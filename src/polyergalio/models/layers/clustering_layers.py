@@ -261,7 +261,6 @@ class PrototypeLayer(Layer):
         self.kernel = None
         self.sample_weights = None
         self.assignment = None
-        self.energy_gradient = None
         self.lead_shape = ()
 
     @property
@@ -721,27 +720,26 @@ class FreePLSOMLayer(ParameterlessLayer):
 
     grows = True
 
-    def __init__(
-        self,
-        n_neurons: int,
-        input_dim: int,
-        theta_min: float = 1.0,
-        theta_max: Optional[float] = None,
-        merge_radius: Optional[float] = None,
-        r_decay: float = 0.99,
-        theta_decay: float = 0.9,
-        hit_decay: float = 0.9,
-        spread_factor: float = 0.5,
-        growth_anneal: float = 1.0,
-        prune_ratio: float = 0.25,
-        min_neurons: int = 2,
-        max_neurons: Optional[int] = None,
-        settle_epochs: int = 3,
-        temperature: float = 1.0,
-        energy_weight: float = 1.0,
-        output_type: str = "assignment",
-        learning_rate: float = 1.0,
-    ):
+    def __init__(self,
+                 n_neurons: int,
+                 input_dim: int,
+                 theta_min: float = 1.0,
+                 theta_max: Optional[float] = None,
+                 merge_radius: Optional[float] = None,
+                 r_decay: float = 0.99,
+                 theta_decay: float = 0.9,
+                 hit_decay: float = 0.9,
+                 spread_factor: float = 0.5,
+                 growth_anneal: float = 1.0,
+                 prune_ratio: float = 0.25,
+                 min_neurons: int = 2,
+                 max_neurons: Optional[int] = None,
+                 settle_epochs: int = 3,
+                 temperature: float = 1.0,
+                 energy_weight: float = 1.0,
+                 output_type: str = "assignment",
+                 learning_rate: float = 1.0,
+                 ):
         """
         Parameters
         ----------

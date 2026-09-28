@@ -18,16 +18,17 @@ things follow from that:
 
 import inspect
 import time
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
 from polyergalio.models.layers.basal_layers import ANY_SHAPE, Layer, shape_conflict
+from polyergalio.types import Composite, CompositeNode
 from numpy.typing import NDArray
 
 INPUT_NAME = "input"
 
 
-class Node:
+class Node(CompositeNode):
     """
     one vertex in the graph: a layer, and references (edges) to the nodes feeding it.
 
@@ -52,25 +53,14 @@ class Node:
         sources: tuple = (),
         shape: tuple = ANY_SHAPE,
     ):
-        self.name = name
-        self.layer = layer
-        self.sources = sources
-        self.consumers: list = []
+        super().__init__(name, layer, sources)
 
         if layer is None:
             self.in_shape = shape
             self.out_shape = shape
         else:
-            incoming = tuple(source.out_shape for source in sources)
-            resolved = layer.infer_output_shapes(incoming)
-            if len(resolved) != 1:
-                raise ValueError(
-                    f"{layer.__class__.__name__}.infer_output_shapes returned "
-                    f"{len(resolved)} shapes for one node. A node holds one "
-                    "value, so it must yield one shape"
-                )
             self.in_shape = shape[0]
-            self.out_shape = resolved[0]
+            self.resolve_shapes()
 
         if layer is None:
             self.forward_kwargs: frozenset[str] = frozenset()
@@ -90,19 +80,28 @@ class Node:
         for source in sources:
             source.consumers.append(self)
 
+    def resolve_shapes(self) -> None:
+        """
+        Work out the shape this node produces from what its sources produce
+        now; a node with no sources yields its layer's declared output.
+        """
+        incoming = tuple(source.out_shape for source in self.sources)
+        resolved = self.layer.infer_output_shapes(incoming) if incoming else self.layer.shapes["output"]
+        if len(resolved) != 1:
+            raise ValueError(
+                f"{self.layer.__class__.__name__}.infer_output_shapes returned "
+                f"{len(resolved)} shapes for one node. A node holds one "
+                "value, so it must yield one shape"
+            )
+        self.out_shape = resolved[0]
+
     @property
-    def is_source(self) -> bool:
-        return self.layer is None
+    def layer(self) -> Optional[Layer]:
+        return self.component
 
     @property
     def shapes(self) -> dict[str, tuple]:
         return {"input": self.in_shape, "output": self.out_shape}
-
-    def __hash__(self):
-        return id(self)
-
-    def __eq__(self, other):
-        return self is other
 
     def __repr__(self):
         if self.is_source:
@@ -114,7 +113,7 @@ class Node:
         return f"{self.__repr__()} producing {self.out_shape}"
 
 
-class NeuralNetwork:
+class NeuralNetwork(Composite):
     """
     A directed acyclic graph of layer connections D(AG)
 
@@ -154,6 +153,8 @@ class NeuralNetwork:
     gradients.
     """
 
+    component_family = Layer
+
     def __init__(
         self,
         layers: Optional[Iterable[Layer]] = None,
@@ -173,13 +174,12 @@ class NeuralNetwork:
         """
         # through object.__setattr__, so the attribute interception below has
         # its registry available before any assignment happens
-        object.__setattr__(self, "_nodes", [])
         object.__setattr__(self, "_registered", [])
+        super().__init__(name)
         object.__setattr__(self, "_output", None)
         object.__setattr__(self, "training", True)
         object.__setattr__(self, "activations", {})
         object.__setattr__(self, "_timings", {})
-        object.__setattr__(self, "name", name or self.__class__.__name__)
 
         source = Node(INPUT_NAME, shape=tuple(input_shape))
         object.__setattr__(self, "_input", source)
@@ -195,7 +195,7 @@ class NeuralNetwork:
         """the graph's source node; pass it as an input source to the first layer"""
         return self._input
 
-    def connect(self, layer: Layer, *sources: Node, name: Optional[str] = None) -> Node:
+    def connect(self, layer: Layer, *sources: Node, name: Optional[str] = None, strict: bool = True) -> Node:
         """
         Place a layer in the graph, fed by the given nodes, and return its node.
 
@@ -207,12 +207,100 @@ class NeuralNetwork:
             a fan-out is expressed.
         name : optional label. Defaults to the layer's class name with a
             counter, and is only used for display and lookup.
+        strict : False places the layer without requiring its inputs, as an
+            unwired node that reconnect() can feed later; an unwired node is
+            skipped by forward.
 
         Returns
         -------
         the new node, to pass as a source to whatever comes next
         """
-        if not sources:
+        return super().connect(layer, *sources, name=name, strict=strict)
+
+    def reconnect(
+        self,
+        node: Node | str,
+        upstream_edge: Node | str | Sequence[Node | str] | None = None,
+        downstream_edge: Node | str | None = None,
+    ) -> Node:
+        """
+        Place a node already in the graph between an upstream and a downstream
+        node, with the checks connect() makes plus two that only apply once a
+        graph exists: no cycle may form, and every node downstream is
+        re-checked against the shapes it now receives. Nothing changes if a
+        check fails. Execution order is recomputed.
+
+            net.reconnect(net.node("head"), upstream_edge=net.node("encoder"), downstream_edge=net.node("loss_head"))
+
+        Parameters
+        ----------
+        node : the node, or its label
+        upstream_edge : the node (or nodes, in the order the layer's forward
+            takes them) that feeds it from now on; None keeps its inputs
+        downstream_edge : a node that should read this one. It takes this node
+            in place of the upstream node it read, else as an added input;
+            None leaves the readers as they are
+        """
+        return super().reconnect(node, upstream_edge, downstream_edge)
+
+    def disconnect(self, node: Node | str, *sources: Node | str) -> Node:
+        """
+        Break connections. With sources, removes just those from the node's
+        inputs. With none, cuts the node off completely: all its inputs, and
+        the node as a source of every node that reads it.
+
+        A node left with fewer sources than its layer needs is unwired:
+        forward skips it and everything that depends on it, and validate()
+        reports it. Reconnect it, delete() it, or let prune() drop it once
+        the output no longer depends on it.
+
+        Parameters
+        ----------
+        node : the node, or its label
+        sources : nodes (or labels) to remove as sources, none for all
+        """
+        return super().disconnect(node, *sources)
+
+    def delete(self, node: Node | str) -> Layer:
+        """
+        Remove a node and its layer from the network, after disconnect().
+
+        Halts, changing nothing, while the node still has inputs or is read
+        by another node, or if it is the network's output (retarget the
+        output first). The layer leaves net.layers, so the optimizer and
+        serialization no longer see it, unless another node still runs the
+        same layer.
+
+            net.disconnect(net.node("mlm_head"))
+            net.delete(net.node("mlm_head"))
+
+        Parameters
+        ----------
+        node : the node, or its label
+
+        Returns
+        -------
+        the layer that was removed
+        """
+        return super().delete(node)
+
+    def check_delete(self, node: Node) -> None:
+        if node is self._output:
+            raise ValueError(
+                f"{node.name!r} is the network's output; set another output before deleting it"
+            )
+
+    def after_delete(self, node: Node) -> None:
+        if not any(member.layer is node.layer for member in self._nodes):
+            self._registered[:] = [layer for layer in self._registered if layer is not node.layer]
+        self.activations.pop(node.name, None)
+        self._timings.pop(node.name, None)
+
+    def entry_point(self, layer: Layer):
+        return layer.forward
+
+    def check_connection(self, layer: Layer, sources: tuple, strict: bool = True, replacing=None) -> None:
+        if strict and not sources:
             raise ValueError(
                 f"{layer.__class__.__name__} needs at least one source. Pass "
                 "net.input for the first layer in a graph."
@@ -229,19 +317,70 @@ class NeuralNetwork:
                     f"source {source.name!r} belongs to a different network"
                 )
 
-        self._check_graph(layer, len(sources))
-        self._check_shapes(layer, sources)
+        if strict:
+            self._check_graph(layer, len(sources))
+            self._check_shapes(layer, sources)
 
-        label = name or self._auto_name(layer)
-        if any(node.name == label for node in self._nodes):
-            raise ValueError(f"node name {label!r} is already taken")
+    def check_rewire(self, node: Node, sources: tuple) -> None:
+        downstream = self.descendants(node)
+        for source in sources:
+            if source is node or source in downstream:
+                raise ValueError(
+                    f"connecting {source.name!r} to {node.name!r} would form a cycle"
+                )
 
-        node = Node(label, layer, tuple(sources))
-        self._nodes.append(node)
-        self._remember(layer)
-        # a freshly connected node is the natural output until told otherwise
+    def after_rewire(self, node: Node, strict: bool) -> None:
+        for member in self._nodes:
+            member.consumers = []
+        for member in self._nodes:
+            for source in member.sources:
+                source.consumers.append(member)
+        self.sort_nodes()
+        for member in [node, *self.descendants(node)]:
+            member.resolve_shapes()
+            if strict and member is not node:
+                self._check_shapes(member.layer, member.sources)
+
+    def descendants(self, node: Node) -> list[Node]:
+        """every node that depends on this one, in execution order"""
+        seen, stack = set(), list(node.consumers)
+        while stack:
+            member = stack.pop()
+            if member not in seen:
+                seen.add(member)
+                stack.extend(member.consumers)
+        return [member for member in self._nodes if member in seen]
+
+    def ancestors(self, node: Node) -> list[Node]:
+        """every node this one depends on, in execution order"""
+        seen, stack = set(), list(node.sources)
+        while stack:
+            member = stack.pop()
+            if member not in seen:
+                seen.add(member)
+                stack.extend(member.sources)
+        return [member for member in self._nodes if member in seen]
+
+    def sort_nodes(self) -> None:
+        """Put the nodes back in an order where every node follows its sources, keeping the current order where free."""
+        placed, ordered, pending = set(), [], list(self._nodes)
+        while pending:
+            for candidate in pending:
+                if all(source in placed for source in candidate.sources):
+                    break
+            else:
+                raise ValueError("the graph contains a cycle")
+            ordered.append(candidate)
+            placed.add(candidate)
+            pending.remove(candidate)
+        self._nodes[:] = ordered
+
+    def make_node(self, name: str, layer: Layer, sources: tuple) -> Node:
+        return Node(name, layer, sources)
+
+    def after_connect(self, node: Node) -> None:
+        self._remember(node.layer)
         object.__setattr__(self, "_output", node)
-        return node
 
     def _check_graph(self, layer: Layer, given: int) -> None:
         """
@@ -255,7 +394,9 @@ class NeuralNetwork:
         no returns, just erroring -- designed to fail when constructing, not passing data.
         """
         name = layer.__class__.__name__
-        emitted = len(layer.shapes["output"])
+        _shapes = layer.shapes
+        print(_shapes)
+        emitted = len(_shapes["output"])
         if emitted != 1:
             raise ValueError(
                 f"{name} declares {emitted} outputs. A node carries one value"
@@ -319,14 +460,6 @@ class NeuralNetwork:
                     f"{source.name!r} at position {position}: {conflict}"
                 )
 
-    def _auto_name(self, layer: Layer) -> str:
-        stem = layer.__class__.__name__
-        taken = {node.name for node in self._nodes}
-        index = 0
-        while f"{stem}_{index}" in taken:
-            index += 1
-        return f"{stem}_{index}"
-
     def extend(self, layers: Iterable[Layer]) -> Node:
         """chain layers end to end"""
         node = self._output or self._input
@@ -354,14 +487,6 @@ class NeuralNetwork:
             for source in requested
         )
         return self.connect(layer, *sources, name=name).name
-
-    def node(self, name: str) -> Node:
-        """fetch a node by label"""
-        for node in self._nodes:
-            if node.name == name:
-                return node
-        known = [node.name for node in self._nodes]
-        raise KeyError(f"no node named {name!r}. Known nodes: {known}")
 
     def get_node(self, name: str) -> Node:
         """as node(), under the older name"""
@@ -419,7 +544,9 @@ class NeuralNetwork:
         pool = {"training_now": self.training, **kwargs}
 
         for node in self._nodes:
-            if node.is_source:
+            if node.is_source or not self.is_wired(node):
+                continue
+            if any(source not in values for source in node.sources):
                 continue
             arguments = [values[source] for source in node.sources]
             passthrough = (
@@ -445,6 +572,11 @@ class NeuralNetwork:
         object.__setattr__(
             self, "activations", {node.name: value for node, value in values.items()}
         )
+        if output not in values:
+            raise ValueError(
+                f"the output node {output.name!r} was not run: it, or a node it "
+                "depends on, is unwired. Reconnect it or set another output"
+            )
         return values[output]
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
@@ -549,12 +681,6 @@ class NeuralNetwork:
         return "\n".join(lines)
 
     # ------------- inspection
-    def edges(self) -> list[tuple[str, str]]:
-        """every (producer, consumer) pair, for tracing or rendering"""
-        return [
-            (source.name, node.name) for node in self._nodes for source in node.sources
-        ]
-
     def validate(self) -> list[str]:
         """
         Check for structural problem
@@ -563,7 +689,14 @@ class NeuralNetwork:
         output = self._output
 
         for node in self._nodes:
-            if node.is_source or node is output:
+            if node.is_source:
+                continue
+            if not self.is_wired(node):
+                problems.append(
+                    f"{node.name} has {len(node.sources)} of {self.required_sources(node.layer)} "
+                    "inputs connected, so forward skips it"
+                )
+            if node is output:
                 continue
             if not node.consumers:
                 problems.append(
@@ -626,61 +759,23 @@ class NeuralNetwork:
         return [node.name for node in dropped]
 
     # ------------- serialization
-    def serialize(self) -> dict:
-        """
-        Package the graph into a plain, nested dict: every connected node's
-        layer (via Layer.serialize()), the edges between them by name, and
-        enough of the network's own state to rebuild it with deserialize()
+    def get_config(self) -> dict:
+        return {"name": self.name, "input_shape": self._input_shape}
 
-        The input source node itself isn't listed -- it carries no layer,
-        and __init__ rebuilds it from input_shape.
-        """
-        nodes = [
-            {
-                "name": node.name,
-                "sources": [source.name for source in node.sources],
-                "layer": node.layer.serialize(),
-            }
-            for node in self._nodes
-            if not node.is_source
-        ]
+    def resolve_source(self, name: str) -> Node:
+        try:
+            return self.node(name)
+        except KeyError as error:
+            raise KeyError(
+                f"no node named {name!r} to use as a source; when restoring a "
+                "saved network, the saved nodes may be out of order"
+            ) from error
 
-        return {
-            "name": self.name,
-            "input_shape": self._input_shape,
-            "nodes": nodes,
-            "output": self.output.name,
-        }
+    def extra_weights(self) -> dict:
+        return {"output": self.output.name}
 
-    @classmethod
-    def deserialize(cls, serialized_dict: dict) -> 'NeuralNetwork':
-        """
-        Rebuild a network from serialize() output.
-
-        Each layer is restored with Layer.deserialize(), then reconnected
-        through the ordinary connect() -- so a rebuilt graph is checked for
-        shape conflicts exactly as it was the first time it was built.
-        """
-        net = cls(
-            name=serialized_dict["name"], input_shape=serialized_dict["input_shape"]
-        )
-        by_name = {INPUT_NAME: net.input}
-
-        for entry in serialized_dict["nodes"]:
-            layer = Layer.deserialize(entry["layer"])
-            try:
-                sources = tuple(
-                    by_name[source_name] for source_name in entry["sources"]
-                )
-            except KeyError as error:
-                raise KeyError(
-                    f"node {entry['name']!r} needs source {error}, which hasn't "
-                    "been connected yet -- the saved nodes are out of order"
-                ) from error
-            by_name[entry["name"]] = net.connect(layer, *sources, name=entry["name"])
-
-        net.output = by_name[serialized_dict["output"]]
-        return net
+    def restore_extras(self, weights: dict) -> None:
+        object.__setattr__(self, "_output", self.node(weights["output"]))
 
     def train(self, mode: bool = True) -> 'NeuralNetwork':
         """switch the network and every layer in it between training and inference"""
@@ -694,11 +789,6 @@ class NeuralNetwork:
         switch to inference -- changes training behavior and training-specific behaviors
         """
         return self.train(False)
-
-    @property
-    def nodes(self) -> list[Node]:
-        """every node including the input source, in construction order"""
-        return list(self._nodes)
 
     @property
     def layers(self) -> list[Layer]:
@@ -765,9 +855,6 @@ class NeuralNetwork:
         for problem in self.validate():
             lines.append(f"  warning: {problem}")
         return "\n".join(lines)
-
-    def __len__(self) -> int:
-        return sum(1 for node in self._nodes if not node.is_source)
 
     def __repr__(self) -> str:
         return (

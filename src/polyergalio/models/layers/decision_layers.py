@@ -192,9 +192,12 @@ class DecisionHead(Layer):
         [CLS] <type> <instructions> [SEP]
         [MARK] <option1> [MARK] <option2> ... [SEP] <state> [SEP]
 
-    the head gathers the encoder's hidden state at each [MARK], adds a learned
+    the head mean-pools the encoder's hidden state across each option's own
+    span -- from its [MARK] to the next control token -- adds a learned
     embedding of the question type, and scores every option with one shared
-    scorer. A softmax over the valid options answers all three types:
+    scorer. Pooling the whole span, not just the [MARK] position, keeps a
+    long option's tokens from being squeezed through a single position.
+    A softmax over the valid options answers all three types:
         CHOICE: argmax between the valid options
         SCORE: expected level over the ordered levels,
         BINARY: P(true) with options fixed as [false, true].
@@ -206,15 +209,19 @@ class DecisionHead(Layer):
     Output shape: (batch, options) logits, MASKED_LOGIT on padded slots
     """
 
-    def __init__(
-        self,
-        hidden_dim: int,
-        head_hidden: int,
-        num_types: int = len(DECISION_TYPES),
-        activation_type: str = "swish",
-        act_weight: float = 1.0,
-        type_initialization: str = "truncated_normal",
-        type_initialization_kwargs: Optional[dict] = None,
+    def __init__(self,
+                 hidden_dim: int,
+                 head_hidden: int,
+                 num_types: int = len(DECISION_TYPES),
+                 activation_type: str = "swish",
+                 act_weight: float = 1.0,
+                 type_initialization: str = "truncated_normal",
+                 type_initialization_kwargs: Optional[dict] = None,
+                 bias_update_speed: float = 1e-3,
+                 routed_scaling: float = 1.0,
+                 num_groups: Optional[int] = None,
+                 top_groups: Optional[int] = None,
+
     ):
         """
         Parameters
@@ -247,26 +254,27 @@ class DecisionHead(Layer):
         self.trunk_a = MixtureOfExperts(input_dim=hidden_dim,
                                         upscale_dim=2 * hidden_dim,
                                         hidden_dim=hidden_dim,
-                                        num_shared_experts=4,
-                                        num_routed_experts=16,
-                                        top_k=4,
-                                        routed_scaling=1.5,
-                                        num_groups=8,
-                                        top_groups=8,
+                                        num_shared_experts=2,
+                                        num_routed_experts=20,
+                                        top_k=2,
+                                        routed_scaling=routed_scaling,
+                                        bias_update_speed=bias_update_speed,
+                                        num_groups=num_groups,
+                                        top_groups=top_groups,
                                         activation_type=activation_type)
 
-        self.trunk_mid_norm = RMSNormLayer(ni=hidden_dim)
-
-        self.trunk_b = MixtureOfExperts(input_dim=hidden_dim,
-                                        upscale_dim=2 * hidden_dim,
-                                        hidden_dim=hidden_dim,
-                                        num_shared_experts=4,
-                                        num_routed_experts=16,
-                                        top_k=4,
-                                        routed_scaling=2.5,
-                                        num_groups=8,
-                                        top_groups=8,
-                                        activation_type=activation_type)
+        self.trunk_norm = NormalizeLayer(ni=hidden_dim)
+        #
+        # self.trunk_b = MixtureOfExperts(input_dim=hidden_dim,
+        #                                 upscale_dim=2 * hidden_dim,
+        #                                 hidden_dim=hidden_dim,
+        #                                 num_shared_experts=4,
+        #                                 num_routed_experts=16,
+        #                                 top_k=4,
+        #                                 routed_scaling=2.5,
+        #                                 num_groups=8,
+        #                                 top_groups=8,
+        #                                 activation_type=activation_type)
 
         self.scorer = FullyConnectedLayer(
             ni=hidden_dim, no=1, activation_type="linear", is_output=True
@@ -288,6 +296,7 @@ class DecisionHead(Layer):
         self,
         hidden_state: NDArray,
         marker_pos: Optional[NDArray] = None,
+        marker_end: Optional[NDArray] = None,
         token_mask: Optional[NDArray] = None,
         decisiontypes: Optional[list[DECISION_TYPES]] = None,
     ) -> NDArray:
@@ -296,6 +305,8 @@ class DecisionHead(Layer):
         ----------
         hidden_state : (batch, sequence, hidden_dim) encoder output, [CLS] at position 0
         marker_pos : (batch, options) position of each option's [MARK]
+        marker_end : (batch, options) exclusive end of each option's span (its
+            next control token's position, or the trailing [SEP]'s)
         token_mask : (batch, options), 1 for a real option; all real if None
         decisiontypes : (batch,) DECISION_TYPES members or their values; all CHOICE if None
 
@@ -307,9 +318,14 @@ class DecisionHead(Layer):
             raise ValueError(
                 "DecisionHead needs marker_pos, the position of each option's [MARK]"
             )
-        batch = hidden_state.shape[0]
+        if marker_end is None:
+            raise ValueError(
+                "DecisionHead needs marker_end, the exclusive end of each option's span"
+            )
+        batch, sequence_length = hidden_state.shape[:2]
         self.hidden_shape = hidden_state.shape
         self.marker_pos = np.asarray(marker_pos, dtype=int)
+        self.marker_end = np.asarray(marker_end, dtype=int)
         self.token_mask = (np.ones(self.marker_pos.shape, dtype=bool)
                            if token_mask is None
                            else np.asarray(token_mask, dtype=bool)
@@ -318,12 +334,20 @@ class DecisionHead(Layer):
                              if decisiontypes is None
                              else decision_type_ids(decisiontypes)
                              )
-        self.rows = np.arange(batch)[:, None]
+
+        positions = np.arange(sequence_length)
+        self.span_mask = (
+            (positions[None, None, :] >= self.marker_pos[..., None])
+            & (positions[None, None, :] < self.marker_end[..., None])
+            & self.token_mask[..., None]
+        )
+        self.span_lengths = np.maximum(self.span_mask.sum(axis=-1, keepdims=True), 1)
+        span_weights = self.span_mask.astype(GLOBAL_DTYPE) / self.span_lengths
 
         type_vector = self.type_embedding[self.decisiontype]
-        markers = hidden_state[self.rows, self.marker_pos]
-        mixed = self.trunk_mid_norm(self.trunk_a(self.embedding_norm(markers), mask=self.token_mask))
-        xs = self.trunk_b(mixed + type_vector[:, None, :], mask=self.token_mask)
+        markers = np.einsum("bot,bth->boh", span_weights, hidden_state)
+        xs = self.trunk_a(self.embedding_norm(markers)+ type_vector[:, None, :], mask=self.token_mask)
+        xs = self.trunk_norm(xs, mask=self.token_mask)
 
         scores = self.scorer(xs)[..., 0]
 
@@ -364,16 +388,12 @@ class DecisionHead(Layer):
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         grad_scores = np.where(self.token_mask, incoming_grad, 0.0)[..., None]
-        grad_typed = self.trunk_b.backward(self.scorer.backward(grad_scores))
-        grad_normed = self.trunk_a.backward(self.trunk_mid_norm.backward(grad_typed))
-        grad_markers = self.embedding_norm.backward(grad_normed) * self.token_mask[..., None]
+        grad_typed = self.trunk_a.backward(self.scorer.backward(grad_scores))
+        grad_normed = self.trunk_norm.backward(grad_typed)
+        grad_markers = grad_normed * self.token_mask[..., None]
 
-        grad_hidden = np.zeros(self.hidden_shape, dtype=GLOBAL_DTYPE)
-        np.add.at(
-            grad_hidden,
-            (np.broadcast_to(self.rows, self.marker_pos.shape), self.marker_pos),
-            grad_markers,
-        )
+        span_weights = self.span_mask.astype(GLOBAL_DTYPE) / self.span_lengths
+        grad_hidden = np.einsum("bot,boh->bth", span_weights, grad_markers)
         grad_type = np.sum(grad_typed * self.token_mask[..., None], axis=1)
 
         if self.act_gradient is None:
@@ -393,8 +413,8 @@ class DecisionHead(Layer):
             "type_embedding": self.type_embedding,
             "embedding_norm": self.embedding_norm.get_weights(for_serialize=for_serialize),
             "trunk_a": self.trunk_a.get_weights(for_serialize=for_serialize),
-            "trunk_b": self.trunk_b.get_weights(for_serialize=for_serialize),
-            "trunk_mid_norm": self.trunk_mid_norm.get_weights(for_serialize=for_serialize),
+            # "trunk_b": self.trunk_b.get_weights(for_serialize=for_serialize),
+            "trunk_norm": self.trunk_norm.get_weights(for_serialize=for_serialize),
             "scorer": self.scorer.get_weights(for_serialize=for_serialize),
             "act_head": self.act_head.get_weights(for_serialize=for_serialize),
         }
@@ -406,8 +426,8 @@ class DecisionHead(Layer):
             self.type_embedding = np.asarray(weights["type_embedding"], dtype=GLOBAL_DTYPE)
         self.embedding_norm.set_weights(weights.get("embedding_norm"))
         self.trunk_a.set_weights(weights.get("trunk_a"))
-        self.trunk_b.set_weights(weights.get("trunk_b"))
-        self.trunk_mid_norm.set_weights(weights.get("trunk_mid_norm"))
+        # self.trunk_b.set_weights(weights.get("trunk_b"))
+        self.trunk_norm.set_weights(weights.get("trunk_norm"))
         self.scorer.set_weights(weights.get("scorer"))
         self.act_head.set_weights(weights.get("act_head"))
 
@@ -416,8 +436,8 @@ class DecisionHead(Layer):
             "gradient_type_embedding": self.gradient_type_embedding,
             "embedding_norm": self.embedding_norm.get_gradients(),
             "trunk_a": self.trunk_a.get_gradients(),
-            "trunk_b": self.trunk_b.get_gradients(),
-            "trunk_mid_norm": self.trunk_mid_norm.get_gradients(),
+            # "trunk_b": self.trunk_b.get_gradients(),
+            "trunk_norm": self.trunk_norm.get_gradients(),
             "scorer": self.scorer.get_gradients(),
             "act_head": self.act_head.get_gradients(),
         }
@@ -428,7 +448,7 @@ class DecisionHead(Layer):
         embedding_norm: Optional[dict] = None,
         trunk_a: Optional[dict] = None,
         trunk_b: Optional[dict] = None,
-        trunk_mid_norm: Optional[dict] = None,
+        trunk_norm: Optional[dict] = None,
         scorer: Optional[dict] = None,
         act_head: Optional[dict] = None,
     ) -> None:
@@ -438,10 +458,10 @@ class DecisionHead(Layer):
             self.embedding_norm.update_weights(**embedding_norm)
         if trunk_a:
             self.trunk_a.update_weights(**trunk_a)
-        if trunk_b:
-            self.trunk_b.update_weights(**trunk_b)
-        if trunk_mid_norm:
-            self.trunk_mid_norm.update_weights(**trunk_mid_norm)
+        # if trunk_b:
+        #     self.trunk_b.update_weights(**trunk_b)
+        if trunk_norm:
+            self.trunk_norm.update_weights(**trunk_norm)
         if scorer:
             self.scorer.update_weights(**scorer)
         if act_head:
@@ -451,23 +471,25 @@ class DecisionHead(Layer):
         self.gradient_type_embedding = np.zeros_like(self.type_embedding)
         self.embedding_norm.zero_gradients()
         self.trunk_a.zero_gradients()
-        self.trunk_b.zero_gradients()
-        self.trunk_mid_norm.zero_gradients()
+        # self.trunk_b.zero_gradients()
+        self.trunk_norm.zero_gradients()
         self.scorer.zero_gradients()
         self.act_head.zero_gradients()
 
     def purge(self) -> None:
         self.embedding_norm.purge()
         self.trunk_a.purge()
-        self.trunk_b.purge()
-        self.trunk_mid_norm.purge()
+        # self.trunk_b.purge()
+        self.trunk_norm.purge()
         self.scorer.purge()
         self.act_head.purge()
         self.hidden_shape = None
         self.marker_pos = None
+        self.marker_end = None
+        self.span_mask = None
+        self.span_lengths = None
         self.token_mask = None
         self.decisiontype = None
-        self.rows = None
         self.act_logits = None
         self.act_gradient = None
         self.output = None
@@ -478,8 +500,8 @@ class DecisionHead(Layer):
             self.type_embedding.size
             + self.embedding_norm.num_parameters
             + self.trunk_a.num_parameters
-            + self.trunk_b.num_parameters
-            + self.trunk_mid_norm.num_parameters
+            # + self.trunk_b.num_parameters
+            + self.trunk_norm.num_parameters
             + self.scorer.num_parameters
             + self.act_head.num_parameters
         )

@@ -69,6 +69,8 @@ class SGD(Optimizer):
     def step(self, layers: list[Layer]) -> None:
 
         for layer in layers:
+            if layer.training != True:
+                continue
             delta_grads = layer.get_gradients()
             if not delta_grads:
                 continue
@@ -136,16 +138,20 @@ class Adam(Optimizer):
         ridge_update = 1 - self.ridge_decay ** self.timestep
 
         for layer in layers:
-            delta_grads = layer.get_gradients()
-            if not delta_grads:
+            if layer.training != True:
                 continue
-            if not layer.adaptive:
-                self.fixed_step(layer, delta_grads)
-                continue
+            else:
+                delta_grads = layer.get_gradients()
+                if not delta_grads:
+                    continue
+                if not layer.adaptive:
+                    self.fixed_step(layer, delta_grads)
+                    continue
 
-            layer.update_weights(**{key: self.update(sub, (layer, key), momentum_update, ridge_update)
-                    for key, sub in delta_grads.items()
-                }
-            )
+                layer.update_weights(**{key: self.update(sub, (layer, key), momentum_update, ridge_update)
+                                        for key, sub in delta_grads.items()
+                                        }
+                                     )
+
 
 # Scaled Conjugate Gradient

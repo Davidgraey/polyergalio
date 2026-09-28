@@ -125,50 +125,9 @@ class ProbCalibration(BasalTransform):
         return self.fit(y_score, y_true).predict(y_score)
 
     def get_config(self) -> dict:
-        """constructor hyperparameters, JSON-safe"""
-        return {
-            "data_dimension": self.input_dimension,
-            "method": self.method.value,
-        }
-
-    def serialize(self) -> dict:
-        """
-        Package the fitted transform for inference: type, config, and just
-        the fitted parameters predict() needs (_structural_state_keys).
-
-        Returns
-        -------
-        dict
-            {"type", "config", "weights"}, where weights holds whichever
-            method's fitted parameters are populated.
-        """
-        return {
-            "type": self.__class__.__name__,
-            "config": self.get_config(),
-            "weights": self._capture_state(),
-        }
-
-    @classmethod
-    def deserialize(cls, payload: dict) -> "ProbCalibration":
-        """
-        Reconstruct a fitted calibrator for inference from serialize()'s
-        output.
-
-        Parameters
-        ----------
-        payload : dict, as returned by serialize()
-
-        Returns
-        -------
-        ProbCalibration
-            fitted, ready for predict()
-        """
-        config = payload["config"]
-        model = cls(data_dimension=config["data_dimension"], method=config["method"])
-        model._restore_state(payload["weights"])
-        model._is_fitted = True
-
-        return model
+        config = super().get_config()
+        config["data_dimension"] = self.input_dimension
+        return config
 
     # Platt Scaling # ------------------------------------------------------------------------
     def _platt_forward(self, logits: NDArray) -> NDArray:

@@ -2,12 +2,15 @@
 
 import glob
 import json
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import sentencepiece as spm
 
 from polyergalio.models.constants import DECISION_TYPES
+from polyergalio.types import Serializable
 
 SPECIAL_TOKEN_PIECES: Dict[str, str] = {
     "PAD": "<pad>",
@@ -61,16 +64,35 @@ class SpecialTokens:
     TOKEN_OFFSET: int = 20
 
 
-class SentencePieceTokenizer:
+class Tokenizer(Serializable, ABC):
+    """Family root for tokenizers, so a tokenizer can be persisted inside another object's payload."""
+
+    @abstractmethod
+    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> List[int]:
+        """text to token ids"""
+
+    @abstractmethod
+    def decode(self, ids: List[int], skip_special: bool = True) -> str:
+        """token ids to text"""
+
+    @abstractmethod
+    def get_vocab_size(self) -> int:
+        """number of tokens, special tokens included"""
+
+
+class SentencePieceTokenizer(Tokenizer):
     """
     SentencePiece-based tokenizer with predefined special tokens.
 
     Parameters
     ----------
-    model_path : str
+    model_path : str, optional
         Path to the SentencePiece model file (.model).
     special_tokens : SpecialTokens, optional
         Special token configuration. Defaults to SpecialTokens().
+    model_proto : bytes, optional
+        The serialized model itself, used instead of model_path. This is
+        what a saved tokenizer carries, so it needs no file.
 
     Raises
     ------
@@ -78,10 +100,34 @@ class SentencePieceTokenizer:
         If SentencePiece is not installed.
     """
 
-    def __init__(self, model_path: str, special_tokens: Optional[SpecialTokens] = None):
-        self.sp = spm.SentencePieceProcessor(model_file=model_path)
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        special_tokens: Optional[SpecialTokens] = None,
+        model_proto: Optional[bytes] = None,
+    ):
+        if model_proto is not None:
+            self.sp = spm.SentencePieceProcessor(model_proto=model_proto)
+        elif model_path is not None:
+            self.sp = spm.SentencePieceProcessor(model_file=model_path)
+        else:
+            raise ValueError("give a model_path or a model_proto")
+        self.model_path = model_path
         self.special_tokens = special_tokens or SpecialTokens()
         self._validate_special_tokens()
+
+    def get_config(self) -> dict:
+        return {"special_tokens": self.special_tokens}
+
+    def get_weights(self, for_serialize: bool = False) -> dict:
+        return {"model_proto": self.sp.serialized_model_proto()}
+
+    def set_weights(self, weights: dict) -> None:
+        pass
+
+    @classmethod
+    def rebuild(cls, config: dict, weights: dict) -> "SentencePieceTokenizer":
+        return cls(model_proto=weights["model_proto"], **config)
 
     def _validate_special_tokens(self) -> None:
         """Verify special token ids are within vocab bounds."""
@@ -246,6 +292,15 @@ class SentencePieceTokenizer:
         raise ValueError(f"Unknown special token: {name}")
 
 
+def resolve_decisiontype(value) -> DECISION_TYPES:
+    """A DECISION_TYPES member, from itself, its name in any case, or its value."""
+    if isinstance(value, DECISION_TYPES):
+        return value
+    if isinstance(value, str):
+        return DECISION_TYPES[value.upper()]
+    return DECISION_TYPES(value)
+
+
 class TokenSequenceBuilder:
     """Build token sequences with structural patterns."""
 
@@ -350,9 +405,8 @@ class TokenSequenceBuilder:
         state,
         decisiontype: DECISION_TYPES = DECISION_TYPES.CHOICE,
         max_length: Optional[int] = None,
-    ) -> Tuple[List[int], List[int]]:
+    ) -> Tuple[List[int], List[int], List[int]]:
         """
-        # This is the decision support 
         Build sequence: [CLS] <type> <instructions> [SEP] [MARK] opt0 [MARK] opt1 ... [SEP] <state> [SEP].
 
         Parameters
@@ -370,8 +424,10 @@ class TokenSequenceBuilder:
 
         Returns
         -------
-        Tuple[List[int], List[int]]
-            (token sequence, position of each option's MARK token).
+        Tuple[List[int], List[int], List[int]]
+            (token sequence, position of each option's [MARK], exclusive end
+            of each option's span -- the next option's [MARK], or the
+            trailing [SEP] for the last one).
         """
         header = self.tokenizer.encode(f"{decisiontype.name.lower()} {instructions}")
         state_text = state if isinstance(state, str) else json.dumps(state)
@@ -379,20 +435,23 @@ class TokenSequenceBuilder:
 
         tokens = [self.st.CLS] + header + [self.st.SEP]
         marker_positions = []
+        marker_ends = []
         for option in options:
             marker_positions.append(len(tokens))
             tokens.append(self.st.MARK)
             tokens.extend(self.tokenizer.encode(option))
+            marker_ends.append(len(tokens))
         tokens.append(self.st.SEP)
 
         room = len(state_ids) if max_length is None else max(0, max_length - len(tokens) - 1)
         tokens.extend(state_ids[:room])
         tokens.append(self.st.SEP)
-        return tokens, marker_positions
+
+        return tokens, marker_positions, marker_ends
 
     def build_binary_decision(
         self, instructions: str, state, max_length: Optional[int] = None
-    ) -> Tuple[List[int], List[int]]:
+    ) -> Tuple[List[int], List[int], List[int]]:
         """
         Build a BINARY decision sequence: options fixed as ["false", "true"],
         matching `decode_decisions`' P(true) convention.
@@ -405,16 +464,20 @@ class TokenSequenceBuilder:
 
         Returns
         -------
-        Tuple[List[int], List[int]]
+        Tuple[List[int], List[int], List[int]]
+            See build_decision_sequence.
         """
         return self.build_decision_sequence(
             instructions, ["false", "true"], state,
             decisiontype=DECISION_TYPES.BINARY, max_length=max_length,
         )
 
-    def build_choice_decision(
-        self, instructions: str, options: List[str], state, max_length: Optional[int] = None
-    ) -> Tuple[List[int], List[int]]:
+    def build_choice_decision(self,
+                              instructions: str,
+                              options: List[str],
+                              state,
+                              max_length: Optional[int] = None
+                              ) -> Tuple[List[int], List[int], List[int]]:
         """
         Build a CHOICE decision sequence over arbitrary options.
 
@@ -427,16 +490,20 @@ class TokenSequenceBuilder:
 
         Returns
         -------
-        Tuple[List[int], List[int]]
+        Tuple[List[int], List[int], List[int]]
+            See build_decision_sequence.
         """
         return self.build_decision_sequence(
             instructions, options, state,
             decisiontype=DECISION_TYPES.CHOICE, max_length=max_length,
         )
 
-    def build_score_decision(
-        self, instructions: str, num_levels: int, state, max_length: Optional[int] = None
-    ) -> Tuple[List[int], List[int]]:
+    def build_score_decision(self,
+                             instructions: str,
+                             num_levels: int,
+                             state,
+                             max_length: Optional[int] = None
+                             ) -> Tuple[List[int], List[int], List[int]]:
         """
         Build a SCORE decision sequence: options are the ordered levels
         "0".."num_levels - 1", matching `decode_decisions`' expected-level
@@ -451,13 +518,105 @@ class TokenSequenceBuilder:
 
         Returns
         -------
-        Tuple[List[int], List[int]]
+        Tuple[List[int], List[int], List[int]]
+            See build_decision_sequence.
         """
         levels = [str(level) for level in range(num_levels)]
         return self.build_decision_sequence(
             instructions, levels, state,
             decisiontype=DECISION_TYPES.SCORE, max_length=max_length,
         )
+
+    def build_decision_row(
+        self, sample: dict, max_length: Optional[int] = None
+    ) -> Tuple[List[int], List[int], List[int], DECISION_TYPES]:
+        """
+        Lay out and tokenize one raw decision sample.
+
+        Parameters
+        ----------
+        sample : dict with "decisiontype" (a DECISION_TYPES member, its name
+            in any case, or its value), "instructions", "state", and
+            "options" (CHOICE; SCORE too, in place of "num_levels"); BINARY
+            needs neither, its options are fixed as ["false", "true"].
+            Other keys (e.g. "answer", "id") are ignored here.
+        max_length : forwarded to build_decision_sequence
+
+        Returns
+        -------
+        (token sequence, marker positions, marker ends, resolved decisiontype)
+        """
+        decisiontype = resolve_decisiontype(sample["decisiontype"])
+        instructions, state = sample["instructions"], sample["state"]
+
+        if decisiontype is DECISION_TYPES.BINARY:
+            ids, positions, ends = self.build_binary_decision(instructions, state, max_length=max_length)
+        elif decisiontype is DECISION_TYPES.CHOICE:
+            ids, positions, ends = self.build_choice_decision(instructions, sample["options"], state, max_length=max_length)
+        elif sample.get("num_levels") is not None:
+            ids, positions, ends = self.build_score_decision(instructions, sample["num_levels"], state, max_length=max_length)
+        elif sample.get("options") is not None:
+            ids, positions, ends = self.build_decision_sequence(
+                instructions, sample["options"], state, decisiontype=decisiontype, max_length=max_length
+            )
+        else:
+            raise ValueError("a SCORE sample needs 'num_levels' or 'options'")
+
+        return ids, positions, ends, decisiontype
+
+    def build_decision_batch(self, samples: List[dict], max_length: Optional[int] = None) -> Dict[str, "np.ndarray"]:
+        """
+        Single entry point: raw decision samples in, everything the encoder
+        and DecisionHead need to run on them out. Lays out and tokenizes
+        every sample with build_decision_row, then pads to a common sequence
+        length and option count.
+
+        Parameters
+        ----------
+        samples : see build_decision_row for a sample's shape
+        max_length : per-row token budget forwarded to build_decision_row;
+            the batch pads to the longest row either way
+
+        Returns
+        -------
+        dict with token_ids (batch, sequence_length), mask (batch,
+            sequence_length) -- the encoder's attention mask --, marker_pos,
+            marker_end and token_mask (batch, options) for DecisionHead,
+            decisiontypes (batch,), and answers (batch,) when every sample
+            has an "answer"
+        """
+        rows, markers, ends, decisiontypes = [], [], [], []
+        for sample in samples:
+            ids, positions, span_ends, decisiontype = self.build_decision_row(sample, max_length=max_length)
+            rows.append(ids)
+            markers.append(positions)
+            ends.append(span_ends)
+            decisiontypes.append(decisiontype.value)
+
+        sequence_length = max_length or max(len(ids) for ids in rows)
+        num_options = max(len(positions) for positions in markers)
+
+        token_ids = np.full((len(samples), sequence_length), self.st.PAD, dtype=int)
+        marker_pos = np.zeros((len(samples), num_options), dtype=int)
+        marker_end = np.zeros((len(samples), num_options), dtype=int)
+        token_mask = np.zeros((len(samples), num_options), dtype=bool)
+        for row, (ids, positions, span_ends) in enumerate(zip(rows, markers, ends)):
+            token_ids[row, : len(ids)] = ids
+            marker_pos[row, : len(positions)] = positions
+            marker_end[row, : len(span_ends)] = span_ends
+            token_mask[row, : len(positions)] = True
+
+        batch = dict(
+            token_ids=token_ids,
+            mask=token_ids != self.st.PAD,
+            marker_pos=marker_pos,
+            marker_end=marker_end,
+            token_mask=token_mask,
+            decisiontypes=np.array(decisiontypes, dtype=int),
+        )
+        if samples and all("answer" in sample for sample in samples):
+            batch["answers"] = np.array([sample["answer"] for sample in samples], dtype=int)
+        return batch
 
     def create_padding_mask(self, ids: List[int]) -> List[bool]:
         """
@@ -723,7 +882,7 @@ def verify_tokenizer_alignment(
 
 
 def fit_tokenizer(
-    corpus_paths: List[str],
+    corpus: List[str],
     model_prefix: str,
     vocab_size: int = 8000,
     model_type: str = "bpe",
@@ -741,7 +900,7 @@ def fit_tokenizer(
 
     Parameters
     ----------
-    corpus_paths : list of str
+    corpus : list of str
         Text files or glob patterns to train on, one sample per line.
     model_prefix : str
         Output path prefix; produces `<model_prefix>.model` and `.vocab`.
@@ -768,14 +927,10 @@ def fit_tokenizer(
         `special_tokens` (see `verify_tokenizer_alignment`).
     """
     special_tokens = special_tokens or SpecialTokens()
-    corpus_files = sorted(
-        {path for pattern in corpus_paths for path in glob.glob(pattern)}
-    )
-    if not corpus_files:
-        raise FileNotFoundError(f"no corpus files matched: {corpus_paths}")
+
 
     spm.SentencePieceTrainer.train(
-        input=",".join(corpus_files),
+        sentence_iterator=iter(corpus),
         model_prefix=model_prefix,
         vocab_size=vocab_size,
         model_type=model_type,

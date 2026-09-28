@@ -13,15 +13,14 @@ class VotingBase(Layer):
     renormalize: bool = False
     activation: str = "linear"
 
-    def __init__(
-        self,
-        input_shape: int,
-        num_experts: int,
-        top_k: Optional[int] = None,
-        bias_update_speed: float = 0.0,
-        num_groups: Optional[int] = None,
-        top_groups: Optional[int] = None,
-    ):
+    def __init__(self,
+                 input_shape: int,
+                 num_experts: int,
+                 top_k: Optional[int] = None,
+                 bias_update_speed: float = 0.0,
+                 num_groups: Optional[int] = None,
+                 top_groups: Optional[int] = None,
+                 ):
         """
         Parameters
         ----------
@@ -76,12 +75,11 @@ class VotingBase(Layer):
 
         self.zero_gradients()
 
-    def forward(
-        self,
-        incoming_x: NDArray,
-        training_now: Optional[bool] = None,
-        mask: Optional[NDArray] = None,
-    ) -> NDArray:
+    def forward(self,
+                incoming_x: NDArray,
+                training_now: Optional[bool] = None,
+                mask: Optional[NDArray] = None,
+                ) -> NDArray:
         """
         Parameters
         ----------
@@ -273,13 +271,12 @@ class VotingBase(Layer):
 
 
 class VotingWeight(VotingBase):
-    def __init__(
-        self,
-        input_shape: int,
-        num_experts: int,
-        top_k: Optional[int] = None,
-        bias_update_speed: float = 0.0,
-    ):
+    def __init__(self,
+                 input_shape: int,
+                 num_experts: int,
+                 top_k: Optional[int] = None,
+                 bias_update_speed: float = 0.0,
+                 ):
         """
         Independent per-expert weights between 0 and 1 as a single projection
 
@@ -317,17 +314,16 @@ class VotingWeightBalanced(VotingBase):
 
     renormalize = True
 
-    def __init__(
-        self,
-        input_shape: int,
-        hidden_size: Optional[int],
-        num_experts: int,
-        top_k: Optional[int] = None,
-        gate_activation: str = "softmax",
-        bias_update_speed: float = 0.0,
-        num_groups: Optional[int] = None,
-        top_groups: Optional[int] = None,
-    ):
+    def __init__(self,
+                 input_shape: int,
+                 hidden_size: Optional[int],
+                 num_experts: int,
+                 top_k: Optional[int] = None,
+                 gate_activation: str = "softmax",
+                 bias_update_speed: float = 0.0,
+                 num_groups: Optional[int] = None,
+                 top_groups: Optional[int] = None,
+                 ):
         """
         Unlike VotingWeight the experts compete here: top_k always re-norms; so raising one vote's weights lowers anothers
 
@@ -344,14 +340,12 @@ class VotingWeightBalanced(VotingBase):
         bias_update_speed : see VotingBase. 0.0 (default) here too, so this stays a plain competitive gate
         num_groups, top_groups : group-limited routing, see VotingBase
         """
-        super().__init__(
-            input_shape,
-            num_experts,
-            top_k,
-            bias_update_speed=bias_update_speed,
-            num_groups=num_groups,
-            top_groups=top_groups,
-        )
+        super().__init__(input_shape,
+                         num_experts,
+                         top_k,
+                         bias_update_speed=bias_update_speed,
+                         num_groups=num_groups,
+                         top_groups=top_groups,)
         self.activation = gate_activation
         self.gate_activation = gate_activation
         self.hidden_size = hidden_size
@@ -378,14 +372,13 @@ class VotingWeightBalanced(VotingBase):
 class VotingGate(VotingBase):
     """boolean pass/no-pass gate -- top_k experts fire at full strength, everyone else is off. No reweighting."""
 
-    def __init__(
-        self,
-        input_shape: int,
-        hidden_size: int,
-        num_experts: int,
-        top_k: int,
-        bias_update_speed: float = 0.0,
-    ):
+    def __init__(self,
+                 input_shape: int,
+                 hidden_size: int,
+                 num_experts: int,
+                 top_k: int,
+                 bias_update_speed: float = 0.0,
+                 ):
         """
         Parameters
         ----------
@@ -399,12 +392,11 @@ class VotingGate(VotingBase):
             "VotingGate requires top_k -- a boolean gate with no top_k has "
             "nothing to gate"
         )
-        super().__init__(
-            input_shape,
-            num_experts,
-            top_k,
-            bias_update_speed=bias_update_speed,
-        )
+        super().__init__(input_shape,
+                         num_experts,
+                         top_k,
+                         bias_update_speed=bias_update_speed,
+                         )
         self.activation = "sigmoid"
         self.hidden_size = hidden_size
         self.stack = (
@@ -453,13 +445,12 @@ class Expert(Layer):
     Output shape: (..., hidden_dim)
     """
 
-    def __init__(
-        self,
-        input_dim: int,
-        upscale_dim: int,
-        hidden_dim: int,
-        activation_type: str = "swish",
-    ):
+    def __init__(self,
+                 input_dim: int,
+                 upscale_dim: int,
+                 hidden_dim: int,
+                 activation_type: str = "swish",
+                 ):
         """
         Parameters
         ----------
@@ -572,22 +563,19 @@ class MixtureOfExperts(Layer):
     Routed experts only run on the rows routed to them. Padded rows (mask == 0) are routed to no expert, so their
     output is the shared experts' alone.
     """
-
-    def __init__(
-        self,
-        input_dim: int,
-        upscale_dim: int,
-        hidden_dim: int,
-        num_shared_experts: int,
-        num_routed_experts: int,
-        top_k: int,
-        activation_type: str = "swish",
-        gate_activation: str = "sigmoid",
-        bias_update_speed: float = 1e-3,
-        routed_scaling: float = 1.0,
-        num_groups: Optional[int] = None,
-        top_groups: Optional[int] = None,
-    ):
+    def __init__(self,
+                 input_dim: int,
+                 upscale_dim: int,
+                 hidden_dim: int,
+                 num_shared_experts: int,
+                 num_routed_experts: int,
+                 top_k: int,
+                 activation_type: str = "swish",
+                 gate_activation: str = "sigmoid",
+                 bias_update_speed: float = 1e-3,
+                 routed_scaling: float = 1.0,
+                 num_groups: Optional[int] = None,
+                 top_groups: Optional[int] = None):
         """
         Parameters
         ----------

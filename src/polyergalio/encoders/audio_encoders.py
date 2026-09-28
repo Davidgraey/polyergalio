@@ -300,9 +300,7 @@ class AudioProcessor(Processor):
     """
     Waveform to a windowed spectral representation.
 
-    variable_idx carries the channel to pull out of a multi channel file, so
-    it keeps the same meaning it has for the tabular encoders: which column of
-    the source the encoder is responsible for.
+    channel is the channel to pull out of a multi channel file.
     """
 
     def __init__(
@@ -312,7 +310,7 @@ class AudioProcessor(Processor):
         overlap_ratio: float = 1 / 3,
         use_decibels: bool = True,
         target: str = "waveform",
-        variable_idx: int = 0,
+        channel: int = 0,
     ):
         """
         Parameters
@@ -322,9 +320,10 @@ class AudioProcessor(Processor):
         overlap_ratio : fraction of a frame shared with the next frame
         use_decibels : encode to decibels rather than raw power
         target : name of the signal being encoded
-        variable_idx : channel index within a multi channel source
+        channel : channel index within a multi channel source
         """
-        super().__init__(target=target, variable_idx=variable_idx)
+        super().__init__(target=target)
+        self.channel = channel
         self.sample_rate = sample_rate
         self.window_ms = window_ms
         self.overlap_ratio = overlap_ratio
@@ -334,6 +333,7 @@ class AudioProcessor(Processor):
         self.num_overlap: int = int(self.window_size * overlap_ratio)
         self.window_kernel: NDArray = np.blackman(self.window_size)
         self.freqs: NDArray = frequency_axis(self.window_size, sample_rate)
+        self.spectrum: Optional[NDArray] = None
 
 
     def fit(self, values: NDArray) -> "AudioProcessor":
@@ -388,12 +388,12 @@ class AudioProcessor(Processor):
     def metadata(self) -> dict:
         return {
             "target": self.target,
-            "variable_idx": self.variable_idx,
+            "channel": self.channel,
             "sample_rate": self.sample_rate,
             "window_ms": self.window_ms,
             "window_size": self.window_size,
             "num_overlap": self.num_overlap,
-            "num_frequencies": self.spectrum.size,
+            "num_frequencies": len(self.freqs),
             "use_decibels": self.use_decibels,
         }
 

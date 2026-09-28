@@ -1,20 +1,16 @@
-import copy
-import inspect
-import warnings
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
-import polyergalio.models.activations as activations
-from polyergalio.models.weight_initialization import get_weight_init
 import numpy as np
-from polyergalio.models.constants import (
-    ANY_SHAPE,
-    EPSILON,
-    GLOBAL_COMPLEX_DTYPE,
-    GLOBAL_DTYPE,
-)
 from numpy.typing import NDArray
 
+import polyergalio.models.activations as activations
+from polyergalio.models.constants import (
+    ANY_SHAPE,
+    GLOBAL_DTYPE,
+)
+from polyergalio.models.weight_initialization import get_weight_init
+from polyergalio.types import Serializable
 
 
 def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
@@ -47,19 +43,10 @@ def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
 
 
 # ------------------------------------------------------------------
-class Layer(ABC):
+class Layer(Serializable, ABC):
     preserves_shape: bool = False
     adaptive: bool = True
     training: bool = True
-    registry_name: Optional[str] = None
-    _registry: dict[str, type] = {}
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        name = cls.registry_name or cls.__name__
-        if name in Layer._registry and Layer._registry[name] is not cls:
-            warnings.warn(f"layer name {name} redefined; keeping the latest class")
-        Layer._registry[name] = cls
 
     def __init__(self):
         super().__init__()
@@ -134,18 +121,8 @@ class Layer(ABC):
             )
 
     def get_gradients(self) -> dict[str, NDArray]:
+        """Parameter gradients, reduced over the batch axis; None if there are none to report."""
         pass
-
-    def get_config(self) -> dict:
-        """
-        Reviews the class signature for set values
-        """
-        parameters = inspect.signature(self.__class__.__init__).parameters
-        return {
-            name: getattr(self, name)
-            for name in parameters
-            if name != "self" and hasattr(self, name)
-        }
 
     @abstractmethod
     def update_weights(self, **kwargs) -> None:
@@ -166,69 +143,17 @@ class Layer(ABC):
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
-    def serialize(self) -> dict:
-        """
-        package identity, hyperparameters, and weights into a plain dict
-        config and weights are kept as separate keys deliberately
-
-        config is what has to keep working if this class's constructor changes later
-        weights are just arrays with no dependency on the class at all
-
-        config and weights are deep copied, so the result is a snapshot: further
-        training of this layer never alters it, nor a layer rebuilt from it
-        """
-        return {
-            "type": self.registry_name or self.__class__.__name__,
-            "config": copy.deepcopy(self.get_config()),
-            "weights": copy.deepcopy(self.get_weights(for_serialize=True)),
-        }
-
-    @classmethod
-    def deserialize(cls, serialized_dict: dict) -> "Layer":
-        """
-        rebuild a layer from serialize() output
-
-        Saved config is filtered against the CURRENT constructor's accepted in case of changes
-
-        """
-        layer_cls = cls._registry.get(serialized_dict["type"])
-        if layer_cls is None:
-            raise KeyError(
-                f"no layer registered as {serialized_dict['type']!r}. Known: {sorted(cls._registry)}"
-            )
-
-        accepted = inspect.signature(layer_cls.__init__).parameters
-        config = {k: v for k, v in serialized_dict["config"].items() if k in accepted}
-        # identify any keys / params that are different - lost or changed
-        dropped = set(serialized_dict["config"]) - set(config)
-
-        if dropped:
-            warnings.warn(
-                f"{serialized_dict['type']}: dropping saved config keys: {sorted(dropped)}"
-            )
-
-        layer = layer_cls(**config)
-
-        try:
-            layer.set_weights(serialized_dict["weights"])
-        except (ValueError, NotImplementedError) as error:
-            warnings.warn(
-                f"{serialized_dict['type']}: could not instantiate weights -- {error}"
-            )
-        return layer
-
 
 # TODO: build ENUMS for activations
 class FullyConnectedLayer(Layer):
-    def __init__(
-        self,
-        ni: int,
-        no: int,
-        activation_type: str,
-        is_output: bool = False,
-        initialization_override: Optional[str] = None,
-        initialization_kwargs: Optional[dict] = None,
-    ):
+    def __init__(self,
+                 ni: int,
+                 no: int,
+                 activation_type: str,
+                 is_output: bool = False,
+                 initialization_override: Optional[str] = None,
+                 initialization_kwargs: Optional[dict] = None,
+                 ):
         """
         **********ARGUMENTS**********
         :param ni: number of input units
@@ -268,12 +193,11 @@ class FullyConnectedLayer(Layer):
 
         self.zero_gradients()
 
-    def forward(
-        self,
-        incoming_x: NDArray,
-        forced_activation: Optional[str] = None,
-        mask: Optional[NDArray] = None,
-    ) -> NDArray:
+    def forward(self,
+                incoming_x: NDArray,
+                forced_activation: Optional[str] = None,
+                mask: Optional[NDArray] = None,
+                ) -> NDArray:
         """
 
         Parameters
@@ -295,10 +219,7 @@ class FullyConnectedLayer(Layer):
             f"weights and xs don't match -- x:{incoming_x.shape} "
             f"weights: {self.weights.shape}"
         )
-
-        self.input = incoming_x.reshape(-1, self.in_shape[-1])
-        self.z = self.input @ self.weights + self.bias
-
+        self._used_activation = forced_activation or self.activation
         if forced_activation is None:  # standard layer activation
             this_activation: Callable = self._func_activation
         else:  # we call out the specific "forced" activation
@@ -306,15 +227,17 @@ class FullyConnectedLayer(Layer):
                 forced_activation
             ]
 
-        self._used_activation = forced_activation or self.activation
+        # if self.training:
+        self.input = incoming_x.reshape(-1, self.in_shape[-1])
+        self.z = self.input @ self.weights + self.bias
         self.output = this_activation(self.z)
-
-        # reshape the leading dimensions
         return self.output.reshape(*self.in_shape[:-1], -1)
 
-    def backward(
-        self, incoming_grad: NDArray, forced_activation: Optional[str] = None
-    ) -> NDArray:
+
+    def backward(self,
+                 incoming_grad: NDArray,
+                 forced_activation: Optional[str] = None
+                 ) -> NDArray:
         """
         Backward pass through this layer and it's activation
         Parameters
@@ -342,7 +265,10 @@ class FullyConnectedLayer(Layer):
 
         return final_grad.reshape(*self.in_shape[:-1], -1)
 
-    def update_weights(self, gradient_bias: NDArray, gradient_weights: NDArray) -> None:
+    def update_weights(self,
+                       gradient_bias: NDArray,
+                       gradient_weights: NDArray
+                       ) -> None:
         """
         values passed in are the update to apply to this this layer's weights - this will already have learning rate,
         depreication or momentum / other calculations addressed in the upper level.
@@ -367,8 +293,6 @@ class FullyConnectedLayer(Layer):
         self.input = None
         self.output = None
         self.z = None
-        self.gradient_weights = None
-        self.gradient_bias = None
 
     def get_weights(self, for_serialize: bool = False):
         if for_serialize:
@@ -413,7 +337,10 @@ class DropoutLayer(Layer):
 
     preserves_shape = True
 
-    def __init__(self, dropout_prob=0.5, use_rescale: bool = False):
+    def __init__(self,
+                 dropout_prob=0.5,
+                 use_rescale: bool = False
+                 ):
         super().__init__()
         assert (dropout_prob > 0.0) and (dropout_prob < 1.0)
         self.dropout_prob: float = dropout_prob
@@ -424,18 +351,15 @@ class DropoutLayer(Layer):
         self.input = None
         self.output = None
 
-    def forward(
-        self,
-        incoming_x: NDArray,
-        training_now: Optional[bool] = None,
-        mask: Optional[NDArray] = None,
-    ):
+    def forward(self,
+                incoming_x: NDArray,
+                mask: Optional[NDArray] = None,
+                ):
         """mask : unused -- dropout is applied per element regardless of
         padding; accepted for pass-through compatibility with the graph.
         training_now : None follows the layer's train() / eval() mode"""
-        training_now = self.training if training_now is None else training_now
         self.input = incoming_x
-        if training_now:
+        if self.training:
             if self.use_rescale:
                 self.mask = (
                     self.RNG.binomial(1, self.keep_prob, size=incoming_x.shape)
@@ -524,6 +448,7 @@ class NormalizeLayer(Layer):
         self.in_shape = incoming_x.shape
 
         # reshape to 2D in case (batch, sequence, hidden)
+        # if self.training:
         self.input = incoming_x.reshape(-1, self.in_shape[-1])
 
         _mean = np.mean(self.input, axis=-1, keepdims=True)
@@ -537,11 +462,11 @@ class NormalizeLayer(Layer):
 
         return output.reshape(self.in_shape)
 
-    def update_weights(
-        self,
-        gradient_beta: Optional[NDArray] = None,
-        gradient_gamma: Optional[NDArray] = None,
-    ) -> None:
+
+    def update_weights(self,
+                       gradient_beta: Optional[NDArray] = None,
+                       gradient_gamma: Optional[NDArray] = None,
+                       ) -> None:
         # update the shift & scale values based on gradient contributions
         if self.shift_scale == True:
             self.shift_beta -= gradient_beta
@@ -574,8 +499,6 @@ class NormalizeLayer(Layer):
         self.input = None
         self.x_norm = None
         self.std = None
-        self.gradient_beta = None
-        self.gradient_gamma = None
 
     def get_weights(self, for_serialize: bool = False):
         if self.shift_scale is True:
@@ -641,10 +564,14 @@ class RMSNormLayer(Layer):
         """mask : unused -- same reasoning as NormalizeLayer: each position
         is normalized against only its own features."""
         in_shape = incoming_x.shape
-        self.input = incoming_x.reshape(-1, in_shape[-1])
+        xs = incoming_x.reshape(-1, in_shape[-1])
+
+        # if self.training:
+        self.input = xs
         self.rms = np.sqrt(np.mean(self.input**2, axis=-1, keepdims=True) + self.eps)
         self.x_norm = self.input / self.rms
         return (self.x_norm * self.scale_gamma).reshape(in_shape)
+
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         original_shape = incoming_grad.shape
@@ -665,7 +592,6 @@ class RMSNormLayer(Layer):
         self.input = None
         self.x_norm = None
         self.rms = None
-        self.gradient_gamma = None
 
     def get_weights(self, for_serialize: bool = False) -> NDArray:
         if for_serialize:
