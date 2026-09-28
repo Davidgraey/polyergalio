@@ -71,6 +71,7 @@ class SGD(Optimizer):
         for layer in layers:
             if layer.training != True:
                 continue
+
             delta_grads = layer.get_gradients()
             if not delta_grads:
                 continue

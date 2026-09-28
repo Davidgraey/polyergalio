@@ -24,6 +24,8 @@ log = logging.getLogger(__name__)
 # -------------- Persistence mixin  --------------
 def write_serialized(payload: dict, path: str | os.PathLike) -> None:
     """Pickle a serialize() payload to a single file."""
+    
+
     with open(path, mode="wb") as handle:
         pickle.dump(payload, handle, protocol=pickle.DEFAULT_PROTOCOL)
 

@@ -2,10 +2,10 @@ from typing import Optional
 
 import numpy as np
 from polyergalio.models.layers.basal_layers import (
-    EPSILON,
     FullyConnectedLayer,
     Layer,
 )
+from polyergalio.models.constants import EPSILON
 from numpy.typing import NDArray
 
 
