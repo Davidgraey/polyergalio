@@ -24,7 +24,6 @@ class TimeCycleProcessor(Processor):
     def __init__(
         self,
         target: str,
-        col_idx: Optional[int] = None,
         numerator: Period = Period.DAY,
         denominator: Period = Period.WEEK,
     ):
@@ -35,13 +34,14 @@ class TimeCycleProcessor(Processor):
         Parameters
         ----------
         target : The column name of the intended variable
-        col_idx : int - the index of the intended variable (order in the column)
         numerator : the numerator, as a PERIOD enum. (period.Day)
         denominator : the denominator of our cyclic ratio (period.Week)
         """
-        super().__init__(target, col_idx)
+        super().__init__(target)
         self.numerator: Period = numerator
         self.denominator: Period = denominator
+        self._func = DISPATCHER[f"{numerator.value}/{denominator.value}"]
+        self._inv_func = np.vectorize(INVERT_DISPATCHER[f"{numerator.value}/{denominator.value}"])
 
     def fit(self, values: pd.Series) -> bool:
         """
@@ -54,11 +54,6 @@ class TimeCycleProcessor(Processor):
         -------
         True if fitting was successful
         """
-        # this is all really something more like initalize, not actually fitting
-        self._func = DISPATCHER[f"{self.numerator.value}/{self.denominator.value}"]
-        self._inv_func = np.vectorize(
-            INVERT_DISPATCHER[f"{self.numerator.value}/{self.denominator.value}"]
-        )
         self._fitted = True
         return True
 
@@ -92,7 +87,6 @@ class TimeCycleProcessor(Processor):
     def metadata(self):
         return {
             str(self.target): {
-                "idx": self.variable_idx,
                 "period": f"{self.numerator} | {self.denominator}",
                 "output_dimension": 2,
                 "output_type": "float",
@@ -106,31 +100,25 @@ class TimeCycleProcessor(Processor):
 
 
 class TimeAbsoluteProcessor(Processor):
+    _structural_state_keys = Processor._structural_state_keys + ("fitted_min", "fitted_max")
+
     def __init__(
         self,
         target: str,
-        col_idx: Optional[int] = None,
-        anchor_column: str = None,
-        timezone_column: str = None,
         primary_interval: Period = Period.DAY,
     ):
         """
         Encodes time as a value from anchor -> timestamp.
-        Anchor column must be specified, along with target column. (anchor = start date, target = end date)
+        Connect it to three columns, in order: target (end date), anchor (start date) and timezone.
         Constrains to values 0-1
         Parameters
         ----------
         target : The column name of the intended variable
-        col_idx : int - the index of the intended variable (order in the column)
-        anchor_column : the 'end date' of the time value
-        timezone_column : the name of the timezone column to use for localization
         primary_interval : interval that we want the absolute value of the different between anchor and target (start and end)
         """
-        super().__init__(target, col_idx)
+        super().__init__(target)
 
         self.primary_interval = primary_interval
-        self.anchor = anchor_column
-        self.tz_target = timezone_column
         self._localize: callable = np.vectorize(localize_timestamp)
         self.fitted_min = None
         self.fitted_max = None
@@ -187,25 +175,18 @@ class TimeAbsoluteProcessor(Processor):
             self.obs_min_max = (np.nanmin(values), np.nanmax(values))
         return {f"{self.target}_delta": values}
 
-    def fit_encode(self, values: pd.Series, anchor_values: pd.Series, timezone_values: pd.Series):
-        success = self.fit(values)
-        return self.encode(values)
+    def fit_encode(self, target_values: pd.Series, anchor_values: pd.Series, timezone_values: pd.Series):
+        self.fit(target_values, anchor_values, timezone_values)
+        return self.encode(target_values, anchor_values, timezone_values)
 
     def inverse(self, values):
         return values * ((self.fitted_max - self.fitted_min) + self.fitted_min)
 
     @property
-    def additional_targets(self):
-        return {"anchor_values": self.anchor, "timezone_values": self.tz_target}
-
-    @property
     def metadata(self):
         return {
             str(self.target): {
-                "idx": self.variable_idx,
                 "period": f"{self.primary_interval}",
-                "anchor": self.anchor,
-                "timezone": self.tz_target,
                 "output_dimension": 1,
                 "enc_type": "chronological",
                 "output_type": "float",

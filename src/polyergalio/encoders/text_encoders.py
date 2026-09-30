@@ -25,7 +25,7 @@ from typing import Iterable, Optional
 import numpy as np
 
 from polyergalio.encoders.encoders import Processor
-from polyergalio.encoders.tokenizer import SentencePieceTokenizer
+from polyergalio.encoders.tokenizer import SentencePieceTokenizer, Tokenizer
 
 
 class DistortionTask(Enum):
@@ -70,11 +70,12 @@ def split_sentences(text: str) -> list[str]:
 
 
 class TextProcessor(Processor):
+    _structural_state_keys = Processor._structural_state_keys + ("sentence_pool", "token_counts")
+
     def __init__(
         self,
         tokenizer: SentencePieceTokenizer,
         target: str = "text",
-        col_idx: Optional[int] = None,
         max_length: int = 128,
         tasks: Iterable[DistortionTask | str] = IMPLEMENTED_TASKS,
         mask_prob: float = 0.15,
@@ -92,7 +93,6 @@ class TextProcessor(Processor):
         ----------
         tokenizer : fitted SentencePieceTokenizer
         target : name of the text column
-        col_idx : index of the text column
         max_length : padded sequence length, special tokens included
         tasks : distortions distort() and distort_batch() draw from
         mask_prob : fraction of content tokens masked by CLOZE and SPAN_BOUNDARY
@@ -105,7 +105,7 @@ class TextProcessor(Processor):
         infill_poisson_lambda : mean of the Poisson distribution TEXT_INFILLING draws span lengths from
         random_seed : seed for every random draw
         """
-        super().__init__(target, col_idx)
+        super().__init__(target)
         self.tokenizer = tokenizer
         self.special = tokenizer.special_tokens
         self.vocab_size = tokenizer.get_vocab_size()
@@ -127,6 +127,7 @@ class TextProcessor(Processor):
         self.delete_prob = delete_prob
         self.infill_prob = infill_prob
         self.infill_poisson_lambda = infill_poisson_lambda
+        self.random_seed = random_seed
         self.rng = np.random.default_rng(random_seed)
 
         self.special_ids = np.array(
@@ -148,6 +149,30 @@ class TextProcessor(Processor):
             DistortionTask.DOCUMENT_ROTATION: self.document_rotation,
             DistortionTask.CONTRASTIVE_VIEW: self.contrastive_view,
         }
+
+    # ------------- persistence
+    def get_config(self) -> dict:
+        config = super().get_config()
+        del config["tokenizer"]
+        return config
+
+    def get_weights(self, for_serialize: bool = False) -> dict:
+        weights = super().get_weights(for_serialize)
+        weights["rng_state"] = self.rng.bit_generator.state
+        weights["tokenizer"] = self.tokenizer.serialize()
+        return weights
+
+    def set_weights(self, weights: dict) -> None:
+        state = {key: value for key, value in weights.items() if key not in ("tokenizer", "rng_state")}
+        super().set_weights(state)
+        self.rng.bit_generator.state = weights["rng_state"]
+
+    @classmethod
+    def rebuild(cls, config: dict, weights: dict) -> "TextProcessor":
+        """The constructor needs the tokenizer, so it is restored first from its own payload."""
+        processor = cls(Tokenizer.deserialize(weights["tokenizer"]), **config)
+        processor.set_weights(weights)
+        return processor
 
     # ------------- Processor interface
     def fit(self, values: Iterable[str]) -> bool:
@@ -187,7 +212,6 @@ class TextProcessor(Processor):
     def metadata(self):
         return {
             str(self.target): {
-                "idx": self.variable_idx,
                 "vocab_size": self.vocab_size,
                 "output_dimension": self.max_length,
                 "output_type": "int",

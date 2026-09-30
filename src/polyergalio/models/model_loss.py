@@ -311,13 +311,12 @@ class DecisionLoss(Loss):
         self.ordinal_weight = ordinal_weight
         self.probabilities = None
 
-    def forward(
-        self,
-        prediction: NDArray,
-        targets: NDArray,
-        mask: Optional[NDArray] = None,
-        decisiontypes: Optional[NDArray] = None,
-    ) -> float:
+    def forward(self,
+                prediction: NDArray,
+                targets: NDArray,
+                mask: Optional[NDArray] = None,
+                decisiontypes: Optional[NDArray] = None,
+                ) -> float:
         """
         Parameters
         ----------
@@ -382,9 +381,9 @@ def cross_entropy_derivative(
 
 
 # ------------------------------------------------------------------
-# free-function wrappers, delegating to the Loss classes above. Added so
-# polyergalio.models.supervised.* (scg_regression, tree_models) can import
-# cross_entropy / mse as plain functions rather than instantiate a class.
+# free-function wrappers, delegating to the Loss classes above. Added so supervised.* (scg_regression, tree_models)
+# can import cross_entropy / mse as plain functions rather than instantiate a class.
+# TODO: modify these later on to make the supervised models work with the actual classes, not aliased
 def mse(prediction: NDArray, targets: NDArray, **kwargs) -> float:
     return MSELoss()(prediction, targets)
 

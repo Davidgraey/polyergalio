@@ -13,10 +13,13 @@ from polyergalio.encoders.encoders import Processor
 
 
 class NuemricNormalizeProcessor(Processor):
+    _structural_state_keys = Processor._structural_state_keys + (
+        "fitted_min", "fitted_max", "seen_samples", "bounds",
+    )
+
     def __init__(
         self,
         target: str,
-        col_idx: Optional[int] = None,
         impute_method: str = "clip",
         encoding_range: tuple[float, float] = (0.0, 1.0),
         impute_outliers: bool = False,
@@ -26,12 +29,11 @@ class NuemricNormalizeProcessor(Processor):
         Parameters
         ----------
         target : the name of the target column
-        col_idx : index of the target column in the dataframe
         impute_method : method to use for imputating outliers
         encoding_range : low, high values to bind the values to - eg 0, 1 or -1, 1
         impute_outliers : to impute or not impute
         """
-        super().__init__(target, col_idx)
+        super().__init__(target)
 
         self.encoding_range = encoding_range
         self.fitted_min = 1
@@ -129,7 +131,6 @@ class NuemricNormalizeProcessor(Processor):
     def metadata(self):
         return {
             str(self.target): {
-                "idx": self.variable_idx,
                 "output_dimension": 1,
                 "output_type": "float",
                 "num_variables": 1,
@@ -140,10 +141,13 @@ class NuemricNormalizeProcessor(Processor):
 
 
 class NuemricStandardizeProcessor(Processor):
+    _structural_state_keys = Processor._structural_state_keys + (
+        "mean", "standard_deviation", "seen_samples", "bounds",
+    )
+
     def __init__(
         self,
         target: str,
-        col_idx: Optional[int] = None,
         impute_method: str = "clip",
         impute_outliers: bool = False,
     ):
@@ -152,11 +156,10 @@ class NuemricStandardizeProcessor(Processor):
         Parameters
         ----------
         target : the column name of the target variable
-        col_idx : the index of the target variable's column
         impute_method : string - either "clip" or "mean" or "median"
         impute_outliers : boolean - if we want to impute outliers to more usable values
         """
-        super().__init__(target, col_idx)
+        super().__init__(target)
         self.eps = 1e-12
 
         self.impute_method = impute_method.lower()
@@ -225,7 +228,6 @@ class NuemricStandardizeProcessor(Processor):
     def metadata(self):
         return {
             str(self.target): {
-                "idx": self.variable_idx,
                 "num_variables": 1,
                 "output_dimension": 1,
                 "enc_type": "numeric",

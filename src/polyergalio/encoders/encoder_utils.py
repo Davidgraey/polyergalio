@@ -129,11 +129,11 @@ def localize_timestamp(timestamp: datetime, timezone_id: int) -> datetime:
     # mask NaNs
     _timeobj = convert_timestamp(timestamp)
 
-    if (_timeobj == np.NAN) or isinstance(_timeobj, float):
+    if (_timeobj == np.nan) or isinstance(_timeobj, float):
         return timestamp
 
     _timeobj = convert_timestamp(timestamp)
-    modified_timestamp = _timeobj + timedelta(hours=timezone_id)
+    modified_timestamp = _timeobj + timedelta(hours=float(timezone_id))
 
     return modified_timestamp
 

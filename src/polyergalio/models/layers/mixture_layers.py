@@ -2,10 +2,10 @@ from typing import Optional
 
 import numpy as np
 from polyergalio.models.layers.basal_layers import (
-    EPSILON,
     FullyConnectedLayer,
     Layer,
 )
+from polyergalio.models.constants import EPSILON
 from numpy.typing import NDArray
 
 
@@ -13,23 +13,19 @@ class VotingBase(Layer):
     renormalize: bool = False
     activation: str = "linear"
 
-    def __init__(
-        self,
-        input_shape: int,
-        num_experts: int,
-        top_k: Optional[int] = None,
-        bias_update_speed: float = 0.0,
-        num_groups: Optional[int] = None,
-        top_groups: Optional[int] = None,
-    ):
+    def __init__(self,
+                 input_shape: int,
+                 num_experts: int,
+                 top_k: Optional[int] = None,
+                 num_groups: Optional[int] = None,
+                 top_groups: Optional[int] = None,
+                 ):
         """
         Parameters
         ----------
         input_shape : width of the incoming hidden state, e.g. hidden_dim
         num_experts : one vote per expert out
-        top_k : keep only the k largest votes, or None for a dense vote
-        bias_update_speed : per-forward-pass adjustment to a routing bias added to each expert's vote before top-k
-            SELECTION to order -- auxiliary-loss-free load-balancing mechanism
+        top_k : keep only the k largest votes, or leave None for a dense vote
         num_groups : split the experts into this many equal groups for group-limited routing (DeepSeek-V3);
             None routes over every expert
         top_groups : groups each token may route into, ranked by the sum of each group's n highest scores
@@ -60,9 +56,6 @@ class VotingBase(Layer):
         self.num_groups = num_groups
         self.top_groups = top_groups
 
-        # a slowly-adapting correction, not a per-batch scratch value. this is the auxiliary load-balancing approach
-        self.bias_update_speed = bias_update_speed
-
         self.expert_bias = np.zeros(num_experts)
         # (input_shape,) > (num_experts,) layer
         self.declare_shapes(inputs=((input_shape,),), outputs=((num_experts,),))
@@ -76,25 +69,20 @@ class VotingBase(Layer):
 
         self.zero_gradients()
 
-    def forward(
-        self,
-        incoming_x: NDArray,
-        training_now: Optional[bool] = None,
-        mask: Optional[NDArray] = None,
-    ) -> NDArray:
+    def forward(self,
+                incoming_x: NDArray,
+                mask: Optional[NDArray] = None,
+                ) -> NDArray:
         """
         Parameters
         ----------
         incoming_x : our incoming data, (..., input_shape) -- any number of leading batch/ sequence axes
-        training_now : whether the expert-load bias is updated. False (inference) leaves expert_bias untouched;
-            None follows the layer's train() / eval() mode
         mask : (...,) matching incoming_x's leading axes, 1 for a real token and 0 for padding
 
         Returns
         -------
         one vote per expert, (num_samples, num_experts)
         """
-        training_now = self.training if training_now is None else training_now
         self.in_shape = incoming_x.shape
         assert self.in_shape[-1] == self.input_shape, (
             f"cannot read trailing axis {self.in_shape[-1]} as input_shape "
@@ -112,7 +100,7 @@ class VotingBase(Layer):
             )
         self.token_mask = None if mask is None else mask.reshape(-1)
 
-        self.output = self._route(votes, training_now=training_now)
+        self.output = self._route(votes)
         return self.output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
@@ -122,7 +110,7 @@ class VotingBase(Layer):
 
         return grad.reshape(self.in_shape)
 
-    def _route(self, votes: NDArray, training_now: bool = True) -> NDArray:
+    def _route(self, votes: NDArray) -> NDArray:
         """
         Core Routing Process
 
@@ -132,7 +120,6 @@ class VotingBase(Layer):
         Parameters
         ----------
         votes: the output / forward pass
-        training_now: bool - if we're training vs inference (bias factored into the update or not)
 
         Returns
         -------
@@ -142,9 +129,6 @@ class VotingBase(Layer):
             return votes
 
         self.mask = self.select_experts(votes)
-
-        if training_now and self.bias_update_speed:
-            self.update_expert_bias()
 
         kept = votes * self.mask
         if not self.renormalize:
@@ -158,7 +142,7 @@ class VotingBase(Layer):
         (num_samples, num_experts) bool mask of the top_k experts per row, ranked on votes + expert_bias.
         With num_groups set, only experts inside each row's top_groups groups are eligible.
         """
-        scores = votes + self.expert_bias if self.bias_update_speed else votes
+        scores = votes + self.expert_bias
         if self.num_groups is not None:
             grouped = scores.reshape(
                 -1, self.num_groups, self.num_experts // self.num_groups
@@ -180,13 +164,16 @@ class VotingBase(Layer):
         np.put_along_axis(mask, keep, True, axis=-1)
         return mask
 
-    def update_expert_bias(self) -> None:
+    def get_expert_bias(self) -> None:
         """
-        auxiliary-loss-free balancing update, similar to Deepseek v3 (entirely separate from the gradient)
+        auxiliary-loss-free balancing process, similar to Deepseek v3 (entirely separate from the gradient)
         it's a load-balancing term to increase less-seen experts, while decreasing over-seen experts.
 
         padded rows (masks in Forward) are left out of the load average, otherwise they'd count as real usage
         """
+        if self.mask is None:
+            return np.zeros_like(self.num_experts)
+
         if self.token_mask is None:
             load = self.mask.mean(axis=0)
         else:
@@ -195,7 +182,8 @@ class VotingBase(Layer):
             load = (self.mask * valid).sum(axis=0) / valid_count
 
         fair_share = self.top_k / self.num_experts
-        self.expert_bias += self.bias_update_speed * np.sign(fair_share - load)
+        # bias update speed is now part of the overall learning rate
+        return np.sign(fair_share - load)
 
     def _route_backward(self, incoming_grad: NDArray) -> NDArray:
         """
@@ -211,16 +199,16 @@ class VotingBase(Layer):
 
     def _named_stack(self) -> dict[str, FullyConnectedLayer]:
         """keys the optimizer round-trips through get_gradients/update_weights"""
-        return {f"fc_{n}": layer for n, layer in enumerate(self.stack, start=1)}
+        named = {f"fc_{n}": layer for n, layer in enumerate(self.stack, start=1)}
+        return named
 
     def get_weights(self, for_serialize: bool = False):
         named = self._named_stack()
         if for_serialize:
-            weights = {
-                name: layer.get_weights(for_serialize=True)
-                for name, layer in named.items()
-            }
-            weights["expert_bias"] = self.expert_bias
+            weights = {"expert_bias": self.expert_bias}
+            weights.update({name: layer.get_weights(for_serialize=True)
+                            for name, layer in named.items()
+                            })
             return weights
         return tuple(layer.get_weights(for_serialize=False) for layer in self.stack) + (
             self.expert_bias,
@@ -236,11 +224,15 @@ class VotingBase(Layer):
             self.expert_bias = np.asarray(weights["expert_bias"])
 
     def get_gradients(self) -> dict[str, dict[str, NDArray]]:
-        return {
+        grads = {"expert_bias": self.get_expert_bias()}
+        grads.update({
             name: layer.get_gradients() for name, layer in self._named_stack().items()
-        }
+        })
+        return grads
 
     def update_weights(self, **gradients: dict[str, NDArray]) -> None:
+        # bias is not a layer, so we have all this extra shit to cover
+        self.expert_bias += gradients["expert_bias"]
         for name, layer in self._named_stack().items():
             layer.update_weights(**gradients[name])
 
@@ -273,13 +265,11 @@ class VotingBase(Layer):
 
 
 class VotingWeight(VotingBase):
-    def __init__(
-        self,
-        input_shape: int,
-        num_experts: int,
-        top_k: Optional[int] = None,
-        bias_update_speed: float = 0.0,
-    ):
+    def __init__(self,
+                 input_shape: int,
+                 num_experts: int,
+                 top_k: Optional[int] = None,
+                 ):
         """
         Independent per-expert weights between 0 and 1 as a single projection
 
@@ -294,10 +284,9 @@ class VotingWeight(VotingBase):
         num_experts : number of experts to weight. Forward returns one weight per expert
         top_k : keep only the k largest weights, zeroing the rest. None keeps
             every expert.
-        bias_update_speed : see VotingBase class for more - this is the load-balancing mechanism
         """
         super().__init__(
-            input_shape, num_experts, top_k, bias_update_speed=bias_update_speed
+            input_shape, num_experts, top_k
         )
         self.activation = "sigmoid"
         self.stack = (
@@ -317,17 +306,15 @@ class VotingWeightBalanced(VotingBase):
 
     renormalize = True
 
-    def __init__(
-        self,
-        input_shape: int,
-        hidden_size: Optional[int],
-        num_experts: int,
-        top_k: Optional[int] = None,
-        gate_activation: str = "softmax",
-        bias_update_speed: float = 0.0,
-        num_groups: Optional[int] = None,
-        top_groups: Optional[int] = None,
-    ):
+    def __init__(self,
+                 input_shape: int,
+                 hidden_size: Optional[int],
+                 num_experts: int,
+                 top_k: Optional[int] = None,
+                 gate_activation: str = "softmax",
+                 num_groups: Optional[int] = None,
+                 top_groups: Optional[int] = None,
+                 ):
         """
         Unlike VotingWeight the experts compete here: top_k always re-norms; so raising one vote's weights lowers anothers
 
@@ -341,17 +328,13 @@ class VotingWeightBalanced(VotingBase):
         gate_activation : final projection's activation
             "softmax" (default) makes every expert compete for one fixed budget of weight.
             "sigmoid" scores each expert independently before top-k selection and renorm
-        bias_update_speed : see VotingBase. 0.0 (default) here too, so this stays a plain competitive gate
         num_groups, top_groups : group-limited routing, see VotingBase
         """
-        super().__init__(
-            input_shape,
-            num_experts,
-            top_k,
-            bias_update_speed=bias_update_speed,
-            num_groups=num_groups,
-            top_groups=top_groups,
-        )
+        super().__init__(input_shape,
+                         num_experts,
+                         top_k,
+                         num_groups=num_groups,
+                         top_groups=top_groups,)
         self.activation = gate_activation
         self.gate_activation = gate_activation
         self.hidden_size = hidden_size
@@ -378,14 +361,12 @@ class VotingWeightBalanced(VotingBase):
 class VotingGate(VotingBase):
     """boolean pass/no-pass gate -- top_k experts fire at full strength, everyone else is off. No reweighting."""
 
-    def __init__(
-        self,
-        input_shape: int,
-        hidden_size: int,
-        num_experts: int,
-        top_k: int,
-        bias_update_speed: float = 0.0,
-    ):
+    def __init__(self,
+                 input_shape: int,
+                 hidden_size: int,
+                 num_experts: int,
+                 top_k: int,
+                 ):
         """
         Parameters
         ----------
@@ -393,18 +374,15 @@ class VotingGate(VotingBase):
         hidden_size : width of the relu hidden layer.
         num_experts : number of experts to gate.
         top_k : how many experts pass per sample. Required -- a dense (top_k=None) boolean gate has nothing to gate.
-        bias_update_speed : see VotingBase.
         """
         assert top_k is not None, (
             "VotingGate requires top_k -- a boolean gate with no top_k has "
             "nothing to gate"
         )
-        super().__init__(
-            input_shape,
-            num_experts,
-            top_k,
-            bias_update_speed=bias_update_speed,
-        )
+        super().__init__(input_shape,
+                         num_experts,
+                         top_k,
+                         )
         self.activation = "sigmoid"
         self.hidden_size = hidden_size
         self.stack = (
@@ -417,7 +395,7 @@ class VotingGate(VotingBase):
             ),
         )
 
-    def _route(self, votes: NDArray, training_now: bool = True) -> NDArray:
+    def _route(self, votes: NDArray) -> NDArray:
         """
         Straight-through gate: forward is the pure top_k boolean mask, no vote
         magnitude passes through.
@@ -425,15 +403,11 @@ class VotingGate(VotingBase):
         Parameters
         ----------
         votes : the output / forward pass
-        training_now : bool - if we're training vs inference (bias factored into the update or not)
 
         Returns
         -------
         """
         self.mask = self.select_experts(votes)
-
-        if training_now and self.bias_update_speed:
-            self.update_expert_bias()
 
         return self.mask.astype(votes.dtype)
 
@@ -453,13 +427,12 @@ class Expert(Layer):
     Output shape: (..., hidden_dim)
     """
 
-    def __init__(
-        self,
-        input_dim: int,
-        upscale_dim: int,
-        hidden_dim: int,
-        activation_type: str = "swish",
-    ):
+    def __init__(self,
+                 input_dim: int,
+                 upscale_dim: int,
+                 hidden_dim: int,
+                 activation_type: str = "swish",
+                 ):
         """
         Parameters
         ----------
@@ -572,22 +545,18 @@ class MixtureOfExperts(Layer):
     Routed experts only run on the rows routed to them. Padded rows (mask == 0) are routed to no expert, so their
     output is the shared experts' alone.
     """
-
-    def __init__(
-        self,
-        input_dim: int,
-        upscale_dim: int,
-        hidden_dim: int,
-        num_shared_experts: int,
-        num_routed_experts: int,
-        top_k: int,
-        activation_type: str = "swish",
-        gate_activation: str = "sigmoid",
-        bias_update_speed: float = 1e-3,
-        routed_scaling: float = 1.0,
-        num_groups: Optional[int] = None,
-        top_groups: Optional[int] = None,
-    ):
+    def __init__(self,
+                 input_dim: int,
+                 upscale_dim: int,
+                 hidden_dim: int,
+                 num_shared_experts: int,
+                 num_routed_experts: int,
+                 top_k: int,
+                 activation_type: str = "swish",
+                 gate_activation: str = "sigmoid",
+                 routed_scaling: float = 1.0,
+                 num_groups: Optional[int] = None,
+                 top_groups: Optional[int] = None):
         """
         Parameters
         ----------
@@ -599,7 +568,6 @@ class MixtureOfExperts(Layer):
         top_k : routed experts per token, 2 <= top_k <= num_routed_experts -- the renormalised gate has no gradient at 1
         activation_type : the experts' gate-projection activation, swish for SwiGLU
         gate_activation : "sigmoid" (default, DeepSeek-V3) scores experts independently; "softmax" makes them compete
-        bias_update_speed : gamma, the step of the load-balancing bias update
         routed_scaling : multiplier on the routed experts' combined output (DeepSeek-V3 uses 2.5)
         num_groups, top_groups : group-limited routing, see VotingBase. None routes over every expert
         """
@@ -617,7 +585,6 @@ class MixtureOfExperts(Layer):
         self.top_k = top_k
         self.activation_type = activation_type
         self.gate_activation = gate_activation
-        self.bias_update_speed = bias_update_speed
         self.routed_scaling = routed_scaling
         self.num_groups = num_groups
         self.top_groups = top_groups
@@ -639,7 +606,6 @@ class MixtureOfExperts(Layer):
             num_experts=num_routed_experts,
             top_k=top_k,
             gate_activation=gate_activation,
-            bias_update_speed=bias_update_speed,
             num_groups=num_groups,
             top_groups=top_groups,
         )
@@ -655,21 +621,18 @@ class MixtureOfExperts(Layer):
     def forward(
         self,
         hidden_state: NDArray,
-        training_now: Optional[bool] = None,
         mask: Optional[NDArray] = None,
     ) -> NDArray:
         """
         Parameters
         ----------
         hidden_state : (..., input_dim), any number of leading batch/sequence axes
-        training_now : whether the gate's load-balancing bias updates this pass; None follows train() / eval()
         mask : (...,) matching hidden_state's leading axes, 1 for a real token and 0 for padding
 
         Returns
         -------
         (..., hidden_dim)
         """
-        training_now = self.training if training_now is None else training_now
         self.in_shape = hidden_state.shape
         rows = hidden_state.reshape(-1, self.input_dim)
 
@@ -678,7 +641,7 @@ class MixtureOfExperts(Layer):
             output = output + expert(rows)
 
         self.gate_weights = self.gate(
-            hidden_state, training_now=training_now, mask=mask
+            hidden_state, mask=mask
         )
         routed = self.gate.mask
         if mask is not None:
@@ -688,6 +651,7 @@ class MixtureOfExperts(Layer):
         for e, expert in enumerate(self.routed_experts):
             chosen = np.flatnonzero(routed[:, e])
             expert_out = expert(rows[chosen]) if chosen.size else None
+
             if chosen.size:
                 output[chosen] += (self.routed_scaling * self.gate_weights[chosen, e : e + 1] * expert_out)
 
@@ -749,6 +713,8 @@ class MixtureOfExperts(Layer):
         }
 
     def update_weights(self, **gradients) -> None:
+        if "expert_bias" in gradients:
+            self.expert_bias += gradients["expert_bias"]
         for name, layer in self.named_sublayers().items():
             if name in gradients:
                 layer.update_weights(**gradients[name])

@@ -320,7 +320,7 @@ class PLSOM(BasalModel):
                 if val_error < self.best_val_error - self.min_delta:
                     self.best_val_error = val_error
                     self.best_epoch = step
-                    self._best_state = self.get_weights(for_serialize=True)
+                    self._best_state = copy.deepcopy(self.get_weights())
                     epochs_without_improvement = 0
                 else:
                     epochs_without_improvement += 1

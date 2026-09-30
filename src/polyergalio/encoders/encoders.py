@@ -3,11 +3,14 @@
 """
 from abc import ABC, abstractmethod
 
+from polyergalio.types import Serializable
 
-class Processor(ABC):
-    def __init__(self, target: (str | int), variable_idx: int):
+
+class Processor(Serializable, ABC):
+    _structural_state_keys: tuple[str, ...] = ("obs_min_max", "_fitted")
+
+    def __init__(self, target: (str | int)):
         self.target = target
-        self.variable_idx = variable_idx
         self._fitted: bool = False
         self.obs_min_max: tuple = None
 
@@ -16,16 +19,16 @@ class Processor(ABC):
         """inverse of the encoding function"""
 
     @abstractmethod
-    def encode(self, values):
-        """encoding of the values"""
+    def encode(self, *columns):
+        """encoding of the column values this processor is connected to"""
 
     @abstractmethod
-    def fit_encode(self, values):
-        """fit and encoding of the  values"""
+    def fit_encode(self, *columns):
+        """fit and encoding of the column values"""
 
     @abstractmethod
-    def fit(self, values):
-        """fit the encoder obj using the data"""
+    def fit(self, *columns):
+        """fit the encoder obj using the column values"""
 
     @property
     @abstractmethod
@@ -43,20 +46,5 @@ class Processor(ABC):
         info.update(self.__dict__)
         return info
 
-    @property
-    def additional_targets(self):
-        return None
-
     def __repr__(self):
-        return (
-            f"encoder of processor {self.__class__} targeting {self.target} at {self.variable_idx}"
-        )
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-
-    def __getstate__(self):
-        # Return a dictionary that defines what to pickle
-        state = self.__dict__.copy()  # Copy the current state
-        # defining this here in case we need specific behaviors to be included
-        return state
+        return f"{self.__class__.__name__} for {self.target}"

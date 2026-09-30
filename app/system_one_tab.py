@@ -49,6 +49,7 @@ def train(x, y, meta, hidden: int, head_hidden: int, heads: int, learning_rate: 
     kwargs = dict(
         mask=meta["attention_mask"],
         marker_pos=meta["marker_pos"],
+        marker_end=meta["marker_end"],
         token_mask=meta["token_mask"],
         decisiontypes=meta["decisiontypes"],
     )

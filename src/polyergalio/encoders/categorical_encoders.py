@@ -13,10 +13,13 @@ from polyergalio.encoders.encoders import Processor
 
 
 class CategoricalProcessor(Processor):
+    _structural_state_keys = Processor._structural_state_keys + (
+        "categorical_mapping", "value_mapping", "_variable_counts", "rare_labels", "rare_value",
+    )
+
     def __init__(
         self,
         target: str,
-        col_idx: Optional[int] = None,
         rare_encoding_threshold: Optional[float] = None,
         min_classes_for_rare_qualification: int = 15,
         for_target: bool = False,
@@ -29,7 +32,6 @@ class CategoricalProcessor(Processor):
         Parameters
         ----------
         target : The column name of the intended variable
-        col_idx : int - the index of the intended variable (order in the column)
         rare_encoding_threshold : float between 0.0 and 1.0 - for a 'rare' variable, it must have a frequence < this
             rare encoding threshold
         min_classes_for_rare_qualification : Before we start considering the placeholder 'rare label' - we must have
@@ -37,7 +39,7 @@ class CategoricalProcessor(Processor):
             placeholder if we have > 10 total variables
         for_target: bool - True to use target encoding
         """
-        super().__init__(target, col_idx)
+        super().__init__(target)
         self.vari_name = f"{target}"
         self.categorical_mapping: dict = {}
         self.value_mapping: dict = {}
@@ -50,6 +52,15 @@ class CategoricalProcessor(Processor):
         self.rare_key: str = "rare_label"
         self.rare_value: int = 999
         self.rare_labels: set = set()
+
+    def get_config(self) -> dict:
+        config = super().get_config()
+        config.update(
+            rare_encoding_threshold=self.rare_thresh,
+            min_classes_for_rare_qualification=self.rare_qualify,
+            for_target=self._for_target,
+        )
+        return config
 
     def count_categories(self, values: pd.Series) -> dict:
         """
@@ -137,7 +148,7 @@ class CategoricalProcessor(Processor):
         # modified - assuming Series is passed in & removing the array overheads
         results = []
         for one_value in values:
-            if (one_value is None) | (one_value is np.NAN) | pd.isna(one_value):
+            if pd.isna(one_value):
                 results.append(None)
             else:
                 results.append(self.categorical_mapping.get(one_value, self.rare_value))
@@ -181,7 +192,7 @@ class CategoricalProcessor(Processor):
         # modified - assuming Series is passed in & removing the array overheads
         results = []
         for one_value in values:
-            if (one_value is None) | (one_value is np.NAN) | (one_value is pd.NA):
+            if pd.isna(one_value):
                 results.append(None)
             else:
                 results.append(self.value_mapping.get(one_value, self.rare_key))
@@ -192,7 +203,6 @@ class CategoricalProcessor(Processor):
     def metadata(self):
         return {
             str(self.target): {
-                "idx": self.variable_idx,
                 "num_categories": len(self.categorical_mapping) + 1,
                 "output_dimension": 1,
                 "output_type": "int",

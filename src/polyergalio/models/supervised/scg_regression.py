@@ -482,5 +482,6 @@ class GradientDescent(BasalModel):
 
     def set_weights(self, weights: dict) -> None:
         super().set_weights(weights)
-        self.input_dimension = self.weights.shape[0] - 1
-        self.full_init = True
+        if self.weights is not None:
+            self.input_dimension = self.weights.shape[0] - 1
+            self.full_init = True

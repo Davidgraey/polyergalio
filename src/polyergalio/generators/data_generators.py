@@ -15,6 +15,16 @@ from polyergalio.models.constants import (
 from numpy.typing import NDArray
 
 
+SIGNAL_FAMILIES = ("tone", "multitone", "chirp", "damped", "noise")
+IMAGE_SHAPES = ("disc", "rect", "cross", "ring")
+CLUSTER_SHAPES = ("gaussian", "elongated", "disc", "rect", "cross", "ring", "moon")
+SEQUENCE_TASKS = ("copy", "reverse", "sort", "cipher", "add")
+
+
+# floor for the signal duration, so a length-1 request cannot divide by zero
+EPSILON_TIME = 1e-12
+
+
 def to_onehot(class_array: NDArray, num_classes=None) -> NDArray:
     """Convert integer class array to one-hot"""
     class_array = np.asarray(class_array)
@@ -51,7 +61,7 @@ def token_accuracy(predicted_ids: NDArray, target_ids: NDArray, mask: Optional[N
     return float(correct.sum() / max(int(mask.sum()), 1))
 
 
-def build_decision_sequence(header: list, options: list[list], state: list, max_len: Optional[int] = None) -> tuple[list, list]:
+def build_decision_sequence(header: list, options: list[list], state: list, max_len: Optional[int] = None) -> tuple[list, list, list]:
     """
     Lay out one decision question as
         [CLS] header [SEP] [MARK] option0 [MARK] option1 ... [SEP] state [SEP]
@@ -65,17 +75,20 @@ def build_decision_sequence(header: list, options: list[list], state: list, max_
 
     Returns
     -------
-    ids, and the position of each option's MARK_ID
+    ids, the position of each option's MARK_ID, and the exclusive end of
+    each option's span (the next option's MARK_ID, or the trailing SEP_ID
+    for the last one)
     """
     ids = [CLS_ID, *header, SEP_ID]
-    markers = []
+    markers, ends = [], []
     for option in options:
         markers.append(len(ids))
         ids.extend([MARK_ID, *option])
+        ends.append(len(ids))
     ids.append(SEP_ID)
     room = len(state) if max_len is None else max(0, max_len - len(ids) - 1)
     ids.extend([*state[:room], SEP_ID])
-    return ids, markers
+    return ids, markers, ends
 
 
 def sequence_exact_match(predicted_ids: NDArray, target_ids: NDArray, mask: Optional[NDArray] = None) -> float:
@@ -85,19 +98,6 @@ def sequence_exact_match(predicted_ids: NDArray, target_ids: NDArray, mask: Opti
         mask = np.ones_like(target_ids, dtype=bool)
     row_matches = np.where(mask, predicted_ids == target_ids, True)
     return float(row_matches.all(axis=-1).mean())
-
-
-SIGNAL_FAMILIES = ("tone", "multitone", "chirp", "damped", "noise")
-IMAGE_SHAPES = ("disc", "rect", "cross", "ring")
-# "gaussian" and "elongated" are analytic (no rejection sampling); the rest
-# reuse the same membership test as IMAGE_SHAPES, sampled as points instead
-# of a pixel mask; "moon" is a half ring.
-CLUSTER_SHAPES = ("gaussian", "elongated", "disc", "rect", "cross", "ring", "moon")
-SEQUENCE_TASKS = ("copy", "reverse", "sort", "cipher", "add")
-
-
-# floor for the signal duration, so a length-1 request cannot divide by zero
-EPSILON_TIME = 1e-12
 
 
 @dataclass
@@ -899,9 +899,10 @@ class RandomDatasetGenerator:
                       num_levels ordered levels
 
         `X` is the padded token ids and `y` the answer option index. `meta`
-        carries DecisionHead's forward kwargs: `marker_pos`, `token_mask` and
-        `decisiontypes` (DECISION_TYPES values), plus `attention_mask` and
-        `words`, the ids used for type names, false/true and level labels.
+        carries DecisionHead's forward kwargs: `marker_pos`, `marker_end`,
+        `token_mask` and `decisiontypes` (DECISION_TYPES values), plus
+        `attention_mask` and `words`, the ids used for type names, false/true
+        and level labels.
         """
         type_ids = [DECISION_TYPES(kind).value for kind in config.decision_types]
         if config.num_choices < 2 or config.num_levels < 2:
@@ -914,14 +915,15 @@ class RandomDatasetGenerator:
         lengths = self._sequence_content_lengths(config.num_samples, config.min_seq_length, config.max_seq_length)
         decisiontypes = self.rng.choice(type_ids, size=config.num_samples)
 
-        rows, markers, answers = [], [], []
+        rows, markers, ends, answers = [], [], [], []
         for kind, length in zip(decisiontypes, lengths):
             header, options, state, answer = self._decision_sample(
                 DECISION_TYPES(int(kind)), items, words, int(length), config
             )
-            ids, positions = build_decision_sequence(header, options, state)
+            ids, positions, span_ends = build_decision_sequence(header, options, state)
             rows.append(ids)
             markers.append(positions)
+            ends.append(span_ends)
             answers.append(answer)
 
         n = config.num_samples
@@ -929,15 +931,18 @@ class RandomDatasetGenerator:
         options = max(len(positions) for positions in markers)
         X = np.full((n, width), PAD_ID, dtype=int)
         marker_pos = np.zeros((n, options), dtype=int)
+        marker_end = np.zeros((n, options), dtype=int)
         token_mask = np.zeros((n, options), dtype=bool)
-        for i, (ids, positions) in enumerate(zip(rows, markers)):
+        for i, (ids, positions, span_ends) in enumerate(zip(rows, markers, ends)):
             X[i, :len(ids)] = ids
             marker_pos[i, :len(positions)] = positions
+            marker_end[i, :len(span_ends)] = span_ends
             token_mask[i, :len(positions)] = True
 
         meta = dict(
             attention_mask=X != PAD_ID,
             marker_pos=marker_pos,
+            marker_end=marker_end,
             token_mask=token_mask,
             decisiontypes=decisiontypes.astype(int),
             words=words,
