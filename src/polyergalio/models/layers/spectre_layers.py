@@ -10,6 +10,8 @@ from polyergalio.models.layers.basal_layers import Layer
 from polyergalio.models.weight_initialization import get_weight_init
 from polyergalio.models.layers.wavelet_layers import WaveletRefinementModule
 
+# LayerNorm epsilon for the pooled query within the Head
+DESCRIPTOR_EPS = 0.1
 
 # -------------    adjoints of the real FFT pair    ----------------
 def rfft_adjoint(grad_freq: NDArray, sequence_length: int, axis: int = 1) -> NDArray:
@@ -34,335 +36,7 @@ def irfft_adjoint(
     return out.astype(GLOBAL_COMPLEX_DTYPE)
 
 
-class PersistentMemory(Layer):
-    """
-    Learned, fixed-width context that is persisted
-    per SPECTRE's persistent-memory extension
-
-    holds M, shape (memory_tokens, hidden_dim), trained jointly with the model.
-    Memory is "injected" into the data-stream (sequence) itself before attention/fft transforms
-    This is a container layer
-    """
-
-    preserves_shape = False
-
-    def __init__(
-        self,
-        memory_tokens: int,
-        hidden_dim: int,
-        initialization: str = "truncated_normal",
-        initialization_kwargs: Optional[dict] = None,
-    ):
-        """
-        Parameters
-        ----------
-        memory_tokens : learned slots, zero disables the bank
-        hidden_dim : channel width of each slot
-        initialization : any WEIGHT_INIT_DISPATCHER name; slots are token-like, so fan-in is not the slot count
-        initialization_kwargs : keyword arguments bound to the initializer
-        """
-        super().__init__()
-        assert memory_tokens >= 0, "memory_tokens must be zero or positive"
-        self.memory_tokens = memory_tokens
-        self.hidden_dim = hidden_dim
-        self.initialization = initialization
-        self.initialization_kwargs = dict(initialization_kwargs or {})
-
-        self.declare_shapes(inputs=(), outputs=((self.hidden_dim,),))
-
-        initializer = get_weight_init(initialization, **self.initialization_kwargs)
-        self.memory = initializer(self.RNG, ni=memory_tokens, no=hidden_dim)
-        self.zero_gradients()
-
-    def get_memory(self) -> NDArray:
-        return self.memory
-
-    def forward(self) -> NDArray:
-        return self.get_memory()
-
-    def backward(self, incoming_gradient: NDArray) -> None:
-        self.gradient_memory += incoming_gradient
-
-    def update_weights(self, gradient_memory: NDArray) -> None:
-        self.memory -= gradient_memory
-
-    def purge(self) -> None:
-        self._stale = True
-
-    def zero_gradients(self) -> None:
-        self.gradient_memory = np.zeros_like(self.memory)
-
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"memory": self.memory}
-        return self.memory
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            self.memory = np.asarray(
-                weights["memory"],
-                dtype=GLOBAL_DTYPE,
-            )
-            self._stale = True
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        if self.memory_tokens == 0:
-            return {}
-        return {"gradient_memory": self.gradient_memory}
-
-    @property
-    def num_parameters(self) -> int:
-        return self.memory.size
-
-
-class PrefixFFTCache:
-    """
-    Batched, hidden_dim-wide Prefix-FFT cache shared by all heads of a
-    SpectreDecoderAttention layer.
-
-    Ring layout (per batch element), length `max_sequence = memory_tokens + window
-    """
-
-    def __init__(
-        self,
-        sequence_length: int,
-        hidden_dim: int,
-        batch_size: int,
-        memory_tokens: int = 0,
-    ):
-        self.sequence_length = int(sequence_length)
-        self.memory_tokens = int(memory_tokens)
-        self.max_sequence = self.memory_tokens + self.sequence_length
-        self.hidden_dim = int(hidden_dim)
-        self.batch_size = int(batch_size)
-        self.n_freq = self.max_sequence // 2 + 1
-
-        self.prefix_fft = np.zeros(
-            shape=(self.batch_size, self.n_freq, self.hidden_dim),
-            dtype=GLOBAL_COMPLEX_DTYPE,
-        )
-        self.value_buffer = np.zeros(
-            shape=(self.batch_size, self.max_sequence, self.hidden_dim),
-            dtype=GLOBAL_DTYPE,
-        )
-        self.query_buffer = np.zeros(
-            shape=(self.batch_size, self.max_sequence, self.hidden_dim),
-            dtype=GLOBAL_DTYPE,
-        )
-        self.mask_buffer = np.zeros((self.batch_size, self.max_sequence), dtype=bool)
-        self.sum_query = np.zeros(
-            (self.batch_size, self.hidden_dim), dtype=GLOBAL_DTYPE
-        )
-
-        # absolute step counter for the *sliding* part alone. memory slots are written once (in prefill / set_memory)
-        # and not counted
-        self.position = 0
-        self.length = np.zeros(self.batch_size)
-        self.memory_values = np.zeros((self.memory_tokens, self.hidden_dim), dtype=GLOBAL_DTYPE)
-        self.memory_query_sum = np.zeros(self.hidden_dim, dtype=GLOBAL_DTYPE)
-
-        k = np.arange(self.n_freq, dtype=GLOBAL_DTYPE)
-        t = np.arange(self.max_sequence, dtype=GLOBAL_DTYPE)
-        self._twiddle = np.exp(-2j * np.pi * np.outer(t, k) / self.max_sequence).astype(
-            GLOBAL_COMPLEX_DTYPE
-        )
-
-    def reset(self):
-        """clear the sliding window, keeping the persistent memory set by set_memory"""
-        self.prefix_fft.fill(0)
-        self.value_buffer.fill(0)
-        self.query_buffer.fill(0)
-        self.mask_buffer.fill(False)
-        self.sum_query.fill(0)
-        self.position = 0
-        self.length.fill(0)
-        if self.memory_tokens:
-            self.value_buffer[:, : self.memory_tokens] = self.memory_values[None]
-            self.mask_buffer[:, : self.memory_tokens] = True
-            self.sum_query[...] = self.memory_query_sum[None]
-            self.prefix_fft[...] = np.fft.rfft(self.value_buffer, n=self.max_sequence, axis=1)
-
-    def set_memory(self, memory_values: np.ndarray, memory_queries: np.ndarray):
-        """
-        Seed the persistent memory slots, (memory_tokens, hidden_dim) each, already passed through the
-        layer's value and query projections -- the training forward projects memory the same way, so
-        memory contributes projected values to the mix and its queries to the pooled descriptor.
-        shared across the batch (since it's "injection in the sequence"
-        *** potentially destructive as it clears the sliding window ***
-        """
-        if self.memory_tokens == 0:
-            return
-        expected = (self.memory_tokens, self.hidden_dim)
-        if memory_values.shape != expected or memory_queries.shape != expected:
-            raise ValueError(
-                f"expected memory shape {expected}, got {memory_values.shape} and {memory_queries.shape}"
-            )
-        self.memory_values = memory_values.astype(GLOBAL_DTYPE)
-        self.memory_query_sum = memory_queries.sum(axis=0).astype(GLOBAL_DTYPE)
-        self.reset()
-
-    def prefill(
-        self, query: np.ndarray, value: np.ndarray, mask: Optional[np.ndarray] = None
-    ):
-        """
-        One-shot cache initialisation
-
-        query, value : (batch, seq, hidden_dim), already re-merged after heads.
-        mask : (batch, seq) optional validity mask to identify.
-
-        single RFFT seeds the full cache.
-        """
-        batch, length, hidden_dim = value.shape
-        if hidden_dim != self.hidden_dim:
-            raise ValueError(f"expected hidden_dim={self.hidden_dim}, got {hidden_dim}")
-        if length > self.sequence_length:
-            raise ValueError(
-                f"prompt length {length} exceeds window={self.sequence_length}"
-            )
-        if batch != self.batch_size:
-            raise ValueError(f"cache batch_size={self.batch_size}, got {batch}")
-
-        if mask is None:
-            mask = np.ones((batch, length), dtype=GLOBAL_DTYPE)
-        mask = mask.astype(GLOBAL_DTYPE)
-
-        self.reset()
-
-        query_valid = (query * mask[..., None]).astype(GLOBAL_DTYPE)
-        value_valid = (value * mask[..., None]).astype(GLOBAL_DTYPE)
-
-        start = self.memory_tokens
-        self.value_buffer[:, start : start + length] = value_valid
-        self.query_buffer[:, start : start + length] = query_valid
-        self.mask_buffer[:, start : start + length] = mask.astype(bool)
-
-        self.prefix_fft[...] = np.fft.rfft(
-            self.value_buffer, n=self.max_sequence, axis=1
-        ).astype(GLOBAL_COMPLEX_DTYPE)
-
-        self.sum_query[...] = self.memory_query_sum[None] + query_valid.sum(axis=1)
-        self.length[...] = mask.sum(axis=1).astype(np.int32)
-        self.position = length
-
-    # DECODE STEPS ------------------
-    def decode_step(self, query_t: np.ndarray, value_t: np.ndarray, valid=True) -> int:
-        """
-        append one token to the sliding window
-
-        query_t, value_t : (batch, hidden_dim), already re-merged after heads.
-        valid : bool or (batch,) bool array, for padded/finished sequences
-
-        returns the ring's positional `slot` the new token was written to, so callers can
-        read the reconstructed row for the newest token
-        """
-        batch = value_t.shape[0]
-        if batch != self.batch_size:
-            raise ValueError(f"cache batch_size={self.batch_size}, got {batch}")
-
-        valid = np.asarray(valid, dtype=bool)
-        if valid.ndim == 0:
-            valid = np.full(batch, bool(valid))
-
-        t = self.position
-        slot = self.memory_tokens + (t % self.sequence_length)
-
-        query_t = np.where(valid[:, None], query_t, 0.0).astype(GLOBAL_DTYPE)
-        value_t = np.where(valid[:, None], value_t, 0.0).astype(GLOBAL_DTYPE)
-
-        if t >= self.sequence_length:
-            old_slot = self.memory_tokens + (
-                (t - self.sequence_length) % self.sequence_length
-            )
-            old_value = self.value_buffer[:, old_slot].copy()
-            old_query = self.query_buffer[:, old_slot].copy()
-            was_valid = self.mask_buffer[:, old_slot].copy()
-
-            # evict using the same twiddle index
-            self.prefix_fft -= (
-                self._twiddle[old_slot, :][None, :, None] * old_value[:, None, :]
-            )
-            self.sum_query -= np.where(was_valid[:, None], old_query, 0.0)
-
-        self.prefix_fft += self._twiddle[slot][None, :, None] * value_t[:, None, :]
-
-        self.value_buffer[:, slot] = value_t
-        self.query_buffer[:, slot] = query_t
-        self.mask_buffer[:, slot] = valid
-        self.sum_query += query_t
-
-        self.position += 1
-        self.length = np.minimum(
-            self.length + valid.astype(np.int64), self.sequence_length
-        )
-
-        return slot
-
-    # ------------------------------------------------------------------
-    @property
-    def live_length(self) -> int:
-        return self.memory_tokens + int(min(self.position, self.sequence_length))
-
-    def reconstruct(self, gate: np.ndarray, spectrum: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        gate : (batch, n_freq, hidden_dim) complex spectral gate, already
-            broadcast/merged across heads (needs to be aligned before reconstruct)
-
-        Returns the full ring-ordered reconstruction, shape (batch, max_sequence, hidden_dim).
-        Slot ordering, not chronological ordering.
-        see `read_slot` / `chronological_order` to extract a specific token or the whole window in seqence
-        """
-        spectrum = self.prefix_fft if spectrum is None else spectrum
-        return np.fft.irfft(spectrum * gate, n=self.max_sequence, axis=1).astype(GLOBAL_DTYPE)
-
-    def read_position(self, gate: np.ndarray, slot: int, spectrum: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        One position of the reconstruction, (batch, hidden_dim), without a full irfft: the gated
-        spectrum phase-rotated to `slot` and summed over frequencies -- SPECTRE's positional phase,
-        O(n_freq * hidden) per step. Equals reconstruct(gate)[:, slot].
-        """
-        weights = np.conj(self._twiddle[slot]) / self.max_sequence
-        weights[1:] *= 2
-        if self.max_sequence % 2 == 0:
-            weights[-1] /= 2
-        spectrum = self.prefix_fft if spectrum is None else spectrum
-        return np.real(np.einsum("bkd,k->bd", spectrum * gate, weights)).astype(GLOBAL_DTYPE)
-
-    def chronological_spectrum(self) -> np.ndarray:
-        """
-        rfft of memory followed by the window in oldest-to-newest order. Once the ring has wrapped,
-        a window rotated behind fixed memory slots is no longer a circular shift of the training
-        layout, so reads switch to this -- O(max_sequence log max_sequence) per step, memory only.
-        """
-        ordered = self.value_buffer[:, self.get_chronological_order()]
-        return np.fft.rfft(ordered, n=self.max_sequence, axis=1)
-
-    def get_chronological_order(self) -> np.ndarray:
-        """
-        Index array that reorders the ring buffer's movible or sliding portion into
-        chronological (oldest -> newest) order, given the current pointer position.
-        Memory slots are already in a fixed order.
-        """
-        if self.position == 0:
-            window_order = np.arange(self.sequence_length)
-        else:
-            newest_slot = (self.position - 1) % self.sequence_length
-            window_order = (
-                np.arange(self.sequence_length) + newest_slot + 1
-            ) % self.sequence_length
-        return np.concatenate(
-            [np.arange(self.memory_tokens), self.memory_tokens + window_order]
-        )
-
-
-DESCRIPTOR_EPS = 0.1
-"""
-LayerNorm epsilon for the pooled query. The mean of zero-mean queries over a sequence shrinks like
-1/sqrt(length), so a standard 1e-6 epsilon divides sampling noise by its own tiny spread and the gate
-swings on every weight update. 0.1 caps that amplification; the paper does not specify a value.
-"""
-
-
-# -------------    head layout    ----------------------------------
+# -------------head layout funcs----------------------------------
 def split_heads(array: NDArray, num_heads: int) -> NDArray:
     """(..., hidden) -> (..., num_heads, head_dim), any number of leading axes"""
     return array.reshape(*array.shape[:-1], num_heads, array.shape[-1] // num_heads)
@@ -388,7 +62,6 @@ def shift_frequencies(array: NDArray, offset: int) -> NDArray:
     else:
         out[...] = array
     return out
-
 
 class DenseHead(Layer):
     """
@@ -781,6 +454,326 @@ class HeadGate(Layer):
 
     def __repr__(self):
         return self.__str__()
+
+
+class PersistentMemory(Layer):
+    """
+    Learned, fixed-width context that is persisted
+    per SPECTRE's persistent-memory extension
+
+    holds M, shape (memory_tokens, hidden_dim), trained jointly with the model.
+    Memory is "injected" into the data-stream (sequence) itself before attention/fft transforms
+    This is a container layer
+    """
+
+    preserves_shape = False
+
+    def __init__(
+        self,
+        memory_tokens: int,
+        hidden_dim: int,
+        initialization: str = "truncated_normal",
+        initialization_kwargs: Optional[dict] = None,
+    ):
+        """
+        Parameters
+        ----------
+        memory_tokens : learned slots, zero disables the bank
+        hidden_dim : channel width of each slot
+        initialization : any WEIGHT_INIT_DISPATCHER name; slots are token-like, so fan-in is not the slot count
+        initialization_kwargs : keyword arguments bound to the initializer
+        """
+        super().__init__()
+        assert memory_tokens >= 0, "memory_tokens must be zero or positive"
+        self.memory_tokens = memory_tokens
+        self.hidden_dim = hidden_dim
+        self.initialization = initialization
+        self.initialization_kwargs = dict(initialization_kwargs or {})
+
+        self.declare_shapes(inputs=(), outputs=((self.hidden_dim,),))
+
+        initializer = get_weight_init(initialization, **self.initialization_kwargs)
+        self.memory = initializer(self.RNG, ni=memory_tokens, no=hidden_dim)
+        self.zero_gradients()
+
+    def get_memory(self) -> NDArray:
+        return self.memory
+
+    def forward(self) -> NDArray:
+        return self.get_memory()
+
+    def backward(self, incoming_gradient: NDArray) -> None:
+        self.gradient_memory += incoming_gradient
+
+    def update_weights(self, gradient_memory: NDArray) -> None:
+        self.memory -= gradient_memory
+
+    def purge(self) -> None:
+        self._stale = True
+
+    def zero_gradients(self) -> None:
+        self.gradient_memory = np.zeros_like(self.memory)
+
+    def get_weights(self, for_serialize: bool = False):
+        if for_serialize:
+            return {"memory": self.memory}
+        return self.memory
+
+    def set_weights(self, weights: dict) -> None:
+        if weights is not None:
+            self.memory = np.asarray(
+                weights["memory"],
+                dtype=GLOBAL_DTYPE,
+            )
+            self._stale = True
+
+    def get_gradients(self) -> dict[str, NDArray]:
+        if self.memory_tokens == 0:
+            return {}
+        return {"gradient_memory": self.gradient_memory}
+
+    @property
+    def num_parameters(self) -> int:
+        return self.memory.size
+
+
+class PrefixFFTCache:
+    """
+    Batched, hidden_dim-wide Prefix-FFT cache shared by all heads of a
+    SpectreDecoderAttention layer.
+
+    Ring layout (per batch element), length `max_sequence = memory_tokens + window
+    """
+
+    def __init__(
+        self,
+        sequence_length: int,
+        hidden_dim: int,
+        batch_size: int,
+        memory_tokens: int = 0,
+    ):
+        self.sequence_length = int(sequence_length)
+        self.memory_tokens = int(memory_tokens)
+        self.max_sequence = self.memory_tokens + self.sequence_length
+        self.hidden_dim = int(hidden_dim)
+        self.batch_size = int(batch_size)
+        self.n_freq = self.max_sequence // 2 + 1
+
+        self.prefix_fft = np.zeros(
+            shape=(self.batch_size, self.n_freq, self.hidden_dim),
+            dtype=GLOBAL_COMPLEX_DTYPE,
+        )
+        self.value_buffer = np.zeros(
+            shape=(self.batch_size, self.max_sequence, self.hidden_dim),
+            dtype=GLOBAL_DTYPE,
+        )
+        self.query_buffer = np.zeros(
+            shape=(self.batch_size, self.max_sequence, self.hidden_dim),
+            dtype=GLOBAL_DTYPE,
+        )
+        self.mask_buffer = np.zeros((self.batch_size, self.max_sequence), dtype=bool)
+        self.sum_query = np.zeros(
+            (self.batch_size, self.hidden_dim), dtype=GLOBAL_DTYPE
+        )
+
+        # absolute step counter for the *sliding* part alone. memory slots are written once (in prefill / set_memory)
+        # and not counted
+        self.position = 0
+        self.length = np.zeros(self.batch_size)
+        self.memory_values = np.zeros((self.memory_tokens, self.hidden_dim), dtype=GLOBAL_DTYPE)
+        self.memory_query_sum = np.zeros(self.hidden_dim, dtype=GLOBAL_DTYPE)
+
+        k = np.arange(self.n_freq, dtype=GLOBAL_DTYPE)
+        t = np.arange(self.max_sequence, dtype=GLOBAL_DTYPE)
+        self._twiddle = np.exp(-2j * np.pi * np.outer(t, k) / self.max_sequence).astype(
+            GLOBAL_COMPLEX_DTYPE
+        )
+
+    def reset(self):
+        """clear the sliding window, keeping the persistent memory set by set_memory"""
+        self.prefix_fft.fill(0)
+        self.value_buffer.fill(0)
+        self.query_buffer.fill(0)
+        self.mask_buffer.fill(False)
+        self.sum_query.fill(0)
+        self.position = 0
+        self.length.fill(0)
+        if self.memory_tokens:
+            self.value_buffer[:, : self.memory_tokens] = self.memory_values[None]
+            self.mask_buffer[:, : self.memory_tokens] = True
+            self.sum_query[...] = self.memory_query_sum[None]
+            self.prefix_fft[...] = np.fft.rfft(self.value_buffer, n=self.max_sequence, axis=1)
+
+    def set_memory(self, memory_values: np.ndarray, memory_queries: np.ndarray):
+        """
+        Seed the persistent memory slots, (memory_tokens, hidden_dim) each, already passed through the
+        layer's value and query projections -- the training forward projects memory the same way, so
+        memory contributes projected values to the mix and its queries to the pooled descriptor.
+        shared across the batch (since it's "injection in the sequence"
+        *** potentially destructive as it clears the sliding window ***
+        """
+        if self.memory_tokens == 0:
+            return
+        expected = (self.memory_tokens, self.hidden_dim)
+        if memory_values.shape != expected or memory_queries.shape != expected:
+            raise ValueError(
+                f"expected memory shape {expected}, got {memory_values.shape} and {memory_queries.shape}"
+            )
+        self.memory_values = memory_values.astype(GLOBAL_DTYPE)
+        self.memory_query_sum = memory_queries.sum(axis=0).astype(GLOBAL_DTYPE)
+        self.reset()
+
+    def prefill(
+        self, query: np.ndarray, value: np.ndarray, mask: Optional[np.ndarray] = None
+    ):
+        """
+        One-shot cache initialisation
+
+        query, value : (batch, seq, hidden_dim), already re-merged after heads.
+        mask : (batch, seq) optional validity mask to identify.
+
+        single RFFT seeds the full cache.
+        """
+        batch, length, hidden_dim = value.shape
+        if hidden_dim != self.hidden_dim:
+            raise ValueError(f"expected hidden_dim={self.hidden_dim}, got {hidden_dim}")
+        if length > self.sequence_length:
+            raise ValueError(
+                f"prompt length {length} exceeds window={self.sequence_length}"
+            )
+        if batch != self.batch_size:
+            raise ValueError(f"cache batch_size={self.batch_size}, got {batch}")
+
+        if mask is None:
+            mask = np.ones((batch, length), dtype=GLOBAL_DTYPE)
+        mask = mask.astype(GLOBAL_DTYPE)
+
+        self.reset()
+
+        query_valid = (query * mask[..., None]).astype(GLOBAL_DTYPE)
+        value_valid = (value * mask[..., None]).astype(GLOBAL_DTYPE)
+
+        start = self.memory_tokens
+        self.value_buffer[:, start : start + length] = value_valid
+        self.query_buffer[:, start : start + length] = query_valid
+        self.mask_buffer[:, start : start + length] = mask.astype(bool)
+
+        self.prefix_fft[...] = np.fft.rfft(
+            self.value_buffer, n=self.max_sequence, axis=1
+        ).astype(GLOBAL_COMPLEX_DTYPE)
+
+        self.sum_query[...] = self.memory_query_sum[None] + query_valid.sum(axis=1)
+        self.length[...] = mask.sum(axis=1).astype(np.int32)
+        self.position = length
+
+    # DECODE STEPS ------------------
+    def decode_step(self, query_t: np.ndarray, value_t: np.ndarray, valid=True) -> int:
+        """
+        append one token to the sliding window
+
+        query_t, value_t : (batch, hidden_dim), already re-merged after heads.
+        valid : bool or (batch,) bool array, for padded/finished sequences
+
+        returns the ring's positional `slot` the new token was written to, so callers can
+        read the reconstructed row for the newest token
+        """
+        batch = value_t.shape[0]
+        if batch != self.batch_size:
+            raise ValueError(f"cache batch_size={self.batch_size}, got {batch}")
+
+        valid = np.asarray(valid, dtype=bool)
+        if valid.ndim == 0:
+            valid = np.full(batch, bool(valid))
+
+        t = self.position
+        slot = self.memory_tokens + (t % self.sequence_length)
+
+        query_t = np.where(valid[:, None], query_t, 0.0).astype(GLOBAL_DTYPE)
+        value_t = np.where(valid[:, None], value_t, 0.0).astype(GLOBAL_DTYPE)
+
+        if t >= self.sequence_length:
+            old_slot = self.memory_tokens + (
+                (t - self.sequence_length) % self.sequence_length
+            )
+            old_value = self.value_buffer[:, old_slot].copy()
+            old_query = self.query_buffer[:, old_slot].copy()
+            was_valid = self.mask_buffer[:, old_slot].copy()
+
+            # evict using the same twiddle index
+            self.prefix_fft -= (
+                self._twiddle[old_slot, :][None, :, None] * old_value[:, None, :]
+            )
+            self.sum_query -= np.where(was_valid[:, None], old_query, 0.0)
+
+        self.prefix_fft += self._twiddle[slot][None, :, None] * value_t[:, None, :]
+
+        self.value_buffer[:, slot] = value_t
+        self.query_buffer[:, slot] = query_t
+        self.mask_buffer[:, slot] = valid
+        self.sum_query += query_t
+
+        self.position += 1
+        self.length = np.minimum(
+            self.length + valid.astype(np.int64), self.sequence_length
+        )
+
+        return slot
+
+    # ------------------------------------------------------------------
+    @property
+    def live_length(self) -> int:
+        return self.memory_tokens + int(min(self.position, self.sequence_length))
+
+    def reconstruct(self, gate: np.ndarray, spectrum: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        gate : (batch, n_freq, hidden_dim) complex spectral gate, already
+            broadcast/merged across heads (needs to be aligned before reconstruct)
+
+        Returns the full ring-ordered reconstruction, shape (batch, max_sequence, hidden_dim).
+        Slot ordering, not chronological ordering.
+        see `read_slot` / `chronological_order` to extract a specific token or the whole window in seqence
+        """
+        spectrum = self.prefix_fft if spectrum is None else spectrum
+        return np.fft.irfft(spectrum * gate, n=self.max_sequence, axis=1).astype(GLOBAL_DTYPE)
+
+    def read_position(self, gate: np.ndarray, slot: int, spectrum: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        One position of the reconstruction, (batch, hidden_dim), without a full irfft: the gated
+        spectrum phase-rotated to `slot` and summed over frequencies -- SPECTRE's positional phase,
+        O(n_freq * hidden) per step. Equals reconstruct(gate)[:, slot].
+        """
+        weights = np.conj(self._twiddle[slot]) / self.max_sequence
+        weights[1:] *= 2
+        if self.max_sequence % 2 == 0:
+            weights[-1] /= 2
+        spectrum = self.prefix_fft if spectrum is None else spectrum
+        return np.real(np.einsum("bkd,k->bd", spectrum * gate, weights)).astype(GLOBAL_DTYPE)
+
+    def chronological_spectrum(self) -> np.ndarray:
+        """
+        rfft of memory followed by the window in oldest-to-newest order. Once the ring has wrapped,
+        a window rotated behind fixed memory slots is no longer a circular shift of the training
+        layout, so reads switch to this -- O(max_sequence log max_sequence) per step, memory only.
+        """
+        ordered = self.value_buffer[:, self.get_chronological_order()]
+        return np.fft.rfft(ordered, n=self.max_sequence, axis=1)
+
+    def get_chronological_order(self) -> np.ndarray:
+        """
+        Index array that reorders the ring buffer's movible or sliding portion into
+        chronological (oldest -> newest) order, given the current pointer position.
+        Memory slots are already in a fixed order.
+        """
+        if self.position == 0:
+            window_order = np.arange(self.sequence_length)
+        else:
+            newest_slot = (self.position - 1) % self.sequence_length
+            window_order = (
+                np.arange(self.sequence_length) + newest_slot + 1
+            ) % self.sequence_length
+        return np.concatenate(
+            [np.arange(self.memory_tokens), self.memory_tokens + window_order]
+        )
 
 
 class SpectreAttention(Layer):

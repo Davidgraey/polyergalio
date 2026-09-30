@@ -14,6 +14,7 @@ for folder in (APP_DIR.parent / "src", APP_DIR.parent / "examples", APP_DIR):
 import clustering_layers_tab
 import clustering_tab
 import moe_routing_tab
+import orchestration_tab
 import relative_weights_tab
 import scg_regression_tab
 import spectre_tab
@@ -36,6 +37,7 @@ CATEGORIES = {
         "Spectre encoder-decoder": spectre_tab.render,
         "MoE routing": moe_routing_tab.render,
         "Clustering layers": clustering_layers_tab.render,
+        "Distributed training": orchestration_tab.render,
     },
     "Text": {
         "Token distortions": text_distortions_tab.render,

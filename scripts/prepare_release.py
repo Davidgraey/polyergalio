@@ -87,4 +87,4 @@ if __name__ == "__main__":
     #run_tests_with_coverage()
     build_distributions()
     check_distributions()
-    print("\nall checks passed -- dist/ is ready for `twine upload` \n twine upload dist/*.")
+    print("\nall checks passed -- dist/ is ready for `twine upload` \n twine upload dist/*")

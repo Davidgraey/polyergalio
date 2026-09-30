@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 import numpy as np
 from polyergalio.models.layers import Layer
 
@@ -23,13 +24,14 @@ class Optimizer(ABC):
         pass
 
     @abstractmethod
-    def step(self, layers: list[Layer]) -> None:
+    def step(self, layers: list[Layer], gradients: Optional[dict] = None) -> None:
         """
         Take one step of the optimizer function
 
         Parameters
         ----------
         layers : layers (List[Layer]): the ORDERED LIST of model structure
+        gradients : gradients keyed by layer, replacing each layer's own get_gradients()
 
         """
         pass
@@ -40,6 +42,13 @@ class Optimizer(ABC):
         layer.update_weights(
             **{key: scale_gradients(sub, layer.learning_rate) for key, sub in gradients.items()}
         )
+
+    def get_state(self, layers: list[Layer]) -> dict:
+        """Optimizer state with layers replaced by their position in layers, so it can cross processes."""
+        return {}
+
+    def set_state(self, state: dict, layers: list[Layer]) -> None:
+        """Restore the output of get_state against the same layer ordering."""
 
     def zero_gradients(self, layers: list[Layer]):
         """
@@ -66,13 +75,13 @@ class SGD(Optimizer):
         self.max_norm = 1.0
         self.do_clipping = clip_gradients  # TODO: fix this
 
-    def step(self, layers: list[Layer]) -> None:
+    def step(self, layers: list[Layer], gradients: Optional[dict] = None) -> None:
 
         for layer in layers:
             if layer.training != True:
                 continue
 
-            delta_grads = layer.get_gradients()
+            delta_grads = layer.get_gradients() if gradients is None else gradients.get(layer)
             if not delta_grads:
                 continue
 
@@ -104,6 +113,19 @@ class Adam(Optimizer):
         self._momenta: dict = {}
         self._ridges: dict = {}
 
+    def get_state(self, layers: list[Layer]) -> dict:
+        positions = {layer: position for position, layer in enumerate(layers)}
+        return {
+            "timestep": self.timestep,
+            "momenta": {(positions[path[0]], *path[1:]): value for path, value in self._momenta.items()},
+            "ridges": {(positions[path[0]], *path[1:]): value for path, value in self._ridges.items()},
+        }
+
+    def set_state(self, state: dict, layers: list[Layer]) -> None:
+        self.timestep = state["timestep"]
+        self._momenta = {(layers[key[0]], *key[1:]): value.copy() for key, value in state["momenta"].items()}
+        self._ridges = {(layers[key[0]], *key[1:]): value.copy() for key, value in state["ridges"].items()}
+
     def update(self,
                value,
                path: tuple,
@@ -133,7 +155,7 @@ class Adam(Optimizer):
         v_hat = v / ridge_update
         return self.learning_rate * m_hat / (np.sqrt(v_hat) + self.eps)
 
-    def step(self, layers: list[Layer]) -> None:
+    def step(self, layers: list[Layer], gradients: Optional[dict] = None) -> None:
         self.timestep += 1
         momentum_update = 1 - self.momentum_decay ** self.timestep
         ridge_update = 1 - self.ridge_decay ** self.timestep
@@ -142,7 +164,7 @@ class Adam(Optimizer):
             if layer.training != True:
                 continue
             else:
-                delta_grads = layer.get_gradients()
+                delta_grads = layer.get_gradients() if gradients is None else gradients.get(layer)
                 if not delta_grads:
                     continue
                 if not layer.adaptive:

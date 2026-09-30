@@ -1,7 +1,16 @@
-0.1.4 (UNRELEASED)
+0.1.5
 =====================
-Serialization methods updated.
-    - 
+Added a distributed training process - polyergalio.models.training/
+- check ./distributed_quickstart.md for more context - but the gradient-averaging local-network training is functional and validated
+- Updated a couple of layer behaviors- mostly in MoE module and the need for consistent interfaces to weight updates. (voting weights were not a layer, so were not being captured / registered. They're still not a layer, but are manually injected.)
+- ** AI usage ** - Had LLM generate some missing docstrings.
+- ** AI usage ** - Building tests for individual modules. Tests are still largely underutilized and definitely need culling.
+- ** AI usage ** - App/Streamlit App and examples were built with coding tools' help.
+
+0.1.4
+=====================
+Serialization methods updated
+
 
 0.1.3
 =====================

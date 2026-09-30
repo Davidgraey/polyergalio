@@ -96,3 +96,140 @@ def plot_graph(
     ax.set_title(title)
     ax.axis("off")
     return fig
+
+
+PHASE_COLORS = {
+    "discover": "#f4a261",
+    "connect": "#ffd166",
+    "initialize": "#118ab2",
+    "step": "#06d6a0",
+    "aggregate": "#8338ec",
+    "apply": "#ef476f",
+    "collect": "#90be6d",
+}
+STATUS_COLORS = {
+    "listening": "#e0e0e0",
+    "connected": "#ffd166",
+    "rejected": "#ef476f",
+    "discovered": "#fbe3c8",
+    "skipped": "#f1f1f1",
+    "dropped": "#ef9a9a",
+    "restarted": "#ffcc80",
+    "reconnected": "#b2dfdb",
+    "initialized": "#a8dadc",
+    "stepped": "#b7efc5",
+    "updated": "#cdb4db",
+    "collected": "#c7e9b4",
+}
+PHASE_MESSAGES = {
+    "discover": ("who is there? (UDP)", "node id + port"),
+    "connect": ("challenge reply (HMAC)", "accepted + node id"),
+    "initialize": ("model + hyperparameters", "completed"),
+    "step": ("data shard", "gradients + loss"),
+    "aggregate": (None, None),
+    "apply": ("pooled gradients", "completed"),
+    "collect": ("export model", "serialized weights"),
+}
+
+
+def plot_cluster(nodes: list, phases: tuple, phase, round_index: int, pooled_norm) -> Figure:
+    """
+    Orchestrator, nodes and the messages of the current phase, under a strip of the phases.
+
+    Parameters
+    ----------
+    nodes : dicts with id, status and, once known, rows, loss, gradient_norm, sent_kb, received_kb
+    phases : phase names in order, drawn as the strip along the top
+    phase : phase that just ran, or None
+    round_index : completed rounds
+    pooled_norm : norm of the last pooled gradients, or None
+
+    Returns
+    -------
+    Figure
+    """
+    slot = 1.7
+    bottom = -1.2 - slot * (len(nodes) - 1) - 0.9
+    fig, ax = plt.subplots(figsize=(9, (1.2 - bottom) * 0.55))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(bottom, 1.2)
+    ax.axis("off")
+    current = phases.index(phase) if phase in phases else -1
+    step = 9.4 / len(phases)
+
+    for index, name in enumerate(phases):
+        active = index == current
+        ax.add_patch(
+            FancyBboxPatch(
+                (0.3 + index * step, 0.15),
+                step - 0.15,
+                0.6,
+                boxstyle="round,pad=0.02",
+                facecolor=PHASE_COLORS[name] if index <= current else "#f1f1f1",
+                edgecolor="black",
+                linewidth=2.5 if active else 0.8,
+            )
+        )
+        ax.text(0.3 + index * step + (step - 0.15) / 2, 0.45, name, ha="center", va="center", fontsize=8, fontweight="bold" if active else "normal")
+
+    middle = -1.2 - slot * (len(nodes) - 1) / 2
+    ax.add_patch(
+        FancyBboxPatch(
+            (0.3, middle - 0.8),
+            2.6,
+            1.6,
+            boxstyle="round,pad=0.03",
+            facecolor=SOURCE_COLOR,
+            edgecolor="black",
+            linewidth=2.5 if phase == "aggregate" else 1.0,
+        )
+    )
+    orchestrator_text = f"Orchestrator\nround {round_index}"
+    if pooled_norm is not None:
+        orchestrator_text += f"\npooled |g| {pooled_norm:.3f}"
+    if phase == "aggregate":
+        orchestrator_text += "\naveraging gradients"
+    ax.text(1.6, middle, orchestrator_text, ha="center", va="center", fontsize=9)
+
+    outbound, inbound = PHASE_MESSAGES.get(phase, (None, None))
+    for index, node in enumerate(nodes):
+        y = -1.2 - index * slot
+        rejected = node["status"] == "rejected"
+        ax.add_patch(
+            FancyBboxPatch(
+                (6.3, y - 0.65),
+                3.4,
+                1.3,
+                boxstyle="round,pad=0.03",
+                facecolor=STATUS_COLORS.get(node["status"], "#e0e0e0"),
+                edgecolor="black",
+            )
+        )
+        lines = [node["id"], node["status"]]
+        if "rows" in node:
+            lines.append(f"{node['rows']} rows  loss {node['loss']:.3f}  |g| {node['gradient_norm']:.3f}")
+        ax.text(8.0, y, "\n".join(lines), ha="center", va="center", fontsize=8)
+
+        offline = node["status"] in ("listening", "dropped", "skipped", "restarted") or (
+            node["status"] == "discovered" and phase != "discover"
+        )
+        active = phase in PHASE_COLORS and phase != "aggregate" and not offline
+        color = "#ef476f" if rejected else PHASE_COLORS[phase] if active else "#cccccc"
+        style = "--" if rejected or not active else "-"
+        for offset, message, direction, size in ((0.22, outbound, 1, node.get("sent_kb")), (-0.22, inbound, -1, node.get("received_kb"))):
+            start, end = (2.95, 6.25) if direction == 1 else (6.25, 2.95)
+            ax.add_patch(
+                FancyArrowPatch(
+                    (start, y + offset),
+                    (end, y + offset),
+                    arrowstyle="-|>",
+                    mutation_scale=12,
+                    color=color,
+                    linestyle=style,
+                    linewidth=1.8 if active else 1.0,
+                )
+            )
+            if active and message and not (rejected and direction == -1):
+                label = "rejected" if rejected else message + (f" ({size:.1f} KB)" if size else "")
+                ax.text(4.6, y + offset + 0.12, label, ha="center", va="bottom", fontsize=7, color="black")
+    return fig

@@ -28,7 +28,6 @@ def build_network(num_features: int, num_classes: int, hidden: int, num_shared: 
             num_shared_experts=num_shared,
             num_routed_experts=num_routed,
             top_k=top_k,
-            bias_update_speed=bias_speed,
         ),
         encoded,
         name="moe",

@@ -22,6 +22,7 @@ from typing import Iterable, Optional, Sequence
 
 import numpy as np
 from polyergalio.models.layers.basal_layers import ANY_SHAPE, Layer, shape_conflict
+from polyergalio.models.optimizers import Optimizer
 from polyergalio.types import Composite, CompositeNode
 from numpy.typing import NDArray
 
@@ -820,6 +821,28 @@ class NeuralNetwork(Composite):
     def zero_gradients(self) -> None:
         for layer in self.layers:
             layer.zero_gradients()
+
+    def get_gradients(self) -> dict[int, dict]:
+        """Layer gradients keyed by position in layers; layers reporting none are skipped."""
+        gradients = {}
+        for position, layer in enumerate(self.layers):
+            layer_gradients = layer.get_gradients()
+            if layer_gradients:
+                gradients[position] = layer_gradients
+        return gradients
+
+    def update_weights(self, gradients: dict[int, dict], optimizer: Optimizer) -> None:
+        """
+        Step the optimizer on supplied gradients, such as ones averaged across nodes.
+
+        Parameters
+        ----------
+        gradients : output of get_gradients()
+        optimizer : optimizer that scales the gradients and updates each layer
+        """
+        layers = self.layers
+        by_layer = {layers[position]: layer_gradients for position, layer_gradients in gradients.items()}
+        optimizer.step(list(by_layer), by_layer)
 
     def shapes(self) -> dict[str, dict[str, tuple]]:
         """
