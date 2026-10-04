@@ -16,7 +16,11 @@ graph API. Two stages:
      -- does it mention a word, which of these words appears, how many times
      does a word appear -- are laid out by tokenizer.py's
      TokenSequenceBuilder and tokenized by the same fitted SentencePiece
-     tokenizer the encoder was pretrained with.
+     tokenizer the encoder was pretrained with. Questions are drawn as train,
+     calibration and test sets: the head trains on the first (main loss plus
+     the act branch), temperatures are fit on the second, and the third is
+     decoded with calibrated probabilities, scored for confidence and
+     escalated by the act branch.
 
 Run: python NNet_spectre_decision_example.py
 """
@@ -26,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
+from NNet_system_one_decision_example import evaluate, fit_calibration, print_evaluation
 from polyergalio.encoders.text_encoders import TextProcessor
 from polyergalio.encoders.tokenizer import SentencePieceTokenizer, TokenSequenceBuilder, fit_tokenizer
 from polyergalio.generators.data_generators import token_accuracy
@@ -60,7 +65,9 @@ MLM_STEPS = 200
 MLM_LEARNING_RATE = 3e-3
 NUM_CHOICES = 4
 NUM_LEVELS = 4
-DECISION_SAMPLES = 256
+TRAIN_SAMPLES = 256
+CALIBRATION_SAMPLES = 128
+TEST_SAMPLES = 128
 DECISION_STEPS = 500
 DECISION_LEARNING_RATE = 0.05
 LOG_EVERY = 50
@@ -314,16 +321,22 @@ def accuracy_by_type(logits: np.ndarray, y: np.ndarray, kwargs: dict) -> dict[st
     }
 
 
-def train_decision(net: NeuralNetwork, X: np.ndarray, y: np.ndarray, kwargs: dict) -> None:
+def train_decision(net: NeuralNetwork, train_set: tuple, calibration_set: tuple, test_set: tuple) -> None:
     """
-    SGD over one fixed batch of real-text questions, DecisionLoss plus the
-    act branch. Evaluated on the same batch it trains on, same as
-    NNet_system_one_decision_example.py -- this is a fit-the-objective demo,
-    not a generalization test.
+    SGD over the train questions with DecisionLoss plus the act branch, then
+    temperatures fit on the calibration questions and calibrated decoding,
+    confidence and escalation reported on the test questions.
+
+    Parameters
+    ----------
+    net : encoder plus DecisionHead network
+    train_set, calibration_set, test_set : (X, y, kwargs) from make_decision_batch
     """
+    X, y, kwargs = train_set
+    x_test, y_test, test_kwargs = test_set
     net.eval()
-    logits = net.forward(X, **kwargs)
-    print(f"decision accuracy before training: {decision_accuracy(logits, y, kwargs):.3f}")
+    logits = net.forward(x_test, **test_kwargs)
+    print(f"test accuracy before training: {decision_accuracy(logits, y_test, test_kwargs):.3f}")
 
     loss_fn = DecisionLoss(ordinal_weight=0.25)
     optimizer = SGD(DECISION_LEARNING_RATE)
@@ -340,13 +353,12 @@ def train_decision(net: NeuralNetwork, X: np.ndarray, y: np.ndarray, kwargs: dic
         if step % LOG_EVERY == 0:
             print(f"decision step {step:4d}  loss {loss:.4f}  act loss {act_loss:.4f}")
 
-    net.eval()
-    logits = net.forward(X, **kwargs)
-    print(f"decision accuracy after training:  {decision_accuracy(logits, y, kwargs):.3f}")
-    for name, value in accuracy_by_type(logits, y, kwargs).items():
+    temperatures = fit_calibration(net, *calibration_set)
+    print("\n--- test questions ---")
+    results = evaluate(net, x_test, y_test, test_kwargs, temperatures)
+    print_evaluation(results, temperatures)
+    for name, value in accuracy_by_type(net.forward(x_test, **test_kwargs), y_test, test_kwargs).items():
         print(f"  {name}: {value:.3f}")
-    escalated = head.escalate()
-    print(f"escalated to system two: {escalated.mean():.3f} of rows")
 
 
 def main():
@@ -376,7 +388,12 @@ def main():
     print(decision_net.summary())
 
     builder = TokenSequenceBuilder(tokenizer)
-    train_decision(decision_net, *make_decision_batch(rng, builder, tokenizer, DECISION_SAMPLES))
+    train_decision(
+        decision_net,
+        make_decision_batch(rng, builder, tokenizer, TRAIN_SAMPLES),
+        make_decision_batch(rng, builder, tokenizer, CALIBRATION_SAMPLES),
+        make_decision_batch(rng, builder, tokenizer, TEST_SAMPLES),
+    )
 
 
 if __name__ == "__main__":

@@ -279,10 +279,8 @@ class FullyConnectedLayer(Layer):
 
         Returns
         -------
-
+        None - inplace operation
         """
-        # print("grad max:", np.max(np.abs(gradient_weights)), "grad bias:", np.max(np.abs(gradient_bias)))
-        # print("weight max:", np.max(np.abs(self.weights)), "bias max:", np.max(np.abs(self.bias)))
         self.bias -= gradient_bias
         self.weights -= gradient_weights
 

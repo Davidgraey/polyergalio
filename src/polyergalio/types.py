@@ -152,7 +152,7 @@ class Serializable:
 
 # -------------- Composite containers  --------------
 class CompositeNode:
-    """One vertex of a Composite: a component and what feeds it."""
+    """One vertex of a Composite Model: a component and what feeds it."""
 
     def __init__(self, name: str, component=None, sources: tuple = ()):
         self.name = name
@@ -181,8 +181,7 @@ class Composite(Serializable, ABC):
     An ordered container of named components, each fed by sources.
 
     Insertion order is execution order
-    source definition is different for each container type.
-    (nodes for a network, input column names for a pipeline)
+    source definitions can be different for each container type
 
     Serialization nests each component's own payload, so a subclass sets component_family to the Serializable family
     those components belong to.

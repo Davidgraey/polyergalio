@@ -217,10 +217,12 @@ class DecisionHead(Layer):
                  act_weight: float = 1.0,
                  type_initialization: str = "truncated_normal",
                  type_initialization_kwargs: Optional[dict] = None,
-                 routed_scaling: float = 1.0,
-                 num_groups: Optional[int] = None,
-                 top_groups: Optional[int] = None,
-
+                 moe_shared_experts: int = 2,
+                 moe_routed_experts: int = 4,
+                 moe_top_k: int = 2,
+                 moe_routed_scaling: float = 1.0,
+                 moe_num_groups: Optional[int] = None,
+                 moe_top_groups: Optional[int] = None,
     ):
         """
         Parameters
@@ -232,6 +234,9 @@ class DecisionHead(Layer):
         act_weight : scale on the act loss gradient
         type_initialization : WEIGHT_INIT_DISPATCHER name for the question-type embedding
         type_initialization_kwargs : keyword arguments bound to that initializer
+        routed_scaling:
+        num_groups:
+        top_groups:
         """
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -251,28 +256,30 @@ class DecisionHead(Layer):
         self.embedding_norm = NormalizeLayer(ni=hidden_dim)
 
         self.trunk_a = MixtureOfExperts(input_dim=hidden_dim,
-                                        upscale_dim=2 * hidden_dim,
+                                        upscale_dim=int(1.5 * hidden_dim),
                                         hidden_dim=hidden_dim,
-                                        num_shared_experts=4,
-                                        num_routed_experts=32,
-                                        top_k=4,
-                                        routed_scaling=routed_scaling,
-                                        num_groups=num_groups,
-                                        top_groups=top_groups,
+                                        num_shared_experts=moe_shared_experts,
+                                        num_routed_experts=moe_routed_experts,
+                                        top_k=moe_top_k,
+                                        routed_scaling=moe_routed_scaling,
+                                        num_groups=moe_num_groups,
+                                        top_groups=moe_top_groups,
                                         activation_type=activation_type)
 
         self.trunk_norm = NormalizeLayer(ni=hidden_dim)
         #
-        # self.trunk_b = MixtureOfExperts(input_dim=hidden_dim,
-        #                                 upscale_dim=2 * hidden_dim,
+        # self.trunk_a = MixtureOfExperts(input_dim=hidden_dim,
+        #                                 upscale_dim=int(2 * hidden_dim),
         #                                 hidden_dim=hidden_dim,
-        #                                 num_shared_experts=4,
-        #                                 num_routed_experts=16,
+        #                                 num_shared_experts=2,
+        #                                 num_routed_experts=32,
         #                                 top_k=4,
-        #                                 routed_scaling=2.5,
-        #                                 num_groups=8,
-        #                                 top_groups=8,
+        #                                 routed_scaling=routed_scaling,
+        #                                 num_groups=num_groups,
+        #                                 top_groups=top_groups,
         #                                 activation_type=activation_type)
+
+        # self.trunk_norm_b = NormalizeLayer(ni=hidden_dim)
 
         self.scorer = FullyConnectedLayer(
             ni=hidden_dim, no=1, activation_type="linear", is_output=True

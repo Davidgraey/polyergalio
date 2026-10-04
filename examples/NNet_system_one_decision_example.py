@@ -8,16 +8,26 @@ forward pass answers every question (no chain-of-thought, no decoding loop),
 which is the "system one" part: one Spectre mixing pass over the sequence,
 then one shared scorer read off the [MARK] positions.
 
+Rows are split into train, calibration and test sets. The network trains on
+the train rows (main loss plus the act branch), temperatures are fit on the
+calibration rows, and the test rows are decoded with calibrated probabilities,
+scored for confidence, and escalated by the act branch.
+
 Run: python NNet_system_one_decision_example.py
 """
 
+import numpy as np
+
 from polyergalio.generators.data_generators import RandomDatasetGenerator
-from polyergalio.models.constants import DECISION_TYPES
+from polyergalio.models.constants import DECISION_TYPES, EPSILON
 from polyergalio.models.embedding.embedding import TextEmbedding
 from polyergalio.models.layers.decision_layers import (
     DecisionHead,
+    calibrated_probabilities,
+    decision_confidence,
     decision_correct,
     decode_decisions,
+    fit_temperatures,
     masked_softmax,
 )
 from polyergalio.models.layers.spectre_layers import SpectreAttention
@@ -30,6 +40,9 @@ HEAD_HIDDEN = 16
 NUM_HEADS = 4
 LEARNING_RATE = 0.05
 TRAIN_STEPS = 200
+NUM_SAMPLES = 768
+SPLIT_FRACTIONS = (0.6, 0.2, 0.2)
+ESCALATION_THRESHOLD = 0.5
 
 
 def build_network(vocab_size: int, sequence_length: int, padding_idx: int) -> NeuralNetwork:
@@ -75,11 +88,80 @@ def accuracy(logits, y, kwargs: dict) -> float:
     return float(row_correctness(logits, y, kwargs).mean())
 
 
+def split_rows(x, y, kwargs: dict, fractions=SPLIT_FRACTIONS) -> list[tuple]:
+    """
+    Split rows in order into train, calibration and test sets.
+
+    Returns
+    -------
+    one (x, y, kwargs) tuple per fraction
+    """
+    edges = np.cumsum([int(len(x) * fraction) for fraction in fractions[:-1]])
+    return [
+        (x[rows], y[rows], {name: value[rows] for name, value in kwargs.items()})
+        for rows in np.split(np.arange(len(x)), edges)
+    ]
+
+
+def fit_calibration(net: NeuralNetwork, x, y, kwargs: dict) -> dict[str, float]:
+    """Temperature per (type, option count) bucket, fit on rows the model did not train on."""
+    net.eval()
+    head = net.node("decision_head").layer
+    logits = net.forward(x, **kwargs)
+    return fit_temperatures(logits, y, kwargs["token_mask"], kwargs["decisiontypes"], head.TEMPERATURE_GRID)
+
+
+def answer_nll(probabilities, y) -> float:
+    picked = np.take_along_axis(probabilities, y[:, None], axis=-1)[:, 0]
+    return float(-np.mean(np.log(np.maximum(picked, EPSILON))))
+
+
+def rate(values, rows) -> float:
+    return float(values[rows].mean()) if rows.any() else float("nan")
+
+
+def evaluate(net: NeuralNetwork, x, y, kwargs: dict, temperatures: dict, threshold: float = ESCALATION_THRESHOLD) -> dict:
+    """
+    Decode, score and escalate every row with the head's three outputs.
+
+    Returns
+    -------
+    per-row arrays (decisions, correct, confidence, act, escalated) and the
+    answer NLL before and after calibration
+    """
+    net.eval()
+    head = net.node("decision_head").layer
+    token_mask, decisiontypes = kwargs["token_mask"], kwargs["decisiontypes"]
+    logits = net.forward(x, **kwargs)
+    raw = masked_softmax(logits, token_mask)
+    probabilities = calibrated_probabilities(logits, token_mask, decisiontypes, temperatures)
+    decisions = decode_decisions(probabilities, decisiontypes)
+    return dict(
+        decisions=decisions,
+        correct=decision_correct(decisions, y, decisiontypes),
+        confidence=decision_confidence(probabilities, token_mask),
+        act=head.act_probabilities,
+        escalated=head.escalate(threshold),
+        nll_raw=answer_nll(raw, y),
+        nll_calibrated=answer_nll(probabilities, y),
+    )
+
+
+def print_evaluation(results: dict, temperatures: dict) -> None:
+    """Print temperatures, calibration effect, confidence and the escalation split."""
+    escalated, correct = results["escalated"], results["correct"]
+    print("temperatures: " + ", ".join(f"{bucket}={value:.2f}" for bucket, value in temperatures.items()))
+    print(f"NLL raw {results['nll_raw']:.3f} -> calibrated {results['nll_calibrated']:.3f}")
+    print(f"accuracy {correct.mean():.3f}  mean confidence {results['confidence'].mean():.3f}  mean P(act) {results['act'].mean():.3f}")
+    print(f"escalated to system two: {escalated.mean():.3f} of rows")
+    print(f"accuracy kept {rate(correct, ~escalated):.3f}  escalated {rate(correct, escalated):.3f}")
+
+
 def main():
     generator = RandomDatasetGenerator(random_seed=0)
     X, y, meta = generator.generate(
         "decision",
-        num_samples=256,
+        num_samples=NUM_SAMPLES,
         num_choices=4,
         num_levels=4,
         decision_types=tuple(DECISION_TYPES),
@@ -92,6 +174,9 @@ def main():
         token_mask=meta["token_mask"],
         decisiontypes=meta["decisiontypes"],
     )
+    train_set, calibration_set, test_set = split_rows(X, y, kwargs)
+    x_train, y_train, train_kwargs = train_set
+    x_test, y_test, test_kwargs = test_set
 
     net = build_network(
         vocab_size=meta["vocab_size"],
@@ -100,31 +185,27 @@ def main():
     )
 
     net.eval()
-    logits = net.forward(X, **kwargs)
     print(net.summary())
-    print(f"accuracy before training: {accuracy(logits, y, kwargs):.3f}")
+    print(f"test accuracy before training: {accuracy(net.forward(x_test, **test_kwargs), y_test, test_kwargs):.3f}")
 
     loss_fn = DecisionLoss(ordinal_weight=0.25)
     optimizer = SGD(LEARNING_RATE)
-
     head = net.node("decision_head").layer
 
     net.train()
     for step in range(TRAIN_STEPS):
         net.zero_gradients()
-        logits = net.forward(X, **kwargs)
-        loss = loss_fn(logits, y, kwargs["token_mask"], kwargs["decisiontypes"])
-        act_loss = head.score_act(row_correctness(logits, y, kwargs))
+        logits = net.forward(x_train, **train_kwargs)
+        loss = loss_fn(logits, y_train, train_kwargs["token_mask"], train_kwargs["decisiontypes"])
+        act_loss = head.score_act(row_correctness(logits, y_train, train_kwargs))
         net.backward(loss_fn.backward())
         optimizer.step(net.layers)
         if step % 50 == 0:
             print(f"step {step:4d}  loss {loss:.4f}  act loss {act_loss:.4f}")
 
-    net.eval()
-    logits = net.forward(X, **kwargs)
-    print(f"accuracy after training: {accuracy(logits, y, kwargs):.3f}")
-    escalated = head.escalate()
-    print(f"escalated to system two: {escalated.mean():.3f} of rows")
+    temperatures = fit_calibration(net, *calibration_set)
+    print("\n--- test rows ---")
+    print_evaluation(evaluate(net, x_test, y_test, test_kwargs, temperatures), temperatures)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,13 @@ time-domain definition and against prefill / decode_step.
 import numpy as np
 import pytest
 from conftest import numeric_gradient, relative_error
+from polyergalio.encoders.text_encoders import TextProcessor
+from polyergalio.encoders.tokenizer import SentencePieceTokenizer, fit_tokenizer
+from polyergalio.models.constants import ClassificationTask
+from polyergalio.models.embedding.embedding import TextEmbedding
+from polyergalio.models.embedding.positional import RopeEmbedding
+from polyergalio.models.layers.basal_layers import FullyConnectedLayer, RMSNormLayer
+from polyergalio.models.layers.operator_layers import LatentSum, MaskGather
 from polyergalio.models.layers.spectre_layers import (
     DenseHead,
     HeadGate,
@@ -14,6 +21,8 @@ from polyergalio.models.layers.spectre_layers import (
     SpectreAttention,
     SpectreDecoderAttention,
 )
+from polyergalio.models.model_loss import CrossEntropyLoss
+from polyergalio.models.neural_network import NeuralNetwork
 from polyergalio.models.optimizers import Adam
 
 SEQUENCE = 8
@@ -270,3 +279,66 @@ def test_dense_head_gradients_match_finite_differences(activation_type):
     assert relative_error(dx, numeric_gradient(loss, x)) < 1e-6
     assert relative_error(layer.gradient_weights, numeric_gradient(loss, layer.weights)) < 1e-6
     assert relative_error(layer.gradient_bias, numeric_gradient(loss, layer.bias)) < 1e-6
+
+
+# -------------    stacked encoder    ----------------------------
+def test_a_multi_block_encoder_overfits_masked_language_modelling(tmp_path):
+    """two Spectre blocks memorise one cloze batch of 50 sentences: tokenizer, processor, embedding, RoPE, norms, attention, ffn, residuals, gather and head train together"""
+    length, hidden, blocks, cases = 20, 32, 2, 50
+    rng = np.random.default_rng(0)
+
+    sentences = [
+        f"{det} {adjective} {noun} {verb} {adverb}."
+        for det in ("the", "a")
+        for adjective in ("small", "large", "quiet", "loud", "red", "blue")
+        for noun in ("cat", "dog", "bird", "fish", "fox", "owl")
+        for verb in ("runs", "jumps", "sleeps", "swims", "climbs", "watches")
+        for adverb in ("fast", "slowly", "quietly", "today")
+    ]
+    texts = [sentences[i] for i in rng.choice(len(sentences), size=cases, replace=False)]
+
+    model_path = fit_tokenizer(texts, str(tmp_path / "tokenizer"), vocab_size=80, hard_vocab_limit=False)
+    processor = TextProcessor(SentencePieceTokenizer(model_path), max_length=length, mask_prob=0.25, random_seed=0)
+    batch = processor.distort_batch(texts, "cloze")
+    ids, attention_mask, target_mask = batch["input_ids"], batch["attention_mask"], batch["target_mask"]
+    vocab, padding_id = processor.vocab_size, processor.special.PAD
+    labels = batch["labels"][target_mask]
+    targets = np.eye(vocab)[labels]
+
+    net = NeuralNetwork(name="spectre_mlm", input_shape=(length,))
+    stream = net.connect(TextEmbedding(vocab, hidden, padding_idx=padding_id), net.input, name="embedding")
+    stream = net.connect(RopeEmbedding(length, hidden), stream, name="positional")
+    for block in range(blocks):
+        normed = net.connect(RMSNormLayer(hidden), stream, name=f"prenorm_{block}")
+        mixed = net.connect(
+            SpectreAttention(length, hidden, num_heads=4, memory_tokens=2, use_wrm=True), normed, name=f"attention_{block}"
+        )
+        mixed = net.connect(LatentSum(), mixed, stream, name=f"attention_residual_{block}")
+        expanded = net.connect(FullyConnectedLayer(hidden, 2 * hidden, "swish"), mixed, name=f"ffn_1_{block}")
+        projected = net.connect(FullyConnectedLayer(2 * hidden, hidden, "linear"), expanded, name=f"ffn_2_{block}")
+        stream = net.connect(LatentSum(), projected, mixed, name=f"ffn_residual_{block}")
+    stream = net.connect(RMSNormLayer(hidden), stream, name="final_norm")
+    gathered = net.connect(MaskGather(), stream, name="mask_gather")
+    net.output = net.connect(FullyConnectedLayer(hidden, vocab, "linear", is_output=True), gathered, name="mlm_head")
+
+    loss_fn = CrossEntropyLoss(task=ClassificationTask.MULTINOMIAL)
+    optimizer = Adam(3e-3)
+    net.train()
+    losses = []
+    for _ in range(500):
+        batch = processor.distort_batch(texts, "cloze")
+        ids, attention_mask, target_mask = batch["input_ids"], batch["attention_mask"], batch["target_mask"]
+        labels = batch["labels"][target_mask]
+        targets = np.eye(vocab)[labels]
+        net.zero_gradients()
+        logits = net.forward(ids, mask=attention_mask, target_mask=target_mask)
+        losses.append(loss_fn(logits, targets))
+        net.backward(loss_fn.backward())
+        optimizer.step(net.layers)
+
+    net.eval()
+    logits = net.forward(ids, mask=attention_mask, target_mask=target_mask)
+    accuracy = np.mean(np.argmax(logits, axis=-1) == labels)
+    assert np.all(np.isfinite(losses))
+    assert losses[-1] < 0.1 * losses[0]
+    assert accuracy > 0.95
