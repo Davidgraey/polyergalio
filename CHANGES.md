@@ -1,3 +1,20 @@
+0.1.6
+=====================
+Breaking Change - reworked the basal types used. Previously, we have a Model, Layer and other mix-ins that was just
+getting out of hand. We reworked these to have a clearer hierarchy, and to make the subtypes interchangable with minimal
+effort.
+|--->Serializable
+|-------> Composite
+|-----------> Network
+|-----------> Feature Pipeline
+|-----------> CompositeNode (NOT SUBCLASSES)
+|
+|-------> BasalEstimator
+|-----------> Layer
+|-----------> Processor (feature processing)
+|-----------> FittedModel
+
+
 0.1.5
 =====================
 Added a distributed training process - polyergalio.models.training/

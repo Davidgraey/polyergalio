@@ -1,5 +1,5 @@
 """
-A container for wiring layers into a network.
+A container for wiring estimators into a network.
 
 Layers know how to transform an array and how to push a gradient back through
 themselves. What they do not know is what feeds them. This module owns that.
@@ -14,69 +14,85 @@ things follow from that:
     exist, so there is no forward reference to close a loop with
   * insertion order is therefore already a topological order, and the forward
     pass is a walk down the list
+
+Every node holds its own estimator, and the node name is the key everything
+else uses: gradients are `gradient_<node name>`, saved nodes are keyed by name.
+
+Training mode is one operation at every level. `train()` and `eval()` on the
+network cascade to its nodes, a node passes them to its layer, and a layer
+passes them to its own sublayers.
 """
+from __future__ import annotations
 
 import inspect
 import time
 from typing import Iterable, Optional, Sequence
 
 import numpy as np
-from polyergalio.models.layers.basal_layers import ANY_SHAPE, Layer, shape_conflict
-from polyergalio.models.optimizers import Optimizer
-from polyergalio.types import Composite, CompositeNode
 from numpy.typing import NDArray
 
+from polyergalio.base_model import BasalEstimator
+from polyergalio.models.constants import ANY_SHAPE
+from polyergalio.utilities import shape_conflict
+from polyergalio.composite_model import Composite, CompositeNode
+
 INPUT_NAME = "input"
+GRADIENT_PREFIX = "gradient_"
+
+
+def forward_options(layer: BasalEstimator) -> tuple[frozenset[str], bool]:
+    """Names of the optional forward parameters, and whether forward accepts **kwargs."""
+    parameters = inspect.signature(layer.forward).parameters
+    optional = frozenset(
+        name for name, parameter in parameters.items() if parameter.default is not inspect.Parameter.empty
+    )
+    return optional, any(parameter.kind is parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
 class Node(CompositeNode):
     """
-    one vertex in the graph: a layer, and references (edges) to the nodes feeding it.
+    One vertex in the graph: an estimator, and references (edges) to the nodes feeding it.
 
-    nodes are compared and hashed by identity, so the same node passed to two consumers is
+    Nodes are compared and hashed by identity, so the same node passed to two consumers is
     one shared producer, which is what makes a fan-out visible in the code that builds it.
 
-    Shapes, logic, and processes are held in the Layer objects that the Node wraps.
+    Shapes, logic, and processes are held in the estimator that the Node wraps.
 
-    Network
-        Node(Layer) -- Node(Layer) --> Node(Layer)
+        Network
+            Node(Layer) -- Node(Layer) --> Node(Layer)
 
-
-    Each node also carries the shape it produces for downstream / outbound edges
-    comes from the sources at construction
-    That is what the next node's check is made against, so an array width flows down the graph as it is wired and checked on connect
+    A layer node's `in_shape` is the layer's declared input shapes, one per source. Its
+    `out_shape` is what it produces for downstream edges, resolved from the sources it was
+    wired to. That is what the next node's check is made against, so an array width flows
+    down the graph as it is wired and checked on connect.
     """
 
     def __init__(
         self,
         name: str,
-        layer: Optional[Layer] = None,
+        layer: Optional[BasalEstimator] = None,
         sources: tuple = (),
         shape: tuple = ANY_SHAPE,
     ):
+        """
+        Parameters
+        ----------
+        name : label, and the key the network stores this node's gradients under
+        layer : the estimator to run, None for the graph's input node
+        sources : nodes feeding this one, in the order the layer's forward takes them
+        shape : trailing axes of the data entering the graph, for the input node only
+        """
         super().__init__(name, layer, sources)
 
         if layer is None:
             self.in_shape = shape
             self.out_shape = shape
-        else:
-            self.in_shape = shape[0]
-            self.resolve_shapes()
-
-        if layer is None:
             self.forward_kwargs: frozenset[str] = frozenset()
             self.accepts_any_kwarg = False
         else:
-            parameters = inspect.signature(layer.forward).parameters
-            self.forward_kwargs = frozenset(
-                name
-                for name, parameter in parameters.items()
-                if parameter.default is not inspect.Parameter.empty
-            )
-            self.accepts_any_kwarg = any(
-                parameter.kind is parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            )
+            self.in_shape = layer.shapes["input"]
+            self.forward_kwargs, self.accepts_any_kwarg = forward_options(layer)
+            self.resolve_shapes()
 
         for source in sources:
             source.consumers.append(self)
@@ -97,12 +113,26 @@ class Node(CompositeNode):
         self.out_shape = resolved[0]
 
     @property
-    def layer(self) -> Optional[Layer]:
+    def layer(self) -> Optional[BasalEstimator]:
         return self.component
 
     @property
     def shapes(self) -> dict[str, tuple]:
         return {"input": self.in_shape, "output": self.out_shape}
+
+    @property
+    def training(self) -> bool:
+        """The layer's mode; the input node has no layer and reports True."""
+        return True if self.layer is None else self.layer.training
+
+    def train(self, mode: bool = True) -> Node:
+        """Pass the mode to the layer, which passes it to its sublayers."""
+        if self.layer is not None:
+            self.layer.train(mode)
+        return self
+
+    def eval(self) -> Node:
+        return self.train(False)
 
     def __repr__(self):
         if self.is_source:
@@ -114,13 +144,13 @@ class Node(CompositeNode):
         return f"{self.__repr__()} producing {self.out_shape}"
 
 
-class NeuralNetwork(Composite):
+class Network(Composite):
     """
     A directed acyclic graph of layer connections D(AG)
 
     connect the DAG by passing nodes:
 
-        net = NeuralNetwork()
+        net = Network()
         audio = net.input
         # fanning out to multiple outputs
         amp = net.connect(amplitude_fc, audio)
@@ -130,7 +160,14 @@ class NeuralNetwork(Composite):
 
     or sequentially, when there is nothing to branch::
 
-        net = NeuralNetwork([layer_a, layer_b, layer_c])
+        net = Network([layer_a, layer_b, layer_c])
+
+    Each node owns its layer: connecting a layer that already runs at another node is an error.
+
+    Gradients and weights are keyed by node name:
+
+        gradients = net.get_gradients()      # {"gradient_<node name>": {...}}
+        net -= gradients                     # or net.update_weights(**gradients)
 
     Swapping a trained network's head means connecting a new node to an
     already-trained node and retargeting the output -- not editing an
@@ -150,15 +187,15 @@ class NeuralNetwork(Composite):
     layer list you hand it, so `optimizer.step([new_head_layer])` instead
     of `optimizer.step(net.layers)` trains only the head. `backward()`
     still has to flow gradient through the encoder's layers to reach it
-    (that's unavoidable), but nothing forces you to apply those encoder
+    (that's unavoidable), but nothing forces you to APPLY those encoder
     gradients.
     """
 
-    component_family = Layer
+    component_family = BasalEstimator
 
     def __init__(
         self,
-        layers: Optional[Iterable[Layer]] = None,
+        layers: Optional[Iterable[BasalEstimator]] = None,
         name: Optional[str] = None,
         input_shape: tuple = ANY_SHAPE,
     ):
@@ -173,19 +210,15 @@ class NeuralNetwork(Composite):
             like every other one; left out, the first layer is taken on trust
             until data arrives.
         """
-        # through object.__setattr__, so the attribute interception below has
-        # its registry available before any assignment happens
-        object.__setattr__(self, "_registered", [])
         super().__init__(name)
-        object.__setattr__(self, "_output", None)
-        object.__setattr__(self, "training", True)
-        object.__setattr__(self, "activations", {})
-        object.__setattr__(self, "_timings", {})
+        self._output = None
+        self.training = True
+        self.activations = {}
+        self._timings = {}
 
-        source = Node(INPUT_NAME, shape=tuple(input_shape))
-        object.__setattr__(self, "_input", source)
-        object.__setattr__(self, "_input_shape", tuple(input_shape))
-        self._nodes.append(source)
+        self._input = Node(INPUT_NAME, shape=tuple(input_shape))
+        self._input_shape = tuple(input_shape)
+        self._nodes.append(self._input)
 
         if layers is not None:
             self.extend(layers)
@@ -196,18 +229,20 @@ class NeuralNetwork(Composite):
         """the graph's source node; pass it as an input source to the first layer"""
         return self._input
 
-    def connect(self, layer: Layer, *sources: Node, name: Optional[str] = None, strict: bool = True) -> Node:
+    def connect(
+        self, layer: BasalEstimator, *sources: Node, name: Optional[str] = None, strict: bool = True
+    ) -> Node:
         """
         Place a layer in the graph, fed by the given nodes, and return its node.
 
         Parameters
         ----------
-        layer : the layer to run at this node
+        layer : the layer to run at this node; it may not already run at another node
         sources : the nodes whose outputs feed it, in the order the layer's
             forward takes them. Passing one node to two different calls is how
             a fan-out is expressed.
         name : optional label. Defaults to the layer's class name with a
-            counter, and is only used for display and lookup.
+            counter, and is the key its gradients are stored under.
         strict : False places the layer without requiring its inputs, as an
             unwired node that reconnect() can feed later; an unwired node is
             skipped by forward.
@@ -262,15 +297,13 @@ class NeuralNetwork(Composite):
         """
         return super().disconnect(node, *sources)
 
-    def delete(self, node: Node | str) -> Layer:
+    def delete(self, node: Node | str) -> BasalEstimator:
         """
         Remove a node and its layer from the network, after disconnect().
 
         Halts, changing nothing, while the node still has inputs or is read
         by another node, or if it is the network's output (retarget the
-        output first). The layer leaves net.layers, so the optimizer and
-        serialization no longer see it, unless another node still runs the
-        same layer.
+        output first).
 
             net.disconnect(net.node("mlm_head"))
             net.delete(net.node("mlm_head"))
@@ -292,15 +325,25 @@ class NeuralNetwork(Composite):
             )
 
     def after_delete(self, node: Node) -> None:
-        if not any(member.layer is node.layer for member in self._nodes):
-            self._registered[:] = [layer for layer in self._registered if layer is not node.layer]
         self.activations.pop(node.name, None)
         self._timings.pop(node.name, None)
 
-    def entry_point(self, layer: Layer):
+    def entry_point(self, layer: BasalEstimator):
         return layer.forward
 
-    def check_connection(self, layer: Layer, sources: tuple, strict: bool = True, replacing=None) -> None:
+    def check_connection(
+        self, layer: BasalEstimator, sources: tuple, strict: bool = True, replacing=None
+    ) -> None:
+        if not isinstance(layer, BasalEstimator):
+            raise TypeError(f"a node runs a BasalEstimator, got {type(layer).__name__}")
+
+        holder = next((node for node in self._nodes if node.layer is layer), None)
+        if holder is not None and holder is not replacing:
+            raise ValueError(
+                f"{layer.__class__.__name__} already runs at node {holder.name!r}; "
+                "every node needs its own layer"
+            )
+
         if strict and not sources:
             raise ValueError(
                 f"{layer.__class__.__name__} needs at least one source. Pass "
@@ -319,8 +362,8 @@ class NeuralNetwork(Composite):
                 )
 
         if strict:
-            self._check_graph(layer, len(sources))
-            self._check_shapes(layer, sources)
+            self.check_graph(layer, len(sources))
+            self.check_shapes(layer, sources)
 
     def check_rewire(self, node: Node, sources: tuple) -> None:
         downstream = self.descendants(node)
@@ -340,7 +383,7 @@ class NeuralNetwork(Composite):
         for member in [node, *self.descendants(node)]:
             member.resolve_shapes()
             if strict and member is not node:
-                self._check_shapes(member.layer, member.sources)
+                self.check_shapes(member.layer, member.sources)
 
     def descendants(self, node: Node) -> list[Node]:
         """every node that depends on this one, in execution order"""
@@ -376,58 +419,39 @@ class NeuralNetwork(Composite):
             pending.remove(candidate)
         self._nodes[:] = ordered
 
-    def make_node(self, name: str, layer: Layer, sources: tuple) -> Node:
+    def make_node(self, name: str, layer: BasalEstimator, sources: tuple) -> Node:
         return Node(name, layer, sources)
 
     def after_connect(self, node: Node) -> None:
-        self._remember(node.layer)
-        object.__setattr__(self, "_output", node)
+        node.train(self.training)
+        self._output = node
 
-    def _check_graph(self, layer: Layer, given: int) -> None:
+    def check_graph(self, layer: BasalEstimator, given: int) -> None:
         """
-        comapre the edge count against its the layer's forward signature and declared shapes
+        Compare the edge count against the layer's forward signature and declared shapes.
 
         Three counts have to agree
         - how many sources were passed
         - how many args forward takes
         - how many input shapes the layer declares
 
-        no returns, just erroring -- designed to fail when constructing, not passing data.
+        Raises only; designed to fail when constructing, not when passing data.
         """
         name = layer.__class__.__name__
-        _shapes = layer.shapes
-        print(_shapes)
-        emitted = len(_shapes["output"])
+        shapes = layer.shapes
+        emitted = len(shapes["output"])
         if emitted != 1:
             raise ValueError(
                 f"{name} declares {emitted} outputs. A node carries one value"
             )
 
-        parameters = list(inspect.signature(layer.forward).parameters.values())
-        positional = [
-            parameter
-            for parameter in parameters
-            if parameter.kind
-            in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
-            and parameter.name != "self"
-        ]
-        variadic = any(
-            parameter.kind == parameter.VAR_POSITIONAL for parameter in parameters
-        )
-
-        if not variadic:
-            required = sum(
-                1 for parameter in positional if parameter.default is parameter.empty
+        required, maximum = self.positional_counts(layer.forward)
+        if given < required or (maximum is not None and given > maximum):
+            raise ValueError(
+                f"{name}.forward takes {required} to {maximum} inputs, got {given}"
             )
-            if not (required <= given <= len(positional)):
-                raise ValueError(
-                    f"{name}.forward takes {required} to "
-                    f"{len(positional)} inputs, got {given}"
-                )
 
-        # optional forward arguments are not edges
-        # the declaration is compared against the edges
-        declared = len(layer.shapes["input"])
+        declared = len(shapes["input"])
         if given > declared:
             raise ValueError(
                 f"{name} was given {given} sources but declares {declared} "
@@ -435,7 +459,7 @@ class NeuralNetwork(Composite):
                 "one shape per input!"
             )
 
-    def _check_shapes(self, layer: Layer, sources: tuple[Node, ...]) -> None:
+    def check_shapes(self, layer: BasalEstimator, sources: tuple[Node, ...]) -> None:
         """
         Compare what each source produces against what the layer says it takes,
         pairing them by position.
@@ -461,37 +485,12 @@ class NeuralNetwork(Composite):
                     f"{source.name!r} at position {position}: {conflict}"
                 )
 
-    def extend(self, layers: Iterable[Layer]) -> Node:
+    def extend(self, layers: Iterable[BasalEstimator]) -> Node:
         """chain layers end to end"""
         node = self._output or self._input
         for layer in layers:
             node = self.connect(layer, node)
         return node
-
-    def add(
-        self,
-        name: str,
-        layer: Layer,
-        inputs: str | Node | Iterable = "input",
-    ) -> str:
-        """
-        name-based wiring, kept so existing graphs keep working.
-
-        Resolves each name to a node and delegates to connect. Prefer connect:
-        a name is matched at wiring time, so a typo that happens to hit another
-        real node produces a valid graph with the wrong edge, which nothing can
-        detect.
-        """
-        requested = (inputs,) if isinstance(inputs, (str, Node)) else tuple(inputs)
-        sources = tuple(
-            source if isinstance(source, Node) else self.get_node(source)
-            for source in requested
-        )
-        return self.connect(layer, *sources, name=name).name
-
-    def get_node(self, name: str) -> Node:
-        """as node(), under the older name"""
-        return self.node(name)
 
     # ------------- the output
     @property
@@ -500,32 +499,13 @@ class NeuralNetwork(Composite):
             raise ValueError("the network has no layers")
         return self._output
 
-    # TODO: this is likely overengineered.
     @output.setter
     def output(self, node: Node) -> None:
         if not isinstance(node, Node):
             raise TypeError("the output must be a Node() returned by connect()")
         if not any(known is node for known in self._nodes):
             raise ValueError(f"node {node.name!r} belongs to a different network")
-        object.__setattr__(self, "_output", node)
-
-    def set_output(self, node: Node | str) -> None:
-        """as the output property, accepting a name for convenience"""
-        self.output = self.get_node(node) if isinstance(node, str) else node
-
-    # ------------- registration
-    def __setattr__(self, attribute: str, value):
-        """assigning a Layer registers it directly"""
-        if isinstance(value, Layer):
-            self._remember(value)
-        elif isinstance(value, NeuralNetwork) and value is not self:
-            for layer in value.layers:
-                self._remember(layer)
-        object.__setattr__(self, attribute, value)
-
-    def _remember(self, layer: Layer) -> None:
-        if not any(known is layer for known in self._registered):
-            self._registered.append(layer)
+        self._output = node
 
     # ------------- the passes
     def forward(self, x_data: NDArray, **kwargs) -> NDArray:
@@ -536,13 +516,10 @@ class NeuralNetwork(Composite):
             that declare a matching optional parameter -- mask, forced_activation,
             or anything a layer adds later. A layer that doesn't declare the
             name never receives it, so unused kwargs are silently ignored.
-            training_now defaults to the network's own train()/eval() state
-            and can be overridden here like any other kwarg.
+            Mode is not a kwarg: layers read their own `training`, set by train() / eval().
         """
-        start = time.perf_counter()
         output = self.output
         values = {self._input: x_data}
-        pool = {"training_now": self.training, **kwargs}
 
         for node in self._nodes:
             if node.is_source or not self.is_wired(node):
@@ -551,13 +528,9 @@ class NeuralNetwork(Composite):
                 continue
             arguments = [values[source] for source in node.sources]
             passthrough = (
-                pool
+                kwargs
                 if node.accepts_any_kwarg
-                else {
-                    key: value
-                    for key, value in pool.items()
-                    if key in node.forward_kwargs
-                }
+                else {key: value for key, value in kwargs.items() if key in node.forward_kwargs}
             )
             start = time.perf_counter()
             try:
@@ -568,11 +541,9 @@ class NeuralNetwork(Composite):
                     f"{node.name} ({node.layer.__class__.__name__}).forward failed "
                     f"on input shape(s) {shapes}: {error}"
                 ) from error
-            self._record_timing(node.name, "forward", time.perf_counter() - start)
+            self.record_timing(node.name, "forward", time.perf_counter() - start)
 
-        object.__setattr__(
-            self, "activations", {node.name: value for node, value in values.items()}
-        )
+        self.activations = {node.name: value for node, value in values.items()}
         if output not in values:
             raise ValueError(
                 f"the output node {output.name!r} was not run: it, or a node it "
@@ -584,15 +555,14 @@ class NeuralNetwork(Composite):
         """
         Navigate the gradient back through the graph
         """
-        start = time.perf_counter()
         gradients = {self.output: incoming_gradient}
 
         for node in reversed(self._nodes):
             if node.is_source or node not in gradients:
-                # nothing downstream in the DAG
                 continue
 
             incoming = gradients.pop(node)
+            start = time.perf_counter()
             try:
                 returned = node.layer.backward(incoming)
             except Exception as error:
@@ -600,7 +570,7 @@ class NeuralNetwork(Composite):
                     f"{node.name} ({node.layer.__class__.__name__}).backward failed "
                     f"on gradient shape {np.shape(incoming)}: {error}"
                 ) from error
-            self._record_timing(node.name, "backward", time.perf_counter() - start)
+            self.record_timing(node.name, "backward", time.perf_counter() - start)
             parts = returned if len(node.sources) > 1 else (returned,)
 
             if len(parts) != len(node.sources):
@@ -627,7 +597,7 @@ class NeuralNetwork(Composite):
     def __call__(self, x_data: NDArray, **kwargs) -> NDArray:
         return self.forward(x_data, **kwargs)
 
-    def _record_timing(self, name: str, phase: str, elapsed: float) -> None:
+    def record_timing(self, name: str, phase: str, elapsed: float) -> None:
         entry = self._timings.setdefault(
             name,
             {
@@ -642,7 +612,7 @@ class NeuralNetwork(Composite):
 
     def reset_timings(self) -> None:
         """clear accumulated per-node timing, e.g. between epochs"""
-        object.__setattr__(self, "_timings", {})
+        self._timings = {}
 
     def timing_summary(self, top: Optional[int] = None) -> str:
         """
@@ -704,16 +674,6 @@ class NeuralNetwork(Composite):
                     f"{node.name} feeds nothing and is not the output, so it "
                     "runs forward but never trains"
                 )
-
-        orphans = [
-            layer
-            for layer in self._registered
-            if not any(node.layer is layer for node in self._nodes)
-        ]
-        for layer in orphans:
-            problems.append(
-                f"{layer.__class__.__name__} is registered but not connected"
-            )
         return problems
 
     def prune(self) -> list[str]:
@@ -722,7 +682,7 @@ class NeuralNetwork(Composite):
 
         A branch left behind by retargeting `net.output` elsewhere (e.g.
         swapping a trained network's head) keeps running forward every
-        pass and cluttering `layers()`, `summary()`, and serialization,
+        pass and cluttering `layers`, `summary()`, and serialization,
         even though `backward()` already ignores it -- `validate()` flags
         it but leaves it in place. This removes such nodes outright, by
         walking `.sources` back from the output and dropping anything
@@ -744,19 +704,15 @@ class NeuralNetwork(Composite):
 
         kept = [node for node in self._nodes if node in reachable]
         dropped = [node for node in self._nodes if node not in reachable]
-        dropped_layers = {node.layer for node in dropped}
 
         for node in kept:
             node.consumers = [
                 consumer for consumer in node.consumers if consumer in reachable
             ]
 
-        object.__setattr__(self, "_nodes", kept)
-        object.__setattr__(
-            self,
-            "_registered",
-            [layer for layer in self._registered if layer not in dropped_layers],
-        )
+        self._nodes = kept
+        for node in dropped:
+            self.after_delete(node)
         return [node.name for node in dropped]
 
     # ------------- serialization
@@ -772,79 +728,81 @@ class NeuralNetwork(Composite):
                 "saved network, the saved nodes may be out of order"
             ) from error
 
-    def extra_weights(self) -> dict:
+    def extra_state(self) -> dict:
         return {"output": self.output.name}
 
-    def restore_extras(self, weights: dict) -> None:
-        object.__setattr__(self, "_output", self.node(weights["output"]))
+    def restore_extras(self, state: dict) -> None:
+        self._output = self.node(state["output"])
 
-    def train(self, mode: bool = True) -> 'NeuralNetwork':
-        """switch the network and every layer in it between training and inference"""
-        object.__setattr__(self, "training", mode)
-        for layer in self.layers:
-            layer.train(mode)
+    # ------------- mode
+    def train(self, mode: bool = True) -> Network:
+        """Switch the network, and every node and layer in it, between training and inference."""
+        self.training = mode
+        for node in self._nodes:
+            node.train(mode)
         return self
 
-    def eval(self) -> 'NeuralNetwork':
-        """
-        switch to inference -- changes training behavior and training-specific behaviors
-        """
+    def eval(self) -> Network:
+        """Switch to inference."""
         return self.train(False)
 
+    # ------------- parameters, keyed by node name
     @property
-    def layers(self) -> list[Layer]:
-        """
-        return every registered layer in graph order
-        """
-        graph_nodes = [node.layer for node in self._nodes if not node.is_source]
-        extra = [
-            layer
-            for layer in self._registered
-            if not any(known is layer for known in graph_nodes)
-        ]
-        return graph_nodes + extra
+    def layers(self) -> list[BasalEstimator]:
+        """every node's layer, in graph order"""
+        return [node.layer for node in self._nodes if not node.is_source]
 
     @property
     def num_parameters(self) -> int:
-        total = 0
-        for layer in self.layers:
-            count = layer.num_parameters
-            if count:
-                total += count
-        return total
+        return sum(layer.num_parameters for layer in self.layers)
 
     def purge(self) -> None:
+        """Clear every layer's forward-pass caches and the stored activations."""
         for layer in self.layers:
             layer.purge()
-        object.__setattr__(self, "activations", {})
+        self.activations = {}
 
     def zero_gradients(self) -> None:
         for layer in self.layers:
             layer.zero_gradients()
 
-    def get_gradients(self) -> dict[int, dict]:
-        """Layer gradients keyed by position in layers; layers reporting none are skipped."""
+    def get_gradients(self) -> dict[str, dict]:
+        """`gradient_<node name>` for every node whose layer reports gradients."""
         gradients = {}
-        for position, layer in enumerate(self.layers):
-            layer_gradients = layer.get_gradients()
-            if layer_gradients:
-                gradients[position] = layer_gradients
+        for node in self._nodes:
+            if node.is_source:
+                continue
+            node_gradients = node.layer.get_gradients()
+            if node_gradients:
+                gradients[f"{GRADIENT_PREFIX}{node.name}"] = node_gradients
         return gradients
 
-    def update_weights(self, gradients: dict[int, dict], optimizer: Optimizer) -> None:
+    def update_weights(self, **gradients: dict) -> None:
         """
-        Step the optimizer on supplied gradients, such as ones averaged across nodes.
+        Subtract each node's gradients from its layer: `layer -= gradient`.
 
         Parameters
         ----------
-        gradients : output of get_gradients()
-        optimizer : optimizer that scales the gradients and updates each layer
+        gradients : `gradient_<node name>` as returned by get_gradients(), already scaled
         """
-        layers = self.layers
-        by_layer = {layers[position]: layer_gradients for position, layer_gradients in gradients.items()}
-        optimizer.step(list(by_layer), by_layer)
+        layers = {node.name: node.layer for node in self._nodes if not node.is_source}
+        unexpected = [key for key in gradients if key.removeprefix(GRADIENT_PREFIX) not in layers]
+        if unexpected:
+            raise ValueError(f"{self.name} has no nodes for gradients {sorted(unexpected)}")
+        for key, node_gradients in gradients.items():
+            if not node_gradients:
+                continue
+            layer = layers[key.removeprefix(GRADIENT_PREFIX)]
+            layer -= node_gradients
 
-    def shapes(self) -> dict[str, dict[str, tuple]]:
+    def __isub__(self, gradients: dict) -> Network:
+        """`net -= gradients` applies a get_gradients() dict through update_weights()."""
+        if not isinstance(gradients, dict):
+            raise TypeError("can only subtract a gradient dict from a Network")
+        self.update_weights(**gradients)
+        return self
+
+    def node_shapes(self) -> dict[str, dict[str, tuple]]:
         """
         every node's declared input and output shapes, keyed by node name
         """

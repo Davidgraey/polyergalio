@@ -12,10 +12,10 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 import pytest
-from polyergalio.models.layers.basal_layers import FullyConnectedLayer
+from polyergalio.models.layers.basic_layers import FullyConnectedLayer
 from polyergalio.models.layers.mixture_layers import MixtureOfExperts
 from polyergalio.models.model_loss import MSELoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network as NeuralNetwork
 from polyergalio.models.optimizers import SGD
 from polyergalio.models.training.node_launcher import NodeLauncher
 from polyergalio.models.training.orchestration import ConnectionHandler, Orchestrator, average

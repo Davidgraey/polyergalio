@@ -1,17 +1,25 @@
+from __future__ import annotations
+
 from typing import Optional
 
 import numpy as np
-from polyergalio.models.layers.basal_layers import (
-    FullyConnectedLayer,
-    Layer,
-)
-from polyergalio.models.constants import EPSILON
 from numpy.typing import NDArray
+
+from polyergalio.models.constants import EPSILON
+from polyergalio.models.layers.basic_layers import FullyConnectedLayer, Layer
 
 
 class VotingBase(Layer):
+    """
+    A stack of fully connected layers scoring experts, followed by a routing step.
+
+    The stack is held as attributes fc_1, fc_2, ... so each layer is a named parameter.
+    expert_bias steers expert selection and is moved by load balance, not by a loss gradient.
+    """
     renormalize: bool = False
     activation: str = "linear"
+    parameter_names = ("expert_bias",)
+    cache_names = ("in_shape", "mask", "token_mask", "route_sum", "output")
 
     def __init__(self,
                  input_shape: int,
@@ -57,16 +65,19 @@ class VotingBase(Layer):
         self.top_groups = top_groups
 
         self.expert_bias = np.zeros(num_experts)
-        # (input_shape,) > (num_experts,) layer
         self.declare_shapes(inputs=((input_shape,),), outputs=((num_experts,),))
+        self.zero_gradients()
 
-        self.stack: tuple[FullyConnectedLayer, ...] = ()
-        self.in_shape = None
-        self.mask = None
-        self.token_mask = None
-        self.route_sum = None
-        self.output = None
+    @property
+    def stack(self) -> tuple[FullyConnectedLayer, ...]:
+        return tuple(getattr(self, name) for name in self.parameter_names[1:])
 
+    def set_stack(self, *layers: FullyConnectedLayer) -> None:
+        """Hold the layers as fc_1, fc_2, ... and register them as parameters."""
+        names = tuple(f"fc_{n}" for n in range(1, len(layers) + 1))
+        for name, layer in zip(names, layers):
+            setattr(self, name, layer)
+        self.parameter_names = ("expert_bias",) + names
         self.zero_gradients()
 
     def forward(self,
@@ -100,30 +111,29 @@ class VotingBase(Layer):
             )
         self.token_mask = None if mask is None else mask.reshape(-1)
 
-        self.output = self._route(votes)
+        self.output = self.route(votes)
         return self.output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        grad = self._route_backward(incoming_grad)
+        self.gradient_expert_bias = -self.balance_signal()
+        grad = self.route_backward(incoming_grad)
         for layer in self.stack[::-1]:
             grad = layer.backward(grad)
 
         return grad.reshape(self.in_shape)
 
-    def _route(self, votes: NDArray) -> NDArray:
+    def route(self, votes: NDArray) -> NDArray:
         """
-        Core Routing Process
-
-        final selection considers votes + expert_bias.
-        bias steers which experts fire without entering the combined output or its gradient
+        Select experts on votes + expert_bias, which steers which experts fire without entering the combined
+        output or its gradient.
 
         Parameters
         ----------
-        votes: the output / forward pass
+        votes : the stack's output
 
         Returns
         -------
-
+        the votes of the selected experts, renormalised per row when renormalize is set
         """
         if self.top_k is None:
             return votes
@@ -164,15 +174,13 @@ class VotingBase(Layer):
         np.put_along_axis(mask, keep, True, axis=-1)
         return mask
 
-    def get_expert_bias(self) -> None:
+    def balance_signal(self) -> NDArray:
         """
-        auxiliary-loss-free balancing process, similar to Deepseek v3 (entirely separate from the gradient)
-        it's a load-balancing term to increase less-seen experts, while decreasing over-seen experts.
-
-        padded rows (masks in Forward) are left out of the load average, otherwise they'd count as real usage
+        Direction that moves expert_bias towards an even load, in the spirit of DeepSeek-V3's auxiliary-loss-free
+        balancing: +1 for an under-used expert, -1 for an over-used one. Padded rows are left out of the load.
         """
         if self.mask is None:
-            return np.zeros_like(self.num_experts)
+            return np.zeros(self.num_experts)
 
         if self.token_mask is None:
             load = self.mask.mean(axis=0)
@@ -182,13 +190,10 @@ class VotingBase(Layer):
             load = (self.mask * valid).sum(axis=0) / valid_count
 
         fair_share = self.top_k / self.num_experts
-        # bias update speed is now part of the overall learning rate
         return np.sign(fair_share - load)
 
-    def _route_backward(self, incoming_grad: NDArray) -> NDArray:
-        """
-        backpass through the route
-        """
+    def route_backward(self, incoming_grad: NDArray) -> NDArray:
+        """Gradient through route()."""
         if self.top_k is None:
             return incoming_grad
         if not self.renormalize:
@@ -196,62 +201,6 @@ class VotingBase(Layer):
 
         dot = np.sum(incoming_grad * self.output, axis=-1, keepdims=True)
         return self.mask * (incoming_grad - dot) / self.route_sum
-
-    def _named_stack(self) -> dict[str, FullyConnectedLayer]:
-        """keys the optimizer round-trips through get_gradients/update_weights"""
-        named = {f"fc_{n}": layer for n, layer in enumerate(self.stack, start=1)}
-        return named
-
-    def get_weights(self, for_serialize: bool = False):
-        named = self._named_stack()
-        if for_serialize:
-            weights = {"expert_bias": self.expert_bias}
-            weights.update({name: layer.get_weights(for_serialize=True)
-                            for name, layer in named.items()
-                            })
-            return weights
-        return tuple(layer.get_weights(for_serialize=False) for layer in self.stack) + (
-            self.expert_bias,
-        )
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        for name, layer in self._named_stack().items():
-            if name in weights:
-                layer.set_weights(weights[name])
-        if "expert_bias" in weights:
-            self.expert_bias = np.asarray(weights["expert_bias"])
-
-    def get_gradients(self) -> dict[str, dict[str, NDArray]]:
-        grads = {"expert_bias": self.get_expert_bias()}
-        grads.update({
-            name: layer.get_gradients() for name, layer in self._named_stack().items()
-        })
-        return grads
-
-    def update_weights(self, **gradients: dict[str, NDArray]) -> None:
-        # bias is not a layer, so we have all this extra shit to cover
-        self.expert_bias += gradients["expert_bias"]
-        for name, layer in self._named_stack().items():
-            layer.update_weights(**gradients[name])
-
-    def zero_gradients(self) -> None:
-        for layer in self.stack:
-            layer.zero_gradients()
-
-    def purge(self) -> None:
-        for layer in self.stack:
-            layer.purge()
-        self.in_shape = None
-        self.mask = None
-        self.token_mask = None
-        self.route_sum = None
-        self.output = None
-
-    @property
-    def num_parameters(self) -> int:
-        return sum(layer.num_parameters for layer in self.stack)
 
     def __str__(self):
         routing = f"top {self.top_k} of" if self.top_k else "dense over"
@@ -289,7 +238,7 @@ class VotingWeight(VotingBase):
             input_shape, num_experts, top_k
         )
         self.activation = "sigmoid"
-        self.stack = (
+        self.set_stack(
             FullyConnectedLayer(
                 ni=input_shape,
                 no=num_experts,
@@ -297,8 +246,6 @@ class VotingWeight(VotingBase):
                 is_output=True,
             ),
         )
-
-        self.zero_gradients()
 
 
 class VotingWeightBalanced(VotingBase):
@@ -348,7 +295,8 @@ class VotingWeightBalanced(VotingBase):
                 ),
             )
         )
-        self.stack = hidden + (
+        self.set_stack(
+            *hidden,
             FullyConnectedLayer(
                 ni=score_width,
                 no=num_experts,
@@ -385,7 +333,7 @@ class VotingGate(VotingBase):
                          )
         self.activation = "sigmoid"
         self.hidden_size = hidden_size
-        self.stack = (
+        self.set_stack(
             FullyConnectedLayer(ni=input_shape, no=hidden_size, activation_type="relu"),
             FullyConnectedLayer(
                 ni=hidden_size,
@@ -395,26 +343,17 @@ class VotingGate(VotingBase):
             ),
         )
 
-    def _route(self, votes: NDArray) -> NDArray:
+    def route(self, votes: NDArray) -> NDArray:
         """
         Straight-through gate: forward is the pure top_k boolean mask, no vote
         magnitude passes through.
-
-        Parameters
-        ----------
-        votes : the output / forward pass
-
-        Returns
-        -------
         """
         self.mask = self.select_experts(votes)
 
         return self.mask.astype(votes.dtype)
 
-    def _route_backward(self, incoming_grad: NDArray) -> NDArray:
-        """
-        Straight-through estimator: reuses the non-renormalised
-        """
+    def route_backward(self, incoming_grad: NDArray) -> NDArray:
+        """Straight-through estimator: the gradient passes where the mask is set."""
         return incoming_grad * self.mask
 
 
@@ -426,6 +365,8 @@ class Expert(Layer):
     Projected shape: (..., upscale_dim)
     Output shape: (..., hidden_dim)
     """
+    parameter_names = ("gate_proj", "up_proj", "down_proj")
+    cache_names = ("gated", "up", "output")
 
     def __init__(self,
                  input_dim: int,
@@ -458,10 +399,6 @@ class Expert(Layer):
             ni=upscale_dim, no=hidden_dim, activation_type="linear"
         )
 
-        self.gated = None
-        self.up = None
-        self.output = None
-
     def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """mask : unused -- each row is transformed on its own"""
         self.gated = self.gate_proj(incoming_x)
@@ -474,52 +411,6 @@ class Expert(Layer):
         return self.gate_proj.backward(grad_product * self.up) + self.up_proj.backward(
             grad_product * self.gated
         )
-
-    def named_sublayers(self) -> dict[str, FullyConnectedLayer]:
-        return {
-            "gate_proj": self.gate_proj,
-            "up_proj": self.up_proj,
-            "down_proj": self.down_proj,
-        }
-
-    def get_weights(self, for_serialize: bool = False):
-        return {
-            name: layer.get_weights(for_serialize=for_serialize)
-            for name, layer in self.named_sublayers().items()
-        }
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        for name, layer in self.named_sublayers().items():
-            if name in weights:
-                layer.set_weights(weights[name])
-
-    def get_gradients(self) -> dict[str, dict]:
-        return {
-            name: layer.get_gradients()
-            for name, layer in self.named_sublayers().items()
-        }
-
-    def update_weights(self, **gradients) -> None:
-        for name, layer in self.named_sublayers().items():
-            if name in gradients:
-                layer.update_weights(**gradients[name])
-
-    def zero_gradients(self) -> None:
-        for layer in self.named_sublayers().values():
-            layer.zero_gradients()
-
-    def purge(self) -> None:
-        for layer in self.named_sublayers().values():
-            layer.purge()
-        self.gated = None
-        self.up = None
-        self.output = None
-
-    @property
-    def num_parameters(self) -> int:
-        return sum(layer.num_parameters for layer in self.named_sublayers().values())
 
     def __str__(self):
         return (
@@ -544,7 +435,11 @@ class MixtureOfExperts(Layer):
 
     Routed experts only run on the rows routed to them. Padded rows (mask == 0) are routed to no expert, so their
     output is the shared experts' alone.
+
+    Experts are held as attributes shared_1.., routed_1.. and gate, which are the parameter names.
     """
+    cache_names = ("in_shape", "gate_weights", "expert_rows", "expert_outputs", "output")
+
     def __init__(self,
                  input_dim: int,
                  upscale_dim: int,
@@ -573,8 +468,8 @@ class MixtureOfExperts(Layer):
         """
         super().__init__()
         assert num_shared_experts >= 0, "num_shared_experts must be >= 0"
-        assert 2 <= top_k <= num_routed_experts, (
-            f"top_k must fall in [2, {num_routed_experts}], got {top_k}"
+        assert 1 <= top_k <= num_routed_experts, (
+            f"top_k must fall in [1, {num_routed_experts}], got {top_k}"
         )
 
         self.input_dim = input_dim
@@ -591,15 +486,10 @@ class MixtureOfExperts(Layer):
 
         self.declare_shapes(inputs=((input_dim,),), outputs=((hidden_dim,),))
 
-        self.shared_experts = tuple(
-            Expert(input_dim, upscale_dim, hidden_dim, activation_type)
-            for _ in range(num_shared_experts)
-        )
-        self.routed_experts = tuple(
-            Expert(input_dim, upscale_dim, hidden_dim, activation_type)
-            for _ in range(num_routed_experts)
-        )
-
+        shared_names = tuple(f"shared_{n}" for n in range(1, num_shared_experts + 1))
+        routed_names = tuple(f"routed_{n}" for n in range(1, num_routed_experts + 1))
+        for name in shared_names + routed_names:
+            setattr(self, name, Expert(input_dim, upscale_dim, hidden_dim, activation_type))
         self.gate = VotingWeightBalanced(
             input_shape=input_dim,
             hidden_size=None,
@@ -609,14 +499,16 @@ class MixtureOfExperts(Layer):
             num_groups=num_groups,
             top_groups=top_groups,
         )
-
-        self.in_shape = None
-        self.gate_weights = None
-        self.expert_rows: list[NDArray] = []
-        self.expert_outputs: list[Optional[NDArray]] = []
-        self.output = None
-
+        self.parameter_names = shared_names + routed_names + ("gate",)
         self.zero_gradients()
+
+    @property
+    def shared_experts(self) -> tuple[Expert, ...]:
+        return tuple(getattr(self, f"shared_{n}") for n in range(1, self.num_shared_experts + 1))
+
+    @property
+    def routed_experts(self) -> tuple[Expert, ...]:
+        return tuple(getattr(self, f"routed_{n}") for n in range(1, self.num_routed_experts + 1))
 
     def forward(
         self,
@@ -685,56 +577,6 @@ class MixtureOfExperts(Layer):
         grad_input = grad_input + self.gate.backward(gate_grad).reshape(grad_input.shape)
         return grad_input.reshape(self.in_shape)
 
-    def named_sublayers(self) -> dict[str, Layer]:
-        named = {f"shared_{n}": e for n, e in enumerate(self.shared_experts, start=1)}
-        named.update(
-            {f"routed_{n}": e for n, e in enumerate(self.routed_experts, start=1)}
-        )
-        named["gate"] = self.gate
-        return named
-
-    def get_weights(self, for_serialize: bool = False):
-        return {
-            name: layer.get_weights(for_serialize=for_serialize)
-            for name, layer in self.named_sublayers().items()
-        }
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        for name, layer in self.named_sublayers().items():
-            if name in weights:
-                layer.set_weights(weights[name])
-
-    def get_gradients(self) -> dict[str, dict]:
-        return {
-            name: layer.get_gradients()
-            for name, layer in self.named_sublayers().items()
-        }
-
-    def update_weights(self, **gradients) -> None:
-        if "expert_bias" in gradients:
-            self.expert_bias += gradients["expert_bias"]
-        for name, layer in self.named_sublayers().items():
-            if name in gradients:
-                layer.update_weights(**gradients[name])
-
-    def zero_gradients(self) -> None:
-        for layer in self.named_sublayers().values():
-            layer.zero_gradients()
-
-    def purge(self) -> None:
-        for layer in self.named_sublayers().values():
-            layer.purge()
-        self.in_shape = None
-        self.gate_weights = None
-        self.expert_rows, self.expert_outputs = [], []
-        self.output = None
-
-    @property
-    def num_parameters(self) -> int:
-        return sum(layer.num_parameters for layer in self.named_sublayers().values())
-
     def __str__(self):
         return (
             f"MixtureOfExperts, {self.num_shared_experts} shared + top "
@@ -755,16 +597,11 @@ class PoolingLayer(Layer):
     """
 
     preserves_shape = False
+    cache_names = ("input", "weights", "counts")
 
     def __init__(self):
         super().__init__()
         self.declare_shapes(inputs=((None, None, None),), outputs=((None, 1, None),))
-
-        self.input = None
-        self.weights = None
-        self.counts = None
-
-        self.zero_gradients()
 
     def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """
@@ -796,27 +633,6 @@ class PoolingLayer(Layer):
             np.broadcast_to(incoming_grad / self.counts, self.input.shape)
             * self.weights
         )
-
-    def update_weights(self) -> None:
-        pass
-
-    def zero_gradients(self) -> None:
-        pass
-
-    def get_weights(self, for_serialize: bool = False):
-        return {} if for_serialize else None
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {}
-
-    def purge(self):
-        self.input = None
-        self.weights = None
-        self.counts = None
-
-    @property
-    def num_parameters(self) -> int:
-        return 0
 
     def __str__(self):
         return "Layer of Sequence Mean Pooling (avg over sequence)"

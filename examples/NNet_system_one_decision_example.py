@@ -2,7 +2,7 @@
 System-one decision example.
 
 Wires the minimal encoder-head setup from decision-head-overview.md --
-TextEmbedding -> SpectreAttention -> DecisionHead -- into one NeuralNetwork
+TextEmbedding -> SpectreAttention -> DecisionHead -- into one Network
 graph, then trains it on RandomDatasetGenerator's "decision" task. A single
 forward pass answers every question (no chain-of-thought, no decoding loop),
 which is the "system one" part: one Spectre mixing pass over the sequence,
@@ -32,7 +32,7 @@ from polyergalio.models.layers.decision_layers import (
 )
 from polyergalio.models.layers.spectre_layers import SpectreAttention
 from polyergalio.models.model_loss import DecisionLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network
 from polyergalio.models.optimizers import SGD
 
 HIDDEN_DIM = 32
@@ -45,7 +45,7 @@ SPLIT_FRACTIONS = (0.6, 0.2, 0.2)
 ESCALATION_THRESHOLD = 0.5
 
 
-def build_network(vocab_size: int, sequence_length: int, padding_idx: int) -> NeuralNetwork:
+def build_network(vocab_size: int, sequence_length: int, padding_idx: int) -> Network:
     """
     Encoder-head system-one network: TextEmbedding -> SpectreAttention -> DecisionHead.
 
@@ -57,9 +57,9 @@ def build_network(vocab_size: int, sequence_length: int, padding_idx: int) -> Ne
 
     Returns
     -------
-    NeuralNetwork mapping token ids (batch, sequence_length) to option logits
+    Network mapping token ids (batch, sequence_length) to option logits
     """
-    net = NeuralNetwork(name="system_one", input_shape=(sequence_length,))
+    net = Network(name="system_one", input_shape=(sequence_length,))
     embedded = net.connect(
         TextEmbedding(vocab_size, HIDDEN_DIM, padding_idx=padding_idx),
         net.input,
@@ -103,7 +103,7 @@ def split_rows(x, y, kwargs: dict, fractions=SPLIT_FRACTIONS) -> list[tuple]:
     ]
 
 
-def fit_calibration(net: NeuralNetwork, x, y, kwargs: dict) -> dict[str, float]:
+def fit_calibration(net: Network, x, y, kwargs: dict) -> dict[str, float]:
     """Temperature per (type, option count) bucket, fit on rows the model did not train on."""
     net.eval()
     head = net.node("decision_head").layer
@@ -120,7 +120,7 @@ def rate(values, rows) -> float:
     return float(values[rows].mean()) if rows.any() else float("nan")
 
 
-def evaluate(net: NeuralNetwork, x, y, kwargs: dict, temperatures: dict, threshold: float = ESCALATION_THRESHOLD) -> dict:
+def evaluate(net: Network, x, y, kwargs: dict, temperatures: dict, threshold: float = ESCALATION_THRESHOLD) -> dict:
     """
     Decode, score and escalate every row with the head's three outputs.
 
@@ -199,7 +199,7 @@ def main():
         loss = loss_fn(logits, y_train, train_kwargs["token_mask"], train_kwargs["decisiontypes"])
         act_loss = head.score_act(row_correctness(logits, y_train, train_kwargs))
         net.backward(loss_fn.backward())
-        optimizer.step(net.layers)
+        optimizer.step(net)
         if step % 50 == 0:
             print(f"step {step:4d}  loss {loss:.4f}  act loss {act_loss:.4f}")
 

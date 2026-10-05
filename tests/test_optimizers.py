@@ -8,13 +8,13 @@ import numpy as np
 import pytest
 from polyergalio.generators.data_generators import to_onehot
 from polyergalio.models.constants import ClassificationTask
-from polyergalio.models.layers.basal_layers import (
+from polyergalio.models.layers.basic_layers import (
     FullyConnectedLayer,
     NormalizeLayer,
     RMSNormLayer,
 )
 from polyergalio.models.model_loss import CrossEntropyLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network as NeuralNetwork
 from polyergalio.models.optimizers import SGD
 
 PARAMETERISED_LAYERS = (

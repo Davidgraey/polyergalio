@@ -3,16 +3,24 @@
 """
 from abc import ABC, abstractmethod
 
-from polyergalio.types import Serializable
+from numpy.typing import NDArray
+
+from polyergalio.base_model import BasalEstimator
 
 
-class Processor(Serializable, ABC):
-    _structural_state_keys: tuple[str, ...] = ("obs_min_max", "_fitted")
+class Processor(BasalEstimator, ABC):
+    """An estimator that learns a column mapping with fit and applies it with encode."""
+    state_names = ("fitted", "obs_min_max")
 
     def __init__(self, target: (str | int)):
+        super().__init__()
         self.target = target
-        self._fitted: bool = False
+        self.fitted = False
         self.obs_min_max: tuple = None
+
+    @property
+    def is_fitted(self) -> bool:
+        return self.fitted
 
     @abstractmethod
     def inverse(self, values):
@@ -35,10 +43,17 @@ class Processor(Serializable, ABC):
     def metadata(self):
         """gets the metadata of the encoder to be passed to backbone network"""
 
-    @property
-    def is_fitted(self):
-        """simple bool - check if the encoder has been fitted to data"""
-        return self._fitted
+    def predict(self, *columns):
+        return self.encode(*columns)
+
+    def fit_predict(self, *columns):
+        return self.fit_encode(*columns)
+
+    def forward(self, *columns):
+        return self.encode(*columns)
+
+    def backward(self, incoming_gradient: NDArray) -> NDArray:
+        raise NotImplementedError(f"{self.__class__.__name__} is fitted, not backpropagated")
 
     @property
     def info(self):

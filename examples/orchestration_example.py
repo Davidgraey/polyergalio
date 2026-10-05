@@ -19,8 +19,8 @@ from typing import Optional
 
 import numpy as np
 from polyergalio.generators.data_generators import RandomDatasetGenerator
-from polyergalio.models.layers.basal_layers import FullyConnectedLayer
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.layers.basic_layers import FullyConnectedLayer
+from polyergalio.models.network import Network
 from polyergalio.models.training.checkpoint import CollectedModel
 from polyergalio.models.training.discovery import NodeRecord, Roster
 from polyergalio.models.training.node_launcher import NodeLauncher
@@ -39,7 +39,7 @@ PHASES = ("discover", "connect", "initialize", "step", "aggregate", "apply", "co
 STARTED_STAGES = ("listening", "connected", "ready", "stepped", "aggregated")
 
 
-def build_network(num_features: int, hidden: int, activation: str) -> NeuralNetwork:
+def build_network(num_features: int, hidden: int, activation: str) -> Network:
     """
     Two-layer regression network.
 
@@ -51,9 +51,9 @@ def build_network(num_features: int, hidden: int, activation: str) -> NeuralNetw
 
     Returns
     -------
-    NeuralNetwork mapping features to one output
+    Network mapping features to one output
     """
-    return NeuralNetwork(
+    return Network(
         [
             FullyConnectedLayer(num_features, hidden, activation),
             FullyConnectedLayer(hidden, 1, "linear", is_output=True),
@@ -92,9 +92,9 @@ def gradient_norm(gradients: dict) -> float:
     return float(np.sqrt(sum(float(np.sum(np.square(array, dtype=np.float64))) for array in nested_arrays(gradients))))
 
 
-def weight_vector(network: NeuralNetwork) -> np.ndarray:
+def weight_vector(network: Network) -> np.ndarray:
     """All of a network's weights as one vector."""
-    arrays = nested_arrays([layer.get_weights(for_serialize=True) for layer in network.layers])
+    arrays = nested_arrays([layer.get_weights() for layer in network.layers])
     return np.concatenate([array.ravel().astype(np.float64) for array in arrays])
 
 
@@ -253,7 +253,7 @@ class Cluster:
         self.stage = "connected" if connected else "listening"
         return connected
 
-    def initialize(self, network: NeuralNetwork, settings: dict, x_data: np.ndarray, y_data: np.ndarray,
+    def initialize(self, network: Network, settings: dict, x_data: np.ndarray, y_data: np.ndarray,
                    batch_size: int, seed: int = 42) -> None:
         """Send every node the serialized model and hyperparameters, and wait for all to report completed."""
         self.require("connected", "ready", "stepped", "aggregated")

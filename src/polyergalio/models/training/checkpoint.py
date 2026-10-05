@@ -7,7 +7,7 @@ from typing import Union
 import numpy as np
 from numpy.typing import NDArray
 
-from polyergalio.types import BasalModel
+from polyergalio.composite_model import Composite
 
 log = logging.getLogger(__name__)
 
@@ -22,13 +22,13 @@ class CollectedModel:
 
     Parameters
     ----------
-    model : model rebuilt from the canonical node's weights
+    model : model rebuilt from the canonical node's state
     canonical : node id the weights were taken from
     deviations : per node, largest absolute weight difference from the canonical node
     tolerance : deviation above which the nodes count as diverged
     timestamp : when the weights were collected, UTC
     """
-    model: BasalModel
+    model: Composite
     canonical: str
     deviations: dict[str, float]
     tolerance: float
@@ -75,8 +75,8 @@ def collect_weights(states: dict[str, dict], model_type: type, tolerance: float 
     tolerance : deviation above which the nodes count as diverged
     """
     canonical = sorted(states)[0]
-    reference = weight_vector(states[canonical]["weights"])
-    deviations = {node_id: deviation(reference, weight_vector(state["weights"])) for node_id, state in states.items()}
+    reference = weight_vector(states[canonical]["state"])
+    deviations = {node_id: deviation(reference, weight_vector(state["state"])) for node_id, state in states.items()}
     return CollectedModel(model_type.deserialize(states[canonical]), canonical, deviations, tolerance, datetime.now(timezone.utc))
 
 

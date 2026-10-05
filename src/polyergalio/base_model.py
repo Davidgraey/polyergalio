@@ -41,6 +41,8 @@ Writing a subclass
     hierarchy. Name every constructor argument after an attribute. Override get_state or set_state only when state
     is not a flat list of names, and update_weights only when an update is not a subtraction.
 """
+from __future__ import annotations
+
 import copy
 import inspect
 import os
@@ -319,9 +321,8 @@ class BasalEstimator(Serializable, ABC):
     def backward(self, x: NDArray) -> NDArray:
         pass
 
-    @abstractmethod
     def purge(self) -> None:
-        """Clear forward-pass caches. Gradients belong to zero_gradients()."""
+        """Clear forward-pass caches. Gradients belong to zero_gradients(). Nothing to clear by default."""
 
     def get_weights(self) -> dict:
         """Trainable members as {name: value}. A sublayer's value is its own get_weights() dict."""
@@ -375,13 +376,13 @@ class BasalEstimator(Serializable, ABC):
         return self
 
     def zero_gradients(self) -> None:
-        """Reset every parameter's gradient to zeros, and every sublayer's."""
+        """Reset every parameter's gradient to zeros, and every sublayer's. None for a parameter that is unset or a container."""
         for name in self.parameter_names:
             member = getattr(self, name)
             if isinstance(member, BasalEstimator):
                 member.zero_gradients()
             else:
-                setattr(self, f"gradient_{name}", np.zeros_like(member))
+                setattr(self, f"gradient_{name}", None if member is None or isinstance(member, (dict, list, tuple)) else np.zeros_like(member))
 
     @property
     def num_parameters(self) -> int:

@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 from typing import Optional
-from polyergalio.types import BasalTransform
+from polyergalio.base_model import BasalEstimator
 from polyergalio.models.activations import sigmoid
 from polyergalio.models.constants import EPSILON
 from enum import Enum
@@ -14,7 +14,7 @@ class CalibrationType(Enum):
     spline = "spline"
 
 
-class ProbCalibration(BasalTransform):
+class ProbCalibration(BasalEstimator):
     """
     Probability calibration - takes in logits as a prediction, and, using CalibrationType methods, projects those
     logist into a calibrated probability space
@@ -24,21 +24,17 @@ class ProbCalibration(BasalTransform):
     Temperature Scaling divides logits by learned T: P = sigmoid(f/T) or softmax(f/T)
     """
 
-    # fields that fully determine a fitted calibrator's predict()-time state,
-    # on top of BasalTransform's (empty) core. Only the branch matching
-    # self.method is ever populated by fit() -- the others stay None, same as
-    # a freshly-constructed instance, so restoring them is harmless.
-    _structural_state_keys: tuple[str, ...] = BasalTransform._structural_state_keys + (
+    state_names = ("fitted",)
+    parameter_names = (
         "platt_coefficient", "platt_intercept",
         "isotonic_scores", "isotonic_values",
         "spline_x", "spline_y", "spline_d",
     )
 
     def __init__(self, data_dimension: int, method: CalibrationType = "platt"):
-
-        self.input_dimension: int = data_dimension
-        self.output_dimension: int = data_dimension
-
+        super().__init__()
+        self.fitted = False
+        self.data_dimension: int = data_dimension
         self.method = CalibrationType(method)
         # Platt parameters
         self.platt_coefficient = None
@@ -53,8 +49,6 @@ class ProbCalibration(BasalTransform):
         self.spline_y = None
         self.spline_d = None
 
-        self._is_fitted: bool = False
-
     def fit(self, logit_data: NDArray, y_data: NDArray):
         """
         Fit the calibration model-- logits (x) are compared to the actual labels(y)
@@ -62,9 +56,9 @@ class ProbCalibration(BasalTransform):
 
         Parameters
         ----------
-        logit_data : array-like of shape (n_samples, input_dimension)
+        logit_data : array-like of shape (n_samples, data_dimension)
 
-        y_true : array-like of shape (n_samples, input_dimension) - ground truth labels
+        y_true : array-like of shape (n_samples, data_dimension) - ground truth labels
 
         Returns
         -------
@@ -85,11 +79,8 @@ class ProbCalibration(BasalTransform):
         else:
             raise ValueError(f"Unknown method: {self.method}.")
 
-        self._is_fitted = True
+        self.fitted = True
         return fitted
-
-    def forward(self, x_data: NDArray, **kwargs):
-        pass
 
     def calculate_loss(self, x_data: NDArray, y_data, **kwargs):
         return y_data - x_data
@@ -108,7 +99,7 @@ class ProbCalibration(BasalTransform):
         calibrated : ndarray of shape (n_samples, num_classes)
             Calibrated probabilities .
         """
-        if not self._is_fitted:
+        if not self.fitted:
             raise RuntimeError("Model has not been fitted. Call fit() first.")
 
         logits = np.asarray(logits)
@@ -120,14 +111,20 @@ class ProbCalibration(BasalTransform):
         elif self.method == CalibrationType.spline:
             return self._predict_spline(logits)
 
-    def fit_predict(self, y_score: NDArray, y_true: NDArray) -> NDArray:
-        """Fit and transform in one step."""
-        return self.fit(y_score, y_true).predict(y_score)
+    @property
+    def is_fitted(self) -> bool:
+        return self.fitted
 
-    def get_config(self) -> dict:
-        config = super().get_config()
-        config["data_dimension"] = self.input_dimension
-        return config
+    def fit_predict(self, logit_data: NDArray, y_data: NDArray) -> NDArray:
+        """Fit, then calibrate the same logits."""
+        self.fit(logit_data, y_data)
+        return self.predict(logit_data)
+
+    def forward(self, logits: NDArray) -> NDArray:
+        return self.predict(logits)
+
+    def backward(self, incoming_gradient: NDArray) -> NDArray:
+        raise NotImplementedError(f"{self.__class__.__name__} is fitted, not backpropagated")
 
     # Platt Scaling # ------------------------------------------------------------------------
     def _platt_forward(self, logits: NDArray) -> NDArray:

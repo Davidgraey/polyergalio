@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Optional
 
 import numpy as np
@@ -9,11 +11,11 @@ from polyergalio.models.constants import (
     GLOBAL_DTYPE,
     MASKED_LOGIT,
 )
-from polyergalio.models.layers.basal_layers import (
+from polyergalio.models.layers.basic_layers import (
+    RNG,
     FullyConnectedLayer,
     Layer,
     NormalizeLayer,
-    RMSNormLayer,
 )
 from polyergalio.models.layers.mixture_layers import MixtureOfExperts
 from polyergalio.models.weight_initialization import get_weight_init
@@ -67,7 +69,6 @@ def decision_confidence(probabilities: NDArray, token_mask: NDArray) -> NDArray:
     (batch,) in [0, 1]; 1 for a one-hot answer or a single-option row
     """
     num_options = token_mask.sum(axis=-1)
-    # NLL vs entropy -SUM(p * log(p))
     entropy = -np.sum(
         probabilities * np.log(np.maximum(probabilities, EPSILON)), axis=-1
     )
@@ -208,6 +209,12 @@ class DecisionHead(Layer):
     Input shape: (batch, sequence, hidden_dim)
     Output shape: (batch, options) logits, MASKED_LOGIT on padded slots
     """
+    parameter_names = ("type_embedding", "embedding_norm", "trunk_a", "trunk_norm", "scorer", "act_head")
+    cache_names = (
+        "hidden_shape", "marker_pos", "marker_end", "span_mask", "span_lengths",
+        "token_mask", "decisiontype", "act_logits", "act_gradient", "output",
+    )
+    TEMPERATURE_GRID = np.exp(np.linspace(np.log(0.05), np.log(10.0), 81))
 
     def __init__(self,
                  hidden_dim: int,
@@ -230,29 +237,33 @@ class DecisionHead(Layer):
         hidden_dim : width of the encoder's hidden state
         head_hidden : width of the option scorer's hidden layer
         num_types : number of question types, see DECISION_TYPES
-        activation_type : activation for trunk_a and trunk_b
+        activation_type : activation for the trunk experts
         act_weight : scale on the act loss gradient
         type_initialization : WEIGHT_INIT_DISPATCHER name for the question-type embedding
         type_initialization_kwargs : keyword arguments bound to that initializer
-        routed_scaling:
-        num_groups:
-        top_groups:
+        moe_shared_experts, moe_routed_experts, moe_top_k, moe_routed_scaling, moe_num_groups, moe_top_groups :
+            see MixtureOfExperts
         """
         super().__init__()
         self.hidden_dim = hidden_dim
         self.head_hidden = head_hidden
         self.num_types = num_types
 
-        self.TEMPERATURE_GRID = np.exp(np.linspace(np.log(0.05), np.log(10.0), 81))
         self.activation_type = activation_type
         self.act_weight = act_weight
+        self.moe_shared_experts = moe_shared_experts
+        self.moe_routed_experts = moe_routed_experts
+        self.moe_top_k = moe_top_k
+        self.moe_routed_scaling = moe_routed_scaling
+        self.moe_num_groups = moe_num_groups
+        self.moe_top_groups = moe_top_groups
 
         self.declare_shapes(inputs=((None, None, hidden_dim),), outputs=((None,),))
 
         self.type_initialization = type_initialization
         self.type_initialization_kwargs = dict(type_initialization_kwargs or {})
         type_initializer = get_weight_init(type_initialization, **self.type_initialization_kwargs)
-        self.type_embedding = type_initializer(self.RNG, ni=num_types, no=hidden_dim)
+        self.type_embedding = type_initializer(RNG, ni=num_types, no=hidden_dim)
         self.embedding_norm = NormalizeLayer(ni=hidden_dim)
 
         self.trunk_a = MixtureOfExperts(input_dim=hidden_dim,
@@ -267,20 +278,6 @@ class DecisionHead(Layer):
                                         activation_type=activation_type)
 
         self.trunk_norm = NormalizeLayer(ni=hidden_dim)
-        #
-        # self.trunk_a = MixtureOfExperts(input_dim=hidden_dim,
-        #                                 upscale_dim=int(2 * hidden_dim),
-        #                                 hidden_dim=hidden_dim,
-        #                                 num_shared_experts=2,
-        #                                 num_routed_experts=32,
-        #                                 top_k=4,
-        #                                 routed_scaling=routed_scaling,
-        #                                 num_groups=num_groups,
-        #                                 top_groups=top_groups,
-        #                                 activation_type=activation_type)
-
-        # self.trunk_norm_b = NormalizeLayer(ni=hidden_dim)
-
         self.scorer = FullyConnectedLayer(
             ni=hidden_dim, no=1, activation_type="linear", is_output=True
         )
@@ -288,10 +285,6 @@ class DecisionHead(Layer):
             ni=hidden_dim, no=2, activation_type="linear", is_output=True
         )
 
-        self.act_logits = None
-        self.act_gradient = None
-        self.output = None
-        self.purge()
         self.zero_gradients()
 
     def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
@@ -393,13 +386,13 @@ class DecisionHead(Layer):
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         grad_scores = np.where(self.token_mask, incoming_grad, 0.0)[..., None]
-        grad_typed = self.trunk_a.backward(self.scorer.backward(grad_scores))
-        grad_normed = self.trunk_norm.backward(grad_typed)
-        grad_markers = grad_normed * self.token_mask[..., None]
+        grad_trunk = self.trunk_a.backward(self.trunk_norm.backward(self.scorer.backward(grad_scores)))
+        grad_typed = grad_trunk * self.token_mask[..., None]
+        grad_markers = self.embedding_norm.backward(grad_typed) * self.token_mask[..., None]
 
         span_weights = self.span_mask.astype(GLOBAL_DTYPE) / self.span_lengths
         grad_hidden = np.einsum("bot,boh->bth", span_weights, grad_markers)
-        grad_type = np.sum(grad_typed * self.token_mask[..., None], axis=1)
+        grad_type = np.sum(grad_typed, axis=1)
 
         if self.act_gradient is None:
             self.act_head.zero_gradients()
@@ -412,104 +405,6 @@ class DecisionHead(Layer):
         self.gradient_type_embedding = np.zeros_like(self.type_embedding)
         np.add.at(self.gradient_type_embedding, self.decisiontype, grad_type)
         return grad_hidden
-
-    def get_weights(self, for_serialize: bool = False) -> dict:
-        return {
-            "type_embedding": self.type_embedding,
-            "embedding_norm": self.embedding_norm.get_weights(for_serialize=for_serialize),
-            "trunk_a": self.trunk_a.get_weights(for_serialize=for_serialize),
-            # "trunk_b": self.trunk_b.get_weights(for_serialize=for_serialize),
-            "trunk_norm": self.trunk_norm.get_weights(for_serialize=for_serialize),
-            "scorer": self.scorer.get_weights(for_serialize=for_serialize),
-            "act_head": self.act_head.get_weights(for_serialize=for_serialize),
-        }
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        if "type_embedding" in weights:
-            self.type_embedding = np.asarray(weights["type_embedding"], dtype=GLOBAL_DTYPE)
-        self.embedding_norm.set_weights(weights.get("embedding_norm"))
-        self.trunk_a.set_weights(weights.get("trunk_a"))
-        # self.trunk_b.set_weights(weights.get("trunk_b"))
-        self.trunk_norm.set_weights(weights.get("trunk_norm"))
-        self.scorer.set_weights(weights.get("scorer"))
-        self.act_head.set_weights(weights.get("act_head"))
-
-    def get_gradients(self) -> dict:
-        return {
-            "gradient_type_embedding": self.gradient_type_embedding,
-            "embedding_norm": self.embedding_norm.get_gradients(),
-            "trunk_a": self.trunk_a.get_gradients(),
-            # "trunk_b": self.trunk_b.get_gradients(),
-            "trunk_norm": self.trunk_norm.get_gradients(),
-            "scorer": self.scorer.get_gradients(),
-            "act_head": self.act_head.get_gradients(),
-        }
-
-    def update_weights(
-        self,
-        gradient_type_embedding: Optional[NDArray] = None,
-        embedding_norm: Optional[dict] = None,
-        trunk_a: Optional[dict] = None,
-        trunk_b: Optional[dict] = None,
-        trunk_norm: Optional[dict] = None,
-        scorer: Optional[dict] = None,
-        act_head: Optional[dict] = None,
-    ) -> None:
-        if gradient_type_embedding is not None:
-            self.type_embedding -= gradient_type_embedding
-        if embedding_norm:
-            self.embedding_norm.update_weights(**embedding_norm)
-        if trunk_a:
-            self.trunk_a.update_weights(**trunk_a)
-        # if trunk_b:
-        #     self.trunk_b.update_weights(**trunk_b)
-        if trunk_norm:
-            self.trunk_norm.update_weights(**trunk_norm)
-        if scorer:
-            self.scorer.update_weights(**scorer)
-        if act_head:
-            self.act_head.update_weights(**act_head)
-
-    def zero_gradients(self) -> None:
-        self.gradient_type_embedding = np.zeros_like(self.type_embedding)
-        self.embedding_norm.zero_gradients()
-        self.trunk_a.zero_gradients()
-        # self.trunk_b.zero_gradients()
-        self.trunk_norm.zero_gradients()
-        self.scorer.zero_gradients()
-        self.act_head.zero_gradients()
-
-    def purge(self) -> None:
-        self.embedding_norm.purge()
-        self.trunk_a.purge()
-        # self.trunk_b.purge()
-        self.trunk_norm.purge()
-        self.scorer.purge()
-        self.act_head.purge()
-        self.hidden_shape = None
-        self.marker_pos = None
-        self.marker_end = None
-        self.span_mask = None
-        self.span_lengths = None
-        self.token_mask = None
-        self.decisiontype = None
-        self.act_logits = None
-        self.act_gradient = None
-        self.output = None
-
-    @property
-    def num_parameters(self) -> int:
-        return (
-            self.type_embedding.size
-            + self.embedding_norm.num_parameters
-            + self.trunk_a.num_parameters
-            # + self.trunk_b.num_parameters
-            + self.trunk_norm.num_parameters
-            + self.scorer.num_parameters
-            + self.act_head.num_parameters
-        )
 
     def __str__(self):
         return (

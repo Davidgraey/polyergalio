@@ -26,14 +26,13 @@ from polyergalio.models.activations import (
     linear,
 )
 from polyergalio.models.supervised import log
-from polyergalio.types import BasalModel
+from polyergalio.fitted_model import FittedModel
 
 
-class GradientDescent(BasalModel):
-    # y_means/y_stds stay None for a classification task (see init_standardize)
-    _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
-        "weights", "y_means", "y_stds",
-    )
+class GradientDescent(FittedModel):
+    """Linear and generalized linear regression fit by scaled conjugate gradient; y_means and y_stds stay None for classification."""
+    parameter_names = ("weights",)
+    state_names = ("y_means", "y_stds", "full_init", "input_dimension")
 
     def __init__(
         self,
@@ -101,6 +100,7 @@ class GradientDescent(BasalModel):
             raise ValueError(
                 f"task must be one of regression, binary, multinomial, multilabel; got {task}"
             )
+        self.zero_gradients()
 
     def init_weights(self, n_outputs: int = 1) -> None:
         """
@@ -115,20 +115,6 @@ class GradientDescent(BasalModel):
         """
         coefficients = get_weight_init("kaiming")(self.RNG, ni=self.input_dimension, no=n_outputs)
         self.weights = np.vstack([np.zeros((1, n_outputs)), coefficients])
-
-    def standardize(self, data_array: NDArray, mean: NDArray, stds: NDArray) -> NDArray:
-        """standardize our data to 0 mean 1 std"""
-        assert data_array.shape[-1] == mean.shape[0]
-
-        return (data_array - mean) / (stds + EPSILON)
-
-    def unstandardize(
-        self, data_array: NDArray, mean: NDArray, stds: NDArray
-    ) -> NDArray:
-        """reverse the standardize process - restore the original data space"""
-        assert data_array.shape[-1] == mean.shape[0]
-
-        return (stds - EPSILON) * data_array + mean
 
     def init_standardize(self, x_data: NDArray, y_data: Optional[NDArray]) -> None:
         """update the tracking means and standards"""
@@ -377,20 +363,11 @@ class GradientDescent(BasalModel):
                     log.info(f"early termination, loss stopped decreasing at {i}")
                     break
 
+        self.fitted = True
         r_squared = self._calculate_r_square(self.predict(x_data), y_data)
         log.info(f"fitted r_squared: {r_squared}")
         log.info(f"divisi {self.divisi} ")
         return errors
-
-    def fit_predict(
-        self,
-        x_data: NDArray,
-        y_data: NDArray,
-        iterations: int = 100,
-        add_constant: bool = True,
-    ):
-        _error = self.fit(x_data, y_data, iterations, add_constant)
-        return self.predict(x_data)
 
     def forward(self, x_data: NDArray, has_bias_present=True) -> NDArray:
         """
@@ -479,9 +456,3 @@ class GradientDescent(BasalModel):
     def get_residuals(self):
         """get the residuals from the last fit"""
         return self.residuals
-
-    def set_weights(self, weights: dict) -> None:
-        super().set_weights(weights)
-        if self.weights is not None:
-            self.input_dimension = self.weights.shape[0] - 1
-            self.full_init = True

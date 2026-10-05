@@ -12,7 +12,7 @@ from polyergalio.encoders.tokenizer import SentencePieceTokenizer, fit_tokenizer
 from polyergalio.models.constants import ClassificationTask
 from polyergalio.models.embedding.embedding import TextEmbedding
 from polyergalio.models.embedding.positional import RopeEmbedding
-from polyergalio.models.layers.basal_layers import FullyConnectedLayer, RMSNormLayer
+from polyergalio.models.layers.basic_layers import FullyConnectedLayer, RMSNormLayer
 from polyergalio.models.layers.operator_layers import LatentSum, MaskGather
 from polyergalio.models.layers.spectre_layers import (
     DenseHead,
@@ -22,7 +22,7 @@ from polyergalio.models.layers.spectre_layers import (
     SpectreDecoderAttention,
 )
 from polyergalio.models.model_loss import CrossEntropyLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network as NeuralNetwork
 from polyergalio.models.optimizers import Adam
 
 SEQUENCE = 8

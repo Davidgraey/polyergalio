@@ -5,7 +5,7 @@ intended rule.
 
 import numpy as np
 import pytest
-from polyergalio.models.layers.basal_layers import FullyConnectedLayer, Layer
+from polyergalio.models.layers.basic_layers import FullyConnectedLayer, Layer
 from polyergalio.models.weight_initialization import get_weight_init
 
 NI = 512

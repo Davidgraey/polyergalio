@@ -22,6 +22,8 @@ At T = 0 the classic rules are gradient steps on E:
     PLSOM family: one single-sample SGD step with learning rate 1,
     w_n = epsilon, theta_decay = 0
 """
+from __future__ import annotations
+
 from abc import abstractmethod
 from typing import Optional
 
@@ -29,7 +31,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from polyergalio.models.constants import EPSILON, GLOBAL_DTYPE
-from polyergalio.models.layers.basal_layers import Layer
+from polyergalio.models.layers.basic_layers import RNG, Layer
 
 OUTPUT_TYPES = ("assignment", "distance", "quantized", "coordinates")
 
@@ -74,6 +76,9 @@ class PrototypeLayer(Layer):
     positions: Optional[NDArray] = None
     grows: bool = False
     adaptive: bool = False
+    parameter_names = ("weights",)
+    state_names = ("initialized",)
+    cache_names = ("input", "distance_cache", "kernel", "sample_weights", "assignment", "lead_shape", "energy_gradient")
 
     def __init__(
         self,
@@ -90,21 +95,19 @@ class PrototypeLayer(Layer):
         if output_type == "coordinates" and self.positions is None:
             raise ValueError(f"{self.__class__.__name__} has no prototype positions to emit")
 
-        self.num_prototypes = num_prototypes
         self.input_dim = input_dim
         self.temperature = temperature
         self.energy_weight = energy_weight
         self.output_type = output_type
         self.learning_rate = learning_rate
 
-        self.weights = self.RNG.normal(0.0, 0.1, size=(num_prototypes, input_dim)).astype(GLOBAL_DTYPE)
+        self.weights = RNG.normal(0.0, 0.1, size=(num_prototypes, input_dim)).astype(GLOBAL_DTYPE)
         self.initialized = False
         self.energy = 0.0
 
         count = None if self.grows else num_prototypes
         width = {"assignment": count, "distance": count, "quantized": input_dim, "coordinates": 2}[output_type]
         self.declare_shapes(inputs=((input_dim,),), outputs=((width,),))
-        self.purge()
         self.zero_gradients()
 
     @abstractmethod
@@ -130,9 +133,9 @@ class PrototypeLayer(Layer):
 
     def initialize(self, x_data: NDArray) -> None:
         """Place prototypes on randomly drawn samples, jittered so duplicates can separate."""
-        rows = self.RNG.choice(len(x_data), size=self.num_prototypes, replace=len(x_data) < self.num_prototypes)
+        rows = RNG.choice(len(x_data), size=self.num_prototypes, replace=len(x_data) < self.num_prototypes)
         jitter = 1e-3 * (np.std(x_data, axis=0) + EPSILON)
-        self.weights = x_data[rows] + self.RNG.normal(size=(self.num_prototypes, self.input_dim)) * jitter
+        self.weights = x_data[rows] + RNG.normal(size=(self.num_prototypes, self.input_dim)) * jitter
         self.initialized = True
 
     def distances(self, x_data: NDArray) -> NDArray:
@@ -234,38 +237,14 @@ class PrototypeLayer(Layer):
         grad_input = 2.0 * (grad_distances.sum(axis=1, keepdims=True) * self.input - grad_distances @ self.weights)
         return grad_input.reshape(*self.lead_shape, self.input_dim)
 
-    def update_weights(self, gradient_weights: NDArray) -> None:
-        self.weights -= gradient_weights
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {"gradient_weights": self.gradient_weights}
-
-    def zero_gradients(self) -> None:
-        self.gradient_weights = np.zeros_like(self.weights)
-
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"weights": self.weights}
-        return self.weights
-
     def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            self.weights = np.array(weights["weights"], dtype=GLOBAL_DTYPE)
-            self.num_prototypes = len(self.weights)
-            self.initialized = True
-            self.zero_gradients()
-
-    def purge(self) -> None:
-        self.input = None
-        self.distance_cache = None
-        self.kernel = None
-        self.sample_weights = None
-        self.assignment = None
-        self.lead_shape = ()
+        super().set_weights(weights)
+        self.initialized = True
+        self.zero_gradients()
 
     @property
-    def num_parameters(self) -> int:
-        return self.weights.size
+    def num_prototypes(self) -> int:
+        return len(self.weights)
 
 
 class CentroidLayer(PrototypeLayer):
@@ -283,8 +262,11 @@ class CentroidLayer(PrototypeLayer):
         output_type: str = "assignment",
         learning_rate: float = 1.0,
     ):
-        self.num_centroids = num_centroids
         super().__init__(num_centroids, input_dim, temperature, energy_weight, output_type, learning_rate)
+
+    @property
+    def num_centroids(self) -> int:
+        return self.num_prototypes
 
     def neighborhood(self, distances: NDArray, training_now: bool) -> tuple[None, NDArray]:
         return None, np.ones(len(distances), dtype=GLOBAL_DTYPE)
@@ -301,6 +283,8 @@ class ParameterlessLayer(PrototypeLayer):
     and error records accumulate in training and decay once per epoch
     (end_epoch), which is also where growing layers restructure.
     """
+
+    state_names = ("scale", "running_epsilon", "hit_map", "node_error", "epoch", "frozen")
 
     def __init__(
         self,
@@ -382,7 +366,6 @@ class ParameterlessLayer(PrototypeLayer):
 
     def after_restructure(self) -> None:
         """Resync counts and buffers after prototypes are added or removed; r re-establishes itself."""
-        self.num_prototypes = len(self.weights)
         self.scale = 0.0
         self.zero_gradients()
         self.purge()
@@ -391,27 +374,6 @@ class ParameterlessLayer(PrototypeLayer):
         """Scale temperature and theta_max down; theta_max is floored at theta_min."""
         super().anneal(factor)
         self.theta_max = max(self.theta_max * factor, self.theta_min)
-
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {
-                "weights": self.weights,
-                "scale": self.scale,
-                "running_epsilon": self.running_epsilon,
-                "hit_map": self.hit_map,
-                "node_error": self.node_error,
-                "epoch": self.epoch,
-            }
-        return self.weights
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            super().set_weights(weights)
-            self.scale = float(weights["scale"])
-            self.running_epsilon = float(weights["running_epsilon"])
-            self.hit_map = np.array(weights["hit_map"], dtype=GLOBAL_DTYPE)
-            self.node_error = np.array(weights["node_error"], dtype=GLOBAL_DTYPE)
-            self.epoch = int(weights["epoch"])
 
 
 class PLSOMLayer(ParameterlessLayer):
@@ -480,18 +442,6 @@ class PLSOMLayer(ParameterlessLayer):
         """Prototypes as (height, width, input_dim)."""
         return self.weights.reshape(self.height, self.width, self.input_dim)
 
-    def get_weights(self, for_serialize: bool = False):
-        weights = super().get_weights(for_serialize)
-        if for_serialize:
-            weights["shape"] = (self.height, self.width)
-        return weights
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            self.height, self.width = weights["shape"]
-            self.build_lattice()
-            super().set_weights(weights)
-
 
 class GPLSOMLayer(PLSOMLayer):
     """
@@ -508,6 +458,7 @@ class GPLSOMLayer(PLSOMLayer):
     """
 
     grows = True
+    state_names = ("growth_threshold", "last_structural_epoch")
 
     def __init__(
         self,
@@ -660,7 +611,7 @@ class GPLSOMLayer(PLSOMLayer):
         worst = int(np.argmax(np.moveaxis(self.mean_node_error().reshape(shape), axis, 0).sum(axis=1)))
         grid = self.weight_grid().copy()
         lines = np.moveaxis(grid, axis, 0)
-        lines[position] = lines[worst] + self.RNG.uniform(-self.theta_min, self.theta_min, size=lines[position].shape)
+        lines[position] = lines[worst] + RNG.uniform(-self.theta_min, self.theta_min, size=lines[position].shape)
         np.moveaxis(self.hit_map.reshape(shape), axis, 0)[position] = 0.0
         np.moveaxis(self.node_error.reshape(shape), axis, 0)[position] = 0.0
         self.reshape_map(grid)
@@ -692,17 +643,6 @@ class GPLSOMLayer(PLSOMLayer):
             addition = np.zeros(lines.shape[1])
         return np.insert(grid, position, addition, axis=axis).reshape(-1)
 
-    def get_weights(self, for_serialize: bool = False):
-        weights = super().get_weights(for_serialize)
-        if for_serialize:
-            weights["growth_threshold"] = self.growth_threshold
-        return weights
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            super().set_weights(weights)
-            self.growth_threshold = float(weights["growth_threshold"])
-
 
 class FreePLSOMLayer(ParameterlessLayer):
     """
@@ -719,6 +659,7 @@ class FreePLSOMLayer(ParameterlessLayer):
     """
 
     grows = True
+    state_names = ("growth_threshold", "last_structural_epoch")
 
     def __init__(self,
                  n_neurons: int,
@@ -853,20 +794,9 @@ class FreePLSOMLayer(ParameterlessLayer):
     def reinit_neuron(self, index: int) -> None:
         """Move a cold prototype at the size floor beside the worst one, with fresh records."""
         worst = int(np.argmax(self.mean_node_error()))
-        self.weights[index] = self.weights[worst] + self.RNG.uniform(
+        self.weights[index] = self.weights[worst] + RNG.uniform(
             -self.theta_min, self.theta_min, size=self.input_dim
         )
         self.hit_map[index] = 0.0
         self.node_error[index] = 0.0
         self.after_restructure()
-
-    def get_weights(self, for_serialize: bool = False):
-        weights = super().get_weights(for_serialize)
-        if for_serialize:
-            weights["growth_threshold"] = self.growth_threshold
-        return weights
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            super().set_weights(weights)
-            self.growth_threshold = float(weights["growth_threshold"])

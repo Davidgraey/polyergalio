@@ -11,12 +11,12 @@ import pickle
 import numpy as np
 import pytest
 from polyergalio.models.constants import DECISION_TYPES
-from polyergalio.models.layers.basal_layers import FullyConnectedLayer, Layer, NormalizeLayer
+from polyergalio.models.layers.basic_layers import FullyConnectedLayer, Layer, NormalizeLayer
 from polyergalio.models.layers.decision_layers import DecisionHead
 from polyergalio.models.layers.mixture_layers import MixtureOfExperts
 from polyergalio.models.layers.operator_layers import LatentStack
 from polyergalio.models.model_loss import MSELoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network as NeuralNetwork
 from polyergalio.models.optimizers import SGD
 from test_network import concrete_layers
 

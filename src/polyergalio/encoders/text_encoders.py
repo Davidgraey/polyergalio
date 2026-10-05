@@ -70,7 +70,7 @@ def split_sentences(text: str) -> list[str]:
 
 
 class TextProcessor(Processor):
-    _structural_state_keys = Processor._structural_state_keys + ("sentence_pool", "token_counts")
+    state_names = ("sentence_pool", "token_counts")
 
     def __init__(
         self,
@@ -156,37 +156,35 @@ class TextProcessor(Processor):
         del config["tokenizer"]
         return config
 
-    def get_weights(self, for_serialize: bool = False) -> dict:
-        weights = super().get_weights(for_serialize)
-        weights["rng_state"] = self.rng.bit_generator.state
-        weights["tokenizer"] = self.tokenizer.serialize()
-        return weights
+    def get_state(self) -> dict:
+        state = super().get_state()
+        state["rng_state"] = self.rng.bit_generator.state
+        state["tokenizer"] = self.tokenizer.serialize()
+        return state
 
-    def set_weights(self, weights: dict) -> None:
-        state = {key: value for key, value in weights.items() if key not in ("tokenizer", "rng_state")}
-        super().set_weights(state)
-        self.rng.bit_generator.state = weights["rng_state"]
+    def set_state(self, state: dict) -> None:
+        super().set_state({key: value for key, value in state.items() if key not in ("tokenizer", "rng_state")})
+        self.rng.bit_generator.state = state["rng_state"]
 
     @classmethod
-    def rebuild(cls, config: dict, weights: dict) -> "TextProcessor":
+    def rebuild(cls, config: dict, state: dict) -> "TextProcessor":
         """The constructor needs the tokenizer, so it is restored first from its own payload."""
-        processor = cls(Tokenizer.deserialize(weights["tokenizer"]), **config)
-        processor.set_weights(weights)
+        processor = cls(Tokenizer.deserialize(state["tokenizer"]), **config)
+        processor.set_state(state)
         return processor
 
     # ------------- Processor interface
     def fit(self, values: Iterable[str]) -> bool:
         """
-        Collect the sentence pool NEXT_SENTENCE draws negatives from and the
-        unigram counts REPLACED_TOKEN samples replacements from. The
-        tokenizer itself is fitted separately, see fit_tokenizer.
+        Collect the sentence pool NEXT_SENTENCE draws negatives from and the unigram counts REPLACED_TOKEN samples
+        replacements from. The tokenizer itself is fitted separately, see fit_tokenizer.
         """
         for text in values:
             if not isinstance(text, str):
                 continue
             self.sentence_pool.extend(split_sentences(text))
             np.add.at(self.token_counts, self.tokenizer.encode(text), 1)
-        self._fitted = True
+        self.fitted = True
         return True
 
     def encode(self, values: Iterable[str]) -> dict:
@@ -587,11 +585,7 @@ if __name__ == "__main__":
     ] * 200
 
     with tempfile.TemporaryDirectory() as workdir:
-        corpus_path = Path(workdir) / "corpus.txt"
-        corpus_path.write_text("\n".join(corpus))
-        model_path = fit_tokenizer(
-            [str(corpus_path)], str(Path(workdir) / "demo"), vocab_size=200, hard_vocab_limit=False
-        )
+        model_path = fit_tokenizer(corpus, str(Path(workdir) / "demo"), vocab_size=200, hard_vocab_limit=False)
         tokenizer = SentencePieceTokenizer(model_path)
 
     processor = TextProcessor(tokenizer, max_length=32, random_seed=0)

@@ -1,5 +1,5 @@
 # up-import our layers
-from polyergalio.models.layers.basal_layers import (
+from polyergalio.models.layers.basic_layers import (
     DropoutLayer,
     FullyConnectedLayer,
     Layer,
@@ -38,5 +38,15 @@ from polyergalio.models.layers.spectre_layers import (
     PersistentMemory,
     SpectreAttention,
     SpectreDecoderAttention,
+)
+from polyergalio.models.layers.operator_layers import (
+    LatentStack,
+    LatentSum,
+    LatentProduct,
+    LatentDifference,
+    MaskGather,
+    ShiftRight,
+    BroadcastOperator,
+
 )
 from polyergalio.models.layers.wavelet_layers import WaveletRefinementModule

@@ -5,3 +5,4 @@ from polyergalio.encoders.categorical_encoders import CategoricalProcessor
 from polyergalio.encoders.chronologic_encoders import TimeCycleProcessor, TimeAbsoluteProcessor
 from polyergalio.encoders.numeric_encoders import NuemricNormalizeProcessor, NuemricStandardizeProcessor
 from polyergalio.encoders.text_encoders import TextProcessor
+from polyergalio.encoders.tokenizer import SentencePieceTokenizer, Tokenizer, TokenSequenceBuilder

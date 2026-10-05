@@ -10,7 +10,7 @@ import numpy as np
 import sentencepiece as spm
 
 from polyergalio.models.constants import DECISION_TYPES
-from polyergalio.types import Serializable
+from polyergalio.base_model import Serializable
 
 SPECIAL_TOKEN_PIECES: Dict[str, str] = {
     "PAD": "<pad>",
@@ -113,21 +113,9 @@ class SentencePieceTokenizer(Tokenizer):
         else:
             raise ValueError("give a model_path or a model_proto")
         self.model_path = model_path
+        self.model_proto = self.sp.serialized_model_proto()
         self.special_tokens = special_tokens or SpecialTokens()
         self._validate_special_tokens()
-
-    def get_config(self) -> dict:
-        return {"special_tokens": self.special_tokens}
-
-    def get_weights(self, for_serialize: bool = False) -> dict:
-        return {"model_proto": self.sp.serialized_model_proto()}
-
-    def set_weights(self, weights: dict) -> None:
-        pass
-
-    @classmethod
-    def rebuild(cls, config: dict, weights: dict) -> "SentencePieceTokenizer":
-        return cls(model_proto=weights["model_proto"], **config)
 
     def _validate_special_tokens(self) -> None:
         """Verify special token ids are within vocab bounds."""
@@ -901,7 +889,7 @@ def fit_tokenizer(
     Parameters
     ----------
     corpus : list of str
-        Text files or glob patterns to train on, one sample per line.
+        Training sentences, one sample each.
     model_prefix : str
         Output path prefix; produces `<model_prefix>.model` and `.vocab`.
     vocab_size : int, optional
@@ -920,8 +908,6 @@ def fit_tokenizer(
 
     Raises
     ------
-    FileNotFoundError
-        If no file matches `corpus_paths`.
     ValueError
         If the trained model's special token ids do not match
         `special_tokens` (see `verify_tokenizer_alignment`).

@@ -7,18 +7,18 @@ from common import flush_figures, run_panel, show_diagram
 from NNet_moe_routing_example import accuracy
 from polyergalio.generators.data_generators import to_onehot
 from polyergalio.models.constants import ClassificationTask
-from polyergalio.models.layers.basal_layers import FullyConnectedLayer
+from polyergalio.models.layers.basic_layers import FullyConnectedLayer
 from polyergalio.models.layers.mixture_layers import MixtureOfExperts
 from polyergalio.models.model_loss import CrossEntropyLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network
 from polyergalio.models.optimizers import SGD
 from polyergalio.visuals.nnet_visuals import plot_expert_routing, plot_network
 from supervised_data import select_data
 
 
-def build_network(num_features: int, num_classes: int, hidden: int, num_shared: int, num_routed: int, top_k: int, bias_speed: float) -> NeuralNetwork:
+def build_network(num_features: int, num_classes: int, hidden: int, num_shared: int, num_routed: int, top_k: int) -> Network:
     """The example's encoder -> MixtureOfExperts -> classifier graph with adjustable sizes."""
-    net = NeuralNetwork(name="moe_routing", input_shape=(num_features,))
+    net = Network(name="moe_routing", input_shape=(num_features,))
     encoded = net.connect(FullyConnectedLayer(num_features, hidden, activation_type="relu"), net.input, name="encoder")
     routed = net.connect(
         MixtureOfExperts(
@@ -36,11 +36,11 @@ def build_network(num_features: int, num_classes: int, hidden: int, num_shared: 
     return net
 
 
-def train(data, hidden: int, num_shared: int, num_routed: int, top_k: int, bias_speed: float, learning_rate: float, steps: int, bias_log_every: int) -> None:
+def train(data, hidden: int, num_shared: int, num_routed: int, top_k: int, learning_rate: float, steps: int, bias_log_every: int) -> None:
     """Train the network as the example does, then plot the loss curve and the routing diagnostics."""
     x, y = data.x, data.y
     targets = to_onehot(y)
-    net = build_network(x.shape[1], data.num_classes, hidden, num_shared, num_routed, top_k, bias_speed)
+    net = build_network(x.shape[1], data.num_classes, hidden, num_shared, num_routed, top_k)
     print(net.summary())
     moe = net.node("moe").layer
 
@@ -56,7 +56,7 @@ def train(data, hidden: int, num_shared: int, num_routed: int, top_k: int, bias_
         logits = net.forward(x)
         loss = loss_fn(logits, targets)
         net.backward(loss_fn.backward())
-        optimizer.step(net.layers)
+        optimizer.step(net)
         losses.append(loss)
         if step % bias_log_every == 0:
             bias_history.append(moe.gate.expert_bias.copy())
@@ -98,7 +98,6 @@ def render() -> None:
         num_shared = int(st.number_input("Shared experts", 0, 8, 1, key="moe_shared"))
         num_routed = int(st.number_input("Routed experts", 2, 16, 6, key="moe_routed"))
         top_k = int(st.number_input("Top k", 2, 16, 2, key="moe_topk"))
-        bias_speed = float(st.number_input("Load-balancing bias speed", 0.0, 0.1, 0.001, step=0.001, format="%.4f", key="moe_bias_speed"))
         learning_rate = float(st.number_input("Learning rate", 0.001, 1.0, 0.05, step=0.01, format="%.3f", key="moe_lr"))
         steps = int(st.number_input("Training steps", 1, 3000, 400, step=50, key="moe_steps"))
         bias_log_every = int(st.number_input("Log bias every N steps", 1, 200, 10, key="moe_bias_log"))
@@ -109,9 +108,9 @@ def render() -> None:
     with right:
         st.subheader("Data")
         data = select_data("moe", "multiclass", samples=1200, features=12, classes=6, settings=left)
-        run_panel("moe", train, data, hidden, num_shared, num_routed, top_k, bias_speed, learning_rate, steps, bias_log_every)
+        run_panel("moe", train, data, hidden, num_shared, num_routed, top_k, learning_rate, steps, bias_log_every)
 
     with diagram:
         with st.expander("Model structure", expanded=True):
-            net = build_network(data.x.shape[1], data.num_classes, hidden, num_shared, num_routed, top_k, bias_speed)
+            net = build_network(data.x.shape[1], data.num_classes, hidden, num_shared, num_routed, top_k)
             show_diagram(plot_network(net, figsize=(5, 6)).figure)

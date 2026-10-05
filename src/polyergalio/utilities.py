@@ -1,32 +1,17 @@
 """
 Utility functions for polyergalio package --- helpers, etc.
 """
+from __future__ import annotations
 
 import time
-import numpy as np
-from numpy.typing import NDArray
-from typing import Optional, Callable, Iterable
 from datetime import datetime, timedelta
 from functools import lru_cache, wraps
+from typing import Optional, Callable, Iterable
+
+import numpy as np
+from numpy.typing import NDArray
+
 from polyergalio.models.constants import EPSILON
-
-
-def standardize_data(design_matrix: NDArray, axis=0):
-    """
-    zero tge mean and variance = 1 along axis
-    Parameters
-    ----------
-    design_matrix :
-    axis :
-
-    Returns
-    -------
-
-    """
-    array_mean = np.mean(design_matrix, axis=axis)
-    array_std = np.std(design_matrix, axis=axis)
-
-    return (design_matrix - array_mean) / array_std
 
 
 # -------------- Decorators  --------------
@@ -175,7 +160,47 @@ def count_elements(value) -> int:
     return int(np.size(value))
 
 
+def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
+    """
+    Compare two declared shapes, right-aligned, and describe the first axis where they disagree.
+
+    Shapes are in trailing-axis form, so they are matched from the last axis backwards and only the overlap is
+    checked. None on either side is a wildcard.
+
+    Returns
+    -------
+    a description of the offending axis, or None when the two are compatible
+    """
+    if (produced is None) or (expected is None):
+        return None
+
+    for offset, (made, wanted) in enumerate(zip(reversed(produced), reversed(expected)), start=1):
+        if (made is None) or (wanted is None):
+            continue
+        if made != wanted:
+            return f"{produced} cannot feed {expected}, axis -{offset} is {made} against {wanted}"
+    return None
+
+
 # --------------- Standardization / Normalize ---------------
+def standardize_data(design_matrix: NDArray, axis=0):
+    """
+    zero tge mean and variance = 1 along axis
+    Parameters
+    ----------
+    design_matrix :
+    axis :
+
+    Returns
+    -------
+
+    """
+    array_mean = np.mean(design_matrix, axis=axis)
+    array_std = np.std(design_matrix, axis=axis)
+
+    return (design_matrix - array_mean) / array_std
+
+
 def update_running_standardize(model, new_data_mean, new_data_std, new_data_count) -> None:
     """
     proportionally update the running mean and standard deviation for standardization processes

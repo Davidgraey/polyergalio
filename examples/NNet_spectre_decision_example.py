@@ -4,7 +4,7 @@ Spectre transformer encoder into a DecisionHead, on real text.
 No `SpectreTransformer` class exists in the codebase yet -- "the Spectre
 transformer" here means the same hand-assembled block
 `NNet_spectre_example.py` builds: TextEmbedding, RoPE, a SpectreAttention
-mixing pass, a feed-forward, and a residual, wired through NeuralNetwork's
+mixing pass, a feed-forward, and a residual, wired through Network's
 graph API. Two stages:
 
   1. Encoder pretraining. TextProcessor (polyergalio.encoders.text_encoders)
@@ -37,7 +37,7 @@ from polyergalio.generators.data_generators import token_accuracy
 from polyergalio.models.constants import DECISION_TYPES, ClassificationTask
 from polyergalio.models.embedding.embedding import TextEmbedding
 from polyergalio.models.embedding.positional import RopeEmbedding
-from polyergalio.models.layers.basal_layers import DropoutLayer, FullyConnectedLayer, RMSNormLayer
+from polyergalio.models.layers.basic_layers import DropoutLayer, FullyConnectedLayer, RMSNormLayer
 from polyergalio.models.layers.decision_layers import (
     DecisionHead,
     decision_correct,
@@ -47,7 +47,7 @@ from polyergalio.models.layers.decision_layers import (
 from polyergalio.models.layers.operator_layers import LatentSum, MaskGather
 from polyergalio.models.layers.spectre_layers import SpectreAttention
 from polyergalio.models.model_loss import CrossEntropyLoss, DecisionLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network
 from polyergalio.models.optimizers import SGD, Adam
 
 TARGET_VOCAB_SIZE = 150
@@ -98,10 +98,8 @@ def make_passages(rng: np.random.Generator, count: int, min_len: int = 4, max_le
 def fit_text_tokenizer(corpus: list[str]) -> SentencePieceTokenizer:
     """Fit a SentencePiece tokenizer on the corpus and load it."""
     with tempfile.TemporaryDirectory() as workdir:
-        corpus_path = Path(workdir) / "corpus.txt"
-        corpus_path.write_text("\n".join(corpus))
         model_path = fit_tokenizer(
-            corpus_paths=[str(corpus_path)],
+            corpus,
             model_prefix=str(Path(workdir) / "decision_tokenizer"),
             vocab_size=TARGET_VOCAB_SIZE,
             hard_vocab_limit=False,
@@ -114,7 +112,7 @@ def sample_texts(rng: np.random.Generator, texts: list[str]) -> list[str]:
 
 
 # -------------    networks    ------------------------------------------------
-def build_encoder(vocab_size: int, padding_idx: int) -> NeuralNetwork:
+def build_encoder(vocab_size: int, padding_idx: int) -> Network:
     """
     TextEmbedding -> RoPE -> Spectre transformer block -> MLM head.
 
@@ -125,9 +123,9 @@ def build_encoder(vocab_size: int, padding_idx: int) -> NeuralNetwork:
 
     Returns
     -------
-    NeuralNetwork whose output is the MLM head, (masked positions, vocab_size)
+    Network whose output is the MLM head, (masked positions, vocab_size)
     """
-    net = NeuralNetwork(name="spectre_transformer", input_shape=(SEQUENCE_LENGTH,))
+    net = Network(name="spectre_transformer", input_shape=(SEQUENCE_LENGTH,))
     embedding = net.connect(
         TextEmbedding(vocab_size, HIDDEN_DIM, padding_idx=padding_idx), net.input, name="embedding"
     )
@@ -152,7 +150,7 @@ def build_encoder(vocab_size: int, padding_idx: int) -> NeuralNetwork:
 ENCODER_CHAIN = ("positional_emb", "prenorm", "attention", "ffn_1", "ffn_2", "postnorm", "dropout")
 
 
-def build_decision_network(encoder: NeuralNetwork) -> NeuralNetwork:
+def build_decision_network(encoder: Network) -> Network:
     """
     The pretrained Spectre transformer block's layers plus a DecisionHead,
     replacing the MLM head.
@@ -164,9 +162,9 @@ def build_decision_network(encoder: NeuralNetwork) -> NeuralNetwork:
 
     Returns
     -------
-    NeuralNetwork mapping token ids (batch, SEQUENCE_LENGTH) to option logits
+    Network mapping token ids (batch, SEQUENCE_LENGTH) to option logits
     """
-    net = NeuralNetwork(name="spectre_decision", input_shape=(SEQUENCE_LENGTH,))
+    net = Network(name="spectre_decision", input_shape=(SEQUENCE_LENGTH,))
     embedding = net.connect(encoder.node("embedding").layer, net.input, name="embedding")
     stream = embedding
     for name in ENCODER_CHAIN:
@@ -177,7 +175,7 @@ def build_decision_network(encoder: NeuralNetwork) -> NeuralNetwork:
 
 
 # -------------    stage 1: encoder MLM    ------------------------------------
-def mlm_accuracy(net: NeuralNetwork, processor: TextProcessor, texts: list[str]) -> float:
+def mlm_accuracy(net: Network, processor: TextProcessor, texts: list[str]) -> float:
     """Accuracy at masked positions of a cloze batch, with the network in eval mode."""
     batch = processor.distort_batch(texts, "cloze")
     net.eval()
@@ -186,7 +184,7 @@ def mlm_accuracy(net: NeuralNetwork, processor: TextProcessor, texts: list[str])
 
 
 def train_mlm(
-    net: NeuralNetwork, processor: TextProcessor, texts: list[str], held_out: list[str], rng: np.random.Generator
+    net: Network, processor: TextProcessor, texts: list[str], held_out: list[str], rng: np.random.Generator
 ) -> None:
     """Masked language modelling with a fresh cloze distortion every step."""
     vocab_size = processor.vocab_size
@@ -202,7 +200,7 @@ def train_mlm(
         logits = net.forward(batch["input_ids"], mask=batch["attention_mask"], target_mask=batch["target_mask"])
         loss = loss_fn(logits, np.eye(vocab_size)[labels])
         net.backward(loss_fn.backward())
-        optimizer.step(net.layers)
+        optimizer.step(net)
         if step % LOG_EVERY == 0:
             print(f"mlm step {step:4d}  loss {loss:.4f}")
     print(f"masked-token accuracy after training:  {mlm_accuracy(net, processor, held_out[:BATCH_SIZE]):.3f}")
@@ -321,7 +319,7 @@ def accuracy_by_type(logits: np.ndarray, y: np.ndarray, kwargs: dict) -> dict[st
     }
 
 
-def train_decision(net: NeuralNetwork, train_set: tuple, calibration_set: tuple, test_set: tuple) -> None:
+def train_decision(net: Network, train_set: tuple, calibration_set: tuple, test_set: tuple) -> None:
     """
     SGD over the train questions with DecisionLoss plus the act branch, then
     temperatures fit on the calibration questions and calibrated decoding,
@@ -349,7 +347,7 @@ def train_decision(net: NeuralNetwork, train_set: tuple, calibration_set: tuple,
         loss = loss_fn(logits, y, kwargs["token_mask"], kwargs["decisiontypes"])
         act_loss = head.score_act(row_correctness(logits, y, kwargs))
         net.backward(loss_fn.backward())
-        optimizer.step(net.layers)
+        optimizer.step(net)
         if step % LOG_EVERY == 0:
             print(f"decision step {step:4d}  loss {loss:.4f}  act loss {act_loss:.4f}")
 

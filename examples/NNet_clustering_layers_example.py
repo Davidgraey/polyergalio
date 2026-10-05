@@ -4,7 +4,7 @@ Clustering layers example.
 Trains the differentiable prototype layers -- CentroidLayer, PLSOMLayer,
 GPLSOMLayer and FreePLSOMLayer -- in two ways.
 
-Unsupervised: each layer is the only node of a NeuralNetwork. Every batch runs
+Unsupervised: each layer is the only node of a Network. Every batch runs
 forward, then backward(None), so the layer learns from its own clustering
 energy alone; end_epoch() lets the growing layers grow, prune and merge, and
 anneal() sharpens the assignments.
@@ -31,7 +31,7 @@ from polyergalio.models.layers import (
 )
 from polyergalio.models.layers.clustering_layers import ParameterlessLayer
 from polyergalio.models.model_loss import CrossEntropyLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network
 from polyergalio.models.optimizers import SGD, Adam
 
 LAYER_NAMES = ("CentroidLayer", "PLSOMLayer", "GPLSOMLayer", "FreePLSOMLayer")
@@ -136,7 +136,7 @@ def train_unsupervised(layer, x: np.ndarray, epochs: int = UNSUPERVISED_EPOCHS, 
     -------
     per-epoch snapshots: dict(epoch, error, num_prototypes, weights)
     """
-    net = NeuralNetwork(name="clustering", input_shape=(x.shape[1],))
+    net = Network(name="clustering", input_shape=(x.shape[1],))
     net.output = net.connect(layer, net.input, name="prototypes")
     optimizer = SGD(CENTROID_RATE if isinstance(layer, CentroidLayer) else SOM_RATE)
     rng = np.random.default_rng(seed)
@@ -148,7 +148,7 @@ def train_unsupervised(layer, x: np.ndarray, epochs: int = UNSUPERVISED_EPOCHS, 
             net.zero_gradients()
             net.forward(x[batch])
             net.backward(None)
-            optimizer.step(net.layers)
+            optimizer.step(net)
         finish_epoch(layer, epoch, epochs, anneal)
         history.append(
             dict(epoch=epoch, error=quantization_error(layer, x), num_prototypes=layer.num_prototypes, weights=layer.weights.copy())
@@ -180,7 +180,7 @@ def cluster_unsupervised(name: str, x: np.ndarray, labels: np.ndarray, num_clust
 
 
 def build_classifier(name: str, num_features: int, num_classes: int, hidden_dim: int = HIDDEN_DIM,
-                     energy_weight: float = ENERGY_WEIGHT, prototype_rate: float = PROTOTYPE_RATE, **options) -> NeuralNetwork:
+                     energy_weight: float = ENERGY_WEIGHT, prototype_rate: float = PROTOTYPE_RATE, **options) -> Network:
     """
     Encoder -> clustering layer -> classifier.
 
@@ -199,7 +199,7 @@ def build_classifier(name: str, num_features: int, num_classes: int, hidden_dim:
     )
     width = clustering.shapes["output"][0][0] or hidden_dim
 
-    net = NeuralNetwork(name=f"classifier_{name}", input_shape=(num_features,))
+    net = Network(name=f"classifier_{name}", input_shape=(num_features,))
     encoded = net.connect(FullyConnectedLayer(num_features, hidden_dim, activation_type="tanh"), net.input, name="encoder")
     clustered = net.connect(clustering, encoded, name="clusters")
     net.output = net.connect(
@@ -213,7 +213,7 @@ def accuracy(logits: np.ndarray, labels: np.ndarray) -> float:
     return float(np.mean(np.argmax(logits, axis=-1) == labels))
 
 
-def train_classifier(net: NeuralNetwork, x: np.ndarray, labels: np.ndarray, epochs: int = SUPERVISED_EPOCHS,
+def train_classifier(net: Network, x: np.ndarray, labels: np.ndarray, epochs: int = SUPERVISED_EPOCHS,
                      batch_size: int = SUPERVISED_BATCH, learning_rate: float = LEARNING_RATE,
                      anneal: float = ANNEAL, seed: int = 0) -> dict:
     """
@@ -241,7 +241,7 @@ def train_classifier(net: NeuralNetwork, x: np.ndarray, labels: np.ndarray, epoc
             net.zero_gradients()
             loss = loss_fn(net.forward(x[batch]), targets[batch])
             net.backward(loss_fn.backward())
-            optimizer.step(net.layers)
+            optimizer.step(net)
         finish_epoch(layer, epoch, epochs, anneal)
         losses.append(float(loss))
         counts.append(layer.num_prototypes)

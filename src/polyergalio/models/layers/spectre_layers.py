@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Optional
 
 import numpy as np
@@ -6,7 +8,7 @@ from numpy.typing import NDArray
 import polyergalio.models.activations as activations
 from polyergalio.models.activations import mod_relu, mod_relu_derivative
 from polyergalio.models.constants import EPSILON, GLOBAL_COMPLEX_DTYPE, GLOBAL_DTYPE
-from polyergalio.models.layers.basal_layers import Layer
+from polyergalio.models.layers.basic_layers import RNG, Layer
 from polyergalio.models.weight_initialization import get_weight_init
 from polyergalio.models.layers.wavelet_layers import WaveletRefinementModule
 
@@ -63,6 +65,7 @@ def shift_frequencies(array: NDArray, offset: int) -> NDArray:
         out[...] = array
     return out
 
+
 class DenseHead(Layer):
     """
     Batched per-head dense layer: FullyConnectedLayer with a head axis. Each head owns an independent
@@ -73,6 +76,8 @@ class DenseHead(Layer):
     Input shape: (..., num_heads * ni)
     Output shape: (..., num_heads * no)
     """
+    parameter_names = ("weights", "bias")
+    cache_names = ("input", "z", "output")
 
     def __init__(
         self,
@@ -104,10 +109,8 @@ class DenseHead(Layer):
         self.declare_shapes(inputs=((num_heads * ni,),), outputs=((num_heads * no,),))
 
         initializer = get_weight_init(initialization or activation_type, **self.initialization_kwargs)
-        self.weights = np.stack([initializer(self.RNG, ni=ni, no=no) for _ in range(num_heads)]).astype(GLOBAL_DTYPE)
+        self.weights = np.stack([initializer(RNG, ni=ni, no=no) for _ in range(num_heads)]).astype(GLOBAL_DTYPE)
         self.bias = np.zeros((num_heads, no), dtype=GLOBAL_DTYPE)
-
-        self.purge()
         self.zero_gradients()
 
     def pre_activation(self, input_data: NDArray) -> NDArray:
@@ -132,37 +135,6 @@ class DenseHead(Layer):
         self.gradient_weights = np.einsum("nhi,nho->hio", flat_input, flat_delta, optimize=True)
         self.gradient_bias = flat_delta.sum(axis=0)
         return merge_heads(np.einsum("...ho,hio->...hi", delta, self.weights, optimize=True))
-
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"weights": self.weights, "bias": self.bias}
-        return self.weights, self.bias
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        self.weights = np.asarray(weights["weights"], dtype=GLOBAL_DTYPE)
-        self.bias = np.asarray(weights["bias"], dtype=GLOBAL_DTYPE)
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {"gradient_weights": self.gradient_weights, "gradient_bias": self.gradient_bias}
-
-    def update_weights(self, gradient_weights: NDArray, gradient_bias: NDArray) -> None:
-        self.weights -= gradient_weights
-        self.bias -= gradient_bias
-
-    def zero_gradients(self) -> None:
-        self.gradient_weights = np.zeros_like(self.weights)
-        self.gradient_bias = np.zeros_like(self.bias)
-
-    def purge(self) -> None:
-        self.input = None
-        self.z = None
-        self.output = None
-
-    @property
-    def num_parameters(self) -> int:
-        return self.weights.size + self.bias.size
 
     def __str__(self):
         return f"DenseHead, {self.num_heads} heads of {self.ni} -> {self.no}, {self.activation_type}"
@@ -231,6 +203,7 @@ class HeadGate(Layer):
     Input shape: (batch, num_heads * head_dim) pooled query
     Output shape: (batch, num_heads, num_frequencies) complex gate
     """
+    cache_names = ("std", "x_norm", "normed", "gate_raw", "gate_pre_activation", "gate")
 
     def __init__(
         self,
@@ -294,21 +267,12 @@ class HeadGate(Layer):
         # every tap acts on all num_frequencies bins at once, so its gradient grows with sequence
         # length; scaling taps by 1/sqrt(num_frequencies) keeps their step size length-independent
         self.band_scale = 1.0 / np.sqrt(num_frequencies)
+        names = ("gamma", "beta", "activation_bias", "hidden_layer", "output_layer")
         if band_radius:
             self.band_taps = np.zeros((num_heads, len(self.band_offsets)), dtype=GLOBAL_COMPLEX_DTYPE)
-
-        self.purge()
+            names += ("band_taps",)
+        self.parameter_names = names
         self.zero_gradients()
-
-    @property
-    def parameter_names(self) -> tuple[str, ...]:
-        """parameters held directly, outside the MLP sublayers"""
-        names = ("gamma", "beta", "activation_bias")
-        return names + ("band_taps",) if self.band_radius else names
-
-    def owned_layers(self) -> dict[str, Layer]:
-        """sublayers by the key their weights and gradients are stored under"""
-        return {"hidden_layer": self.hidden_layer, "output_layer": self.output_layer}
 
     def band_update(self, gate: NDArray) -> NDArray:
         """gate plus its band-tap mix of neighbouring frequencies"""
@@ -393,58 +357,6 @@ class HeadGate(Layer):
         ) / self.std
         return merge_heads(heads_gradient)
 
-    def get_weights(self, for_serialize: bool = False):
-        weights = {name: getattr(self, name) for name in self.parameter_names}
-        weights.update({name: layer.get_weights(for_serialize=for_serialize) for name, layer in self.owned_layers().items()})
-        return weights if for_serialize else tuple(weights.values())
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        for name in self.parameter_names:
-            if name in weights:
-                dtype = GLOBAL_COMPLEX_DTYPE if name == "band_taps" else GLOBAL_DTYPE
-                setattr(self, name, np.asarray(weights[name], dtype=dtype))
-        for name, layer in self.owned_layers().items():
-            if name in weights:
-                layer.set_weights(weights[name])
-
-    def get_gradients(self) -> dict:
-        gradients = {f"gradient_{name}": getattr(self, f"gradient_{name}") for name in self.parameter_names}
-        gradients.update({name: layer.get_gradients() for name, layer in self.owned_layers().items()})
-        return gradients
-
-    def update_weights(self, **gradients) -> None:
-        for name in self.parameter_names:
-            if gradients.get(f"gradient_{name}") is not None:
-                setattr(self, name, getattr(self, name) - gradients[f"gradient_{name}"])
-        for name, layer in self.owned_layers().items():
-            if gradients.get(name):
-                layer.update_weights(**gradients[name])
-
-    def zero_gradients(self) -> None:
-        for name in self.parameter_names:
-            setattr(self, f"gradient_{name}", np.zeros_like(getattr(self, name)))
-        for layer in self.owned_layers().values():
-            layer.zero_gradients()
-
-    def purge(self) -> None:
-        self.std = None
-        self.x_norm = None
-        self.normed = None
-        self.gate_raw = None
-        self.gate_pre_activation = None
-        self.gate = None
-        for layer in self.owned_layers().values():
-            layer.purge()
-
-    @property
-    def num_parameters(self) -> int:
-        total = sum(getattr(self, name).size for name in self.parameter_names)
-        total += sum(layer.num_parameters for layer in self.owned_layers().values())
-        # band taps are complex, two parameters each
-        return total + self.band_taps.size if self.band_radius else total
-
     def __str__(self):
         band = f", band radius {self.band_radius}" if self.band_radius else ""
         return (
@@ -467,6 +379,7 @@ class PersistentMemory(Layer):
     """
 
     preserves_shape = False
+    parameter_names = ("memory",)
 
     def __init__(
         self,
@@ -493,7 +406,7 @@ class PersistentMemory(Layer):
         self.declare_shapes(inputs=(), outputs=((self.hidden_dim,),))
 
         initializer = get_weight_init(initialization, **self.initialization_kwargs)
-        self.memory = initializer(self.RNG, ni=memory_tokens, no=hidden_dim)
+        self.memory = initializer(RNG, ni=memory_tokens, no=hidden_dim)
         self.zero_gradients()
 
     def get_memory(self) -> NDArray:
@@ -504,37 +417,6 @@ class PersistentMemory(Layer):
 
     def backward(self, incoming_gradient: NDArray) -> None:
         self.gradient_memory += incoming_gradient
-
-    def update_weights(self, gradient_memory: NDArray) -> None:
-        self.memory -= gradient_memory
-
-    def purge(self) -> None:
-        self._stale = True
-
-    def zero_gradients(self) -> None:
-        self.gradient_memory = np.zeros_like(self.memory)
-
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"memory": self.memory}
-        return self.memory
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            self.memory = np.asarray(
-                weights["memory"],
-                dtype=GLOBAL_DTYPE,
-            )
-            self._stale = True
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        if self.memory_tokens == 0:
-            return {}
-        return {"gradient_memory": self.gradient_memory}
-
-    @property
-    def num_parameters(self) -> int:
-        return self.memory.size
 
 
 class PrefixFFTCache:
@@ -788,6 +670,10 @@ class SpectreAttention(Layer):
 
     registry_name = "SPECTREAttention"
     preserves_shape = True
+    cache_names = (
+        "input", "mask", "counts", "total_counts", "combined_length", "seq_mu",
+        "gate", "descriptor", "value_transform", "output",
+    )
 
     def __init__(
         self,
@@ -836,8 +722,6 @@ class SpectreAttention(Layer):
         self.use_positional_phase: bool = use_positional_phase
         self.gate_hidden = gate_hidden
 
-        self.training_now: bool = True
-
         # sequence axis is pinned, not wildcarded: fft_length / num_frequencies
         # are sized off sequence_length at construction time, so a mismatched
         # sequence length here is a real, catchable error, not a free axis.
@@ -871,21 +755,13 @@ class SpectreAttention(Layer):
                 skip_threshold=0.5,
             )
 
-        self.purge()
+        names = ("query_projection", "value_projection", "head_gate")
+        if memory_tokens:
+            names += ("memory",)
+        if use_wrm:
+            names += ("wrm",)
+        self.parameter_names = names
         self.zero_gradients()
-
-    def owned_layers(self) -> dict[str, Layer]:
-        """sublayers by the key their weights and gradients are stored under"""
-        owned = {
-            "query_projection": self.query_projection,
-            "value_projection": self.value_projection,
-            "head_gate": self.head_gate,
-        }
-        if self.memory_tokens:
-            owned["persistent_memory"] = self.memory
-        if self.use_wrm:
-            owned["wrm"] = self.wrm
-        return owned
 
     def forward(
         self,
@@ -899,7 +775,6 @@ class SpectreAttention(Layer):
         assert input_data.shape[2] == self.hidden_dim
 
         self.input = input_data
-        self.training_now = training_now
         batch = input_data.shape[0]
 
         self.mask = (
@@ -942,7 +817,7 @@ class SpectreAttention(Layer):
         self.output = output_all[:, memory_tokens:]
 
         if self.use_wrm:
-            self.output = self.wrm.forward(self.output, self.descriptor, training_now=self.training_now)
+            self.output = self.wrm.forward(self.output, self.descriptor, training_now=training_now)
         return self.output
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
@@ -978,47 +853,6 @@ class SpectreAttention(Layer):
         if memory_tokens:
             self.memory.backward(input_gradient[:, :memory_tokens].sum(axis=0))
         return input_gradient[:, memory_tokens:].real.astype(GLOBAL_DTYPE)
-
-    def get_weights(self, for_serialize: bool = False) -> tuple | dict:
-        weights = {name: layer.get_weights(for_serialize=for_serialize) for name, layer in self.owned_layers().items()}
-        return weights if for_serialize else tuple(weights.values())
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is None:
-            return
-        for name, layer in self.owned_layers().items():
-            if name in weights:
-                layer.set_weights(weights[name])
-
-    def get_gradients(self) -> dict[str, dict]:
-        return {name: layer.get_gradients() for name, layer in self.owned_layers().items()}
-
-    def update_weights(self, **gradients: dict) -> None:
-        for name, layer in self.owned_layers().items():
-            if gradients.get(name):
-                layer.update_weights(**gradients[name])
-
-    def zero_gradients(self) -> None:
-        for layer in self.owned_layers().values():
-            layer.zero_gradients()
-
-    def purge(self) -> None:
-        self.input = None
-        self.mask = None
-        self.counts = None
-        self.total_counts = None
-        self.combined_length = None
-        self.seq_mu = None
-        self.gate = None
-        self.descriptor = None
-        self.value_transform = None
-        self.output = None
-        for layer in self.owned_layers().values():
-            layer.purge()
-
-    @property
-    def num_parameters(self) -> int:
-        return sum(layer.num_parameters for layer in self.owned_layers().values())
 
     def __str__(self):
         band = f", band radius {self.band_radius}" if self.band_radius else ""
@@ -1067,6 +901,7 @@ class SpectreDecoderAttention(SpectreAttention):
     """
 
     registry_name = "SPECTREDecoderAttention"
+    cache_names = ("anchors", "chunk_counts", "filter_transforms")
 
     def __init__(
         self,
@@ -1219,12 +1054,6 @@ class SpectreDecoderAttention(SpectreAttention):
         if memory_tokens:
             self.memory.backward(input_gradient[:, :memory_tokens].sum(axis=0))
         return input_gradient[:, memory_tokens:].astype(GLOBAL_DTYPE)
-
-    def purge(self) -> None:
-        super().purge()
-        self.anchors = None
-        self.chunk_counts = None
-        self.filter_transforms = None
 
     # ------------- decoding
     def reset_cache(self, batch_size: int):

@@ -7,11 +7,11 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from numpy.typing import NDArray
-from polyergalio.models.neural_network import NeuralNetwork, Node
+from polyergalio.models.network import Network
 
 
 def plot_network(
-    network: NeuralNetwork,
+    network: Network,
     ax: Optional[Axes] = None,
     figsize: tuple = (9, 12),
     x_spacing: float = 2.0,
@@ -49,7 +49,7 @@ def plot_network(
     -------
     the axes drawn on
     """
-    nodes = network._nodes
+    nodes = network.nodes
     depth = {}
     for node in nodes:
         depth[node] = (
@@ -70,7 +70,7 @@ def plot_network(
         _, ax = plt.subplots(figsize=figsize)
 
     for node, (x, y) in positions.items():
-        is_output = node is network._output
+        is_output = node is network.output
         color = "#ffd166" if node.is_source else ("#06d6a0" if is_output else "#118ab2")
         label = (
             node.name if node.is_source else f"{node.name}\n{type(node.layer).__name__}"

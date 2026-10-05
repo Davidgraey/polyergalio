@@ -19,16 +19,16 @@ from polyergalio.models.embedding.embedding import TextEmbedding
 from polyergalio.models.layers.decision_layers import DecisionHead
 from polyergalio.models.layers.spectre_layers import SpectreAttention
 from polyergalio.models.model_loss import DecisionLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network
 from polyergalio.models.optimizers import SGD
 from polyergalio.visuals.nnet_visuals import plot_network
 
 TYPE_NAMES = {member.value: member.name.lower() for member in DECISION_TYPES}
 
 
-def build_network(vocab_size: int, sequence_length: int, padding_idx: int, hidden: int, head_hidden: int, heads: int) -> NeuralNetwork:
+def build_network(vocab_size: int, sequence_length: int, padding_idx: int, hidden: int, head_hidden: int, heads: int) -> Network:
     """The example's TextEmbedding -> SpectreAttention -> DecisionHead graph with adjustable sizes."""
-    net = NeuralNetwork(name="system_one", input_shape=(sequence_length,))
+    net = Network(name="system_one", input_shape=(sequence_length,))
     embedded = net.connect(TextEmbedding(vocab_size, hidden, padding_idx=padding_idx), net.input, name="embedding")
     attended = net.connect(SpectreAttention(sequence_length, hidden, num_heads=heads), embedded, name="attention")
     net.output = net.connect(DecisionHead(hidden, head_hidden), attended, name="decision_head")
@@ -82,7 +82,7 @@ def train(x, y, meta, hidden: int, head_hidden: int, heads: int, learning_rate: 
         loss = loss_fn(logits, y_train, train_kwargs["token_mask"], train_kwargs["decisiontypes"])
         act_loss = head.score_act(row_correctness(logits, y_train, train_kwargs))
         net.backward(loss_fn.backward())
-        optimizer.step(net.layers)
+        optimizer.step(net)
         losses.append(loss)
         act_losses.append(act_loss)
         if step % 50 == 0:

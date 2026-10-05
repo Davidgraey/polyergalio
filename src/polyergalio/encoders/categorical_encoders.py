@@ -13,9 +13,7 @@ from polyergalio.encoders.encoders import Processor
 
 
 class CategoricalProcessor(Processor):
-    _structural_state_keys = Processor._structural_state_keys + (
-        "categorical_mapping", "value_mapping", "_variable_counts", "rare_labels", "rare_value",
-    )
+    state_names = ("categorical_mapping", "value_mapping", "variable_counts", "rare_labels", "rare_value")
 
     def __init__(
         self,
@@ -43,24 +41,15 @@ class CategoricalProcessor(Processor):
         self.vari_name = f"{target}"
         self.categorical_mapping: dict = {}
         self.value_mapping: dict = {}
-        self._variable_counts: Counter = Counter()
-        self._for_target = for_target
+        self.variable_counts: Counter = Counter()
+        self.for_target = for_target
 
-        self.rare_thresh: float = rare_encoding_threshold
-        self.rare_qualify: int = min_classes_for_rare_qualification
+        self.rare_encoding_threshold: float = rare_encoding_threshold
+        self.min_classes_for_rare_qualification: int = min_classes_for_rare_qualification
 
         self.rare_key: str = "rare_label"
         self.rare_value: int = 999
         self.rare_labels: set = set()
-
-    def get_config(self) -> dict:
-        config = super().get_config()
-        config.update(
-            rare_encoding_threshold=self.rare_thresh,
-            min_classes_for_rare_qualification=self.rare_qualify,
-            for_target=self._for_target,
-        )
-        return config
 
     def count_categories(self, values: pd.Series) -> dict:
         """
@@ -72,7 +61,7 @@ class CategoricalProcessor(Processor):
 
         Returns
         -------
-        per-value frequency (held in self._variable_counts)
+        per-value frequency (held in self.variable_counts)
         """
         if isinstance(values, pd.Series):
             _counts = values.value_counts(dropna=True).to_dict()
@@ -100,22 +89,22 @@ class CategoricalProcessor(Processor):
         """
         values = values.dropna(axis=0)
 
-        self._variable_counts = self.count_categories(values)
+        self.variable_counts = self.count_categories(values)
 
-        items = list(self._variable_counts.keys())
-        if self.rare_qualify:
-            if len(items) <= self.rare_qualify:
+        items = list(self.variable_counts.keys())
+        if self.min_classes_for_rare_qualification:
+            if len(items) <= self.min_classes_for_rare_qualification:
                 valids = items
                 rare_labels = []
             else:
-                valids = items[: self.rare_qualify]
-                rare_labels = items[self.rare_qualify :]
+                valids = items[: self.min_classes_for_rare_qualification]
+                rare_labels = items[self.min_classes_for_rare_qualification :]
         else:
             raise NotImplementedError("not yet implemented")
 
         self.rare_labels = rare_labels
 
-        if self._for_target is True:
+        if self.for_target is True:
             enum_idx = 0
         else:
             enum_idx = 1
@@ -124,7 +113,7 @@ class CategoricalProcessor(Processor):
         }
         # since variables are enumerate(), we'll need to add to create the 'out of range' rare value
         self.rare_value = int(len(valids) + enum_idx)
-        self._fitted = True
+        self.fitted = True
 
         # flip for lookup --
         self.value_mapping = {v: k for k, v in self.categorical_mapping.items()}
@@ -142,7 +131,7 @@ class CategoricalProcessor(Processor):
         -------
         returns a dict of {"variable_name": [encoded_values]}
         """
-        if self._fitted is False:
+        if self.fitted is False:
             raise ValueError("Not yet fitted")
 
         # modified - assuming Series is passed in & removing the array overheads
@@ -185,7 +174,7 @@ class CategoricalProcessor(Processor):
         -------
         vector of reverse-transformed values
         """
-        if self._fitted is False:
+        if self.fitted is False:
             raise ValueError("Not yet fitted")
 
         # flip self.categorical_mapping
@@ -208,7 +197,7 @@ class CategoricalProcessor(Processor):
                 "output_type": "int",
                 "enc_type": "categorical",
                 "rare_labels": self.rare_labels,
-                "counts": self._variable_counts,
+                "counts": self.variable_counts,
                 "variable_names": [f"{self.target}"],
             }
         }

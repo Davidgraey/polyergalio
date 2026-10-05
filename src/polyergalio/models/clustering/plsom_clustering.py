@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import polyergalio.distances as distances
 import numpy as np
 from polyergalio.models.clustering.centroid_network import CentroidNeuralNetwork
-from polyergalio.types import BasalModel
+from polyergalio.fitted_model import FittedModel
 from polyergalio.visuals.cluster_visuals import plot_clusters
 from numpy.typing import NDArray
 
@@ -18,7 +18,7 @@ DISTANCE_DICT = {
 }
 
 
-class PLSOM(BasalModel):
+class PLSOM(FittedModel):
     """
     Parameterless Self Organizing Map
     https://arxiv.org/pdf/0705.0199
@@ -38,12 +38,8 @@ class PLSOM(BasalModel):
     sample:pseudo-clustering:cluster membership chain.
     """
 
-    # Growing subclasses extend this tuple with their own structural fields
-    _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
-        "weights",
-        "hit_map",
-        "node_error",
-    )
+    parameter_names = ("weights",)
+    state_names = ("hit_map", "node_error", "THETAMAX", "previous_step_r", "q_error_trace", "epsilon_trace")
 
     def __init__(
         self,
@@ -100,9 +96,7 @@ class PLSOM(BasalModel):
             run ends. Has no effect on a fixed-lattice PLSOM, only on growing
             subclasses.
         """
-        super().__init__(
-            input_dimension=input_dim, output_dimension=width * height, seed=lock_seed
-        )
+        super().__init__(seed=lock_seed, input_dimension=input_dim, output_dimension=width * height)
 
         self.width = width
         self.height = height
@@ -128,6 +122,8 @@ class PLSOM(BasalModel):
 
         # Constants
         # minimum theta (within neighborhood influence)- 1 for alternate equations - might be worth trying both!
+        self.theta_min = theta_min
+        self.theta_max = theta_max
         self.THETAMIN = theta_min if theta_min else 1
         # Maximum value for neighborhood influence - also called Beta in some papers
         self.THETAMAX = theta_max if theta_max else width
@@ -320,7 +316,7 @@ class PLSOM(BasalModel):
                 if val_error < self.best_val_error - self.min_delta:
                     self.best_val_error = val_error
                     self.best_epoch = step
-                    self._best_state = copy.deepcopy(self.get_weights())
+                    self._best_state = copy.deepcopy(self.get_state())
                     epochs_without_improvement = 0
                 else:
                     epochs_without_improvement += 1
@@ -334,7 +330,9 @@ class PLSOM(BasalModel):
                     break
 
         if _x_val is not None and self.restore_best and self._best_state is not None:
-            self.set_weights(self._best_state)
+            self.set_state(copy.deepcopy(self._best_state))
+
+        self.fitted = True
 
         if self.verbose or verbose:
             self.plot_grid(samples=0, highlight_idx=np.argmin(self.hit_map))
@@ -622,15 +620,13 @@ class PLSOM(BasalModel):
 
         return prediction
 
-    def get_config(self) -> dict:
-        config = super().get_config()
-        config.update(
-            input_dim=self.input_dimension,
-            theta_min=self.THETAMIN,
-            theta_max=self.THETAMAX,
-            lock_seed=self.seed,
-        )
-        return config
+    @property
+    def input_dim(self) -> int:
+        return self.input_dimension
+
+    @property
+    def lock_seed(self) -> int:
+        return self.seed
 
 
 if __name__ == "__main__":

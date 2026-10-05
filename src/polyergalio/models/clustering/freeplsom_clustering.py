@@ -4,7 +4,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 from polyergalio.models.clustering.plsom_clustering import DISTANCE_DICT, PLSOM
-from polyergalio.types import BasalModel
+from polyergalio.fitted_model import FittedModel
 from polyergalio.visuals.cluster_visuals import plot_clusters
 from numpy.typing import NDArray
 
@@ -38,7 +38,10 @@ class FreePLSOM(PLSOM):
     (Neural Gas) - https://doi.org/10.1109/72.238311
     """
 
-    _structural_state_keys = PLSOM._structural_state_keys + ("n_neurons",)
+    state_names = (
+        "n_neurons", "growth_threshold", "last_structural_epoch", "structure_trace",
+        "theta_max_auto", "merge_radius_auto",
+    )
 
     def __init__(
         self,
@@ -94,10 +97,8 @@ class FreePLSOM(PLSOM):
             same way THETAMAX is.
         """
         # PLSOM.__init__ bakes in a width/height rectangle this class doesn't
-        # have, so this skips it and calls BasalModel directly instead.
-        BasalModel.__init__(
-            self, input_dimension=input_dim, output_dimension=n_neurons, seed=lock_seed
-        )
+        # have, so this skips it and calls FittedModel directly instead.
+        FittedModel.__init__(self, seed=lock_seed, input_dimension=input_dim, output_dimension=n_neurons)
 
         self.width = None
         self.height = None
@@ -119,6 +120,8 @@ class FreePLSOM(PLSOM):
         self.node_error = np.zeros(shape=self.n_neurons)
         self.verbose = verbose
 
+        self.theta_min = theta_min
+        self.theta_max = theta_max
         self.THETAMIN = theta_min if theta_min else 1
         # theta is a RANK scale here (see calc_neighborhood), not a weight-space
         # distance, so it's naturally in units of "how many of the nearest
@@ -127,7 +130,7 @@ class FreePLSOM(PLSOM):
         # to the starting neuron count (roughly N/2, per Martinetz et al.) when
         # this is left unset; the existing per-epoch 0.98 decay narrows it from
         # there the same way it does for grid-based PLSOM/GPLSOM.
-        self._theta_max_auto = theta_max is None
+        self.theta_max_auto = theta_max is None
         self.THETAMAX = theta_max if theta_max else 1.0
 
         self.distance = distance
@@ -164,7 +167,7 @@ class FreePLSOM(PLSOM):
 
         # scaled to the weights' own spread once it's known (initalize_params),
         # same as THETAMAX, when left unset -- see there for why
-        self._merge_radius_auto = merge_radius is None
+        self.merge_radius_auto = merge_radius is None
         self.merge_radius = merge_radius if merge_radius else 1e-3
 
         self.last_structural_epoch = -settle_epochs
@@ -177,9 +180,9 @@ class FreePLSOM(PLSOM):
         distance, when left unset) to the initial weights' own spread.
         """
         _x = super().initalize_params(x_data)
-        if self._theta_max_auto:
+        if self.theta_max_auto:
             self.THETAMAX = max(1.0, self.n_neurons / 2)
-        if self._merge_radius_auto:
+        if self.merge_radius_auto:
             # this one does need real weight-space distance, not rank: it's
             # meant to catch neurons that have actually collapsed onto each
             # other (their distance driven towards 0), not merely ones with

@@ -37,10 +37,8 @@ TASKS = (
 def fit_text_tokenizer(corpus: list[str]) -> SentencePieceTokenizer:
     """Fit a SentencePiece tokenizer on the corpus and load it."""
     with tempfile.TemporaryDirectory() as workdir:
-        corpus_path = Path(workdir) / "corpus.txt"
-        corpus_path.write_text("\n".join(corpus))
         model_path = fit_tokenizer(
-            corpus_paths=[str(corpus_path)],
+            corpus,
             model_prefix=str(Path(workdir) / "distortions_tokenizer"),
             vocab_size=VOCAB_SIZE,
             hard_vocab_limit=False,

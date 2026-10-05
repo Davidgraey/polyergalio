@@ -12,7 +12,7 @@ from typing import Any, Callable, Optional, Union
 from polyergalio.models.training.checkpoint import DEFAULT_TOLERANCE, CollectedModel, collect_weights, persist
 from polyergalio.models.training.discovery import BROADCAST, DEFAULT_PORT, NodeRecord, Roster, find_nodes, parse_address
 from polyergalio.models.training.transport import receive_frame, receive_message, send_frame, send_message, sign
-from polyergalio.types import BasalModel
+from polyergalio.models.network import Network
 
 log = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ class Orchestrator:
     on the remaining nodes.
     """
 
-    def __init__(self, model: BasalModel,
+    def __init__(self, model: Network,
                  handler: ConnectionHandler,
                  node_addresses: Optional[list[Union[str, tuple[str, int]]]],
                  hyperparameters: dict,
