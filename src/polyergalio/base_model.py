@@ -60,6 +60,31 @@ from polyergalio.utilities import count_elements
 
 
 # ===================================================================================================
+def resolve_data_types(data_type, complex_data_type=None) -> tuple[type, type]:
+    """
+    Validate a float type and pair it with a complex type.
+
+    Parameters
+    ----------
+    data_type : numpy floating type, e.g. np.float32
+    complex_data_type : numpy complex type; defaults to the complex type of matching precision
+
+    Returns
+    -------
+    (data_type, complex_data_type) as numpy scalar types
+    """
+    float_type = np.dtype(data_type).type
+    if not issubclass(float_type, np.floating):
+        raise ValueError(f"data_type must be a numpy floating type, got {data_type!r}")
+    if complex_data_type is None:
+        complex_data_type = np.result_type(float_type, np.complex64)
+    complex_type = np.dtype(complex_data_type).type
+    if not issubclass(complex_type, np.complexfloating):
+        raise ValueError(f"complex_data_type must be a numpy complex type, got {complex_data_type!r}")
+    return float_type, complex_type
+
+
+# ===================================================================================================
 def write_serialized(payload: dict, path: str | os.PathLike) -> None:
     """Pickle a serialize() payload to a single file."""
     with open(path, mode="wb") as handle:
@@ -252,6 +277,7 @@ class BasalEstimator(Serializable, ABC):
     """
     adaptive: bool = True
     preserves_shape: bool = False
+    multi_output: bool = False
     training: bool = True
     parameter_names: tuple[str, ...] = ()
     declarations: tuple[str, ...] = Serializable.declarations + ("parameter_names",)
@@ -293,6 +319,35 @@ class BasalEstimator(Serializable, ABC):
     def eval(self) -> BasalEstimator:
         """Switch to inference, see train()."""
         return self.train(False)
+
+    def recast(self, data_type=np.float64, complex_data_type=None) -> BasalEstimator:
+        """
+        Convert the float and complex arrays named in parameter_names and state_names, and those of every sublayer.
+        Gradients are reset to zeros at the new dtype and forward caches are cleared.
+
+        Parameters
+        ----------
+        data_type : numpy floating type for real arrays
+        complex_data_type : numpy complex type for complex arrays; defaults to the precision matching data_type
+
+        Returns
+        -------
+        self, so calls chain
+        """
+        float_type, complex_type = resolve_data_types(data_type, complex_data_type)
+        for sublayer in self.sublayers():
+            sublayer.recast(float_type, complex_type)
+        for name in self.persisted_names():
+            member = getattr(self, name)
+            if not isinstance(member, np.ndarray):
+                continue
+            if member.dtype.kind == "f":
+                setattr(self, name, member.astype(float_type, copy=False))
+            elif member.dtype.kind == "c":
+                setattr(self, name, member.astype(complex_type, copy=False))
+        self.zero_gradients()
+        self.purge()
+        return self
 
     def declare_shapes(self, inputs=(ANY_SHAPE,), outputs=(ANY_SHAPE,)) -> None:
         """

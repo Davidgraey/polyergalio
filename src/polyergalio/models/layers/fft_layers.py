@@ -6,7 +6,6 @@ from typing import Optional
 import numpy as np
 from numpy.typing import NDArray
 
-from polyergalio.models.constants import GLOBAL_DTYPE
 from polyergalio.models.layers.basic_layers import FullyConnectedLayer, Layer, NormalizeLayer
 
 
@@ -67,8 +66,8 @@ class FrequencyFFT(Layer):
             f"last axis must equal window_size {self.window_size}, got {self.in_shape[-1]}"
         )
 
-        self.input = incoming_x.reshape(-1, self.in_shape[-1])
-        self.output = hartley(self.window_kernel * self.input, axis=-1)
+        input_reshaped = incoming_x.reshape(-1, self.in_shape[-1])
+        self.output = hartley(self.window_kernel * input_reshaped, axis=-1)
         return self.output.reshape(self.in_shape)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
@@ -107,7 +106,6 @@ class FourierLayer(HartleyLayer):
         mask : unused; the transform is linear and the sequence is already zero-padded upstream, so a padded
             position contributes nothing to any output frequency. Kept for pass-through compatibility with the graph.
         """
-        self.input = incoming_x
         self.output = self.transform(incoming_x)
         return self.output
 
@@ -128,7 +126,6 @@ class InverseFourierLayer(HartleyLayer):
 
         mask : unused, same reasoning as FourierLayer.forward.
         """
-        self.input = incoming_x
         shape = incoming_x.shape
         self.scale = shape[-2] * shape[-1] if self.use_2d else shape[-1]
         self.output = self.transform(incoming_x) / self.scale
@@ -149,9 +146,9 @@ class FourierAttention(Layer):
         assert ni == no, f"the feed forward residual needs matching widths, got ni={ni} no={no}"
         self.ni, self.no, self.use_2d = ni, no, use_2d
         self.fftlayer = FourierLayer(use_2d)
-        self.norm_a = NormalizeLayer(ni=ni, shift_scale=False)
-        self.fc = FullyConnectedLayer(ni=ni, no=no, activation_type="relu")
-        self.norm_b = NormalizeLayer(ni=no, shift_scale=True)
+        self.norm_a = NormalizeLayer(input_dimension=ni, shift_scale=False)
+        self.fc = FullyConnectedLayer(input_dimension=ni, output_dimension=no, activation_type="relu")
+        self.norm_b = NormalizeLayer(input_dimension=no, shift_scale=True)
 
         self.declare_shapes(inputs=((ni,),), outputs=((no,),))
         self.zero_gradients()
@@ -183,4 +180,4 @@ class FourierAttention(Layer):
         grad = self.norm_a.backward(grad)
         grad = self.fftlayer.backward(grad) + grad
         self.gradient = grad
-        return grad.real.astype(GLOBAL_DTYPE)
+        return grad.real

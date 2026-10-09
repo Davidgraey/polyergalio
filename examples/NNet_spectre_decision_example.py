@@ -38,7 +38,7 @@ from polyergalio.models.constants import DECISION_TYPES, ClassificationTask
 from polyergalio.models.embedding.embedding import TextEmbedding
 from polyergalio.models.embedding.positional import RopeEmbedding
 from polyergalio.models.layers.basic_layers import DropoutLayer, FullyConnectedLayer, RMSNormLayer
-from polyergalio.models.layers.decision_layers import (
+from polyergalio.models.heads import (
     DecisionHead,
     decision_correct,
     decode_decisions,

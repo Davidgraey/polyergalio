@@ -33,23 +33,9 @@ class DistortionTask(Enum):
     NEXT_SENTENCE = "next_sentence"
     SPAN_BOUNDARY = "span_boundary"
     REPLACED_TOKEN = "replaced_token"
-    SENTENCE_ORDER = "sentence_order"
-    SENTENCE_BOUNDARY = "sentence_boundary"
     TOKEN_DELETION = "token_deletion"
     TEXT_INFILLING = "text_infilling"
-    SENTENCE_PERMUTATION = "sentence_permutation"
-    DOCUMENT_ROTATION = "document_rotation"
-    CONTRASTIVE_VIEW = "contrastive_view"
 
-
-IMPLEMENTED_TASKS = (
-    DistortionTask.CLOZE,
-    DistortionTask.NEXT_SENTENCE,
-    DistortionTask.SPAN_BOUNDARY,
-    DistortionTask.REPLACED_TOKEN,
-    DistortionTask.TOKEN_DELETION,
-    DistortionTask.TEXT_INFILLING,
-)
 
 PAD_VALUES = {
     "attention_mask": 0,
@@ -70,14 +56,14 @@ def split_sentences(text: str) -> list[str]:
 
 
 class TextProcessor(Processor):
-    state_names = ("sentence_pool", "token_counts")
+    state_names = ("sentence_pool",)
 
     def __init__(
         self,
         tokenizer: SentencePieceTokenizer,
         target: str = "text",
         max_length: int = 128,
-        tasks: Iterable[DistortionTask | str] = IMPLEMENTED_TASKS,
+        tasks: Iterable[DistortionTask | str] = tuple(DistortionTask),
         mask_prob: float = 0.15,
         replace_prob: float = 0.15,
         span_geometric_p: float = 0.2,
@@ -86,6 +72,7 @@ class TextProcessor(Processor):
         delete_prob: float = 0.15,
         infill_prob: float = 0.3,
         infill_poisson_lambda: float = 3.0,
+        pool_size: int = 10000,
         random_seed: Optional[int] = None,
     ):
         """
@@ -103,6 +90,7 @@ class TextProcessor(Processor):
         delete_prob : fraction of content tokens TOKEN_DELETION removes
         infill_prob : fraction of content TEXT_INFILLING covers with spans
         infill_poisson_lambda : mean of the Poisson distribution TEXT_INFILLING draws span lengths from
+        pool_size : sentences kept from the fitted corpus for NEXT_SENTENCE negatives
         random_seed : seed for every random draw
         """
         super().__init__(target)
@@ -114,6 +102,8 @@ class TextProcessor(Processor):
                 f"vocab_size {self.vocab_size} leaves no content tokens past "
                 f"TOKEN_OFFSET {self.special.TOKEN_OFFSET}"
             )
+        if pool_size < 1:
+            raise ValueError("pool_size must be at least 1")
         if max_length < 5:
             raise ValueError("max_length must leave room for [CLS] A [SEP] B [SEP]")
 
@@ -127,27 +117,20 @@ class TextProcessor(Processor):
         self.delete_prob = delete_prob
         self.infill_prob = infill_prob
         self.infill_poisson_lambda = infill_poisson_lambda
+        self.pool_size = pool_size
         self.random_seed = random_seed
         self.rng = np.random.default_rng(random_seed)
 
-        self.special_ids = np.array(
-            [value for name, value in asdict(self.special).items() if name != "TOKEN_OFFSET"]
-        )
+        self.special_ids = np.array(sorted(self.special.ids))
         self.sentence_pool: list[str] = []
-        self.token_counts = np.zeros(self.vocab_size)
 
         self.distortions = {
             DistortionTask.CLOZE: self.cloze,
             DistortionTask.NEXT_SENTENCE: self.next_sentence,
             DistortionTask.SPAN_BOUNDARY: self.span_boundary,
             DistortionTask.REPLACED_TOKEN: self.replaced_token,
-            DistortionTask.SENTENCE_ORDER: self.sentence_order,
-            DistortionTask.SENTENCE_BOUNDARY: self.sentence_boundary,
             DistortionTask.TOKEN_DELETION: self.token_deletion,
             DistortionTask.TEXT_INFILLING: self.text_infilling,
-            DistortionTask.SENTENCE_PERMUTATION: self.sentence_permutation,
-            DistortionTask.DOCUMENT_ROTATION: self.document_rotation,
-            DistortionTask.CONTRASTIVE_VIEW: self.contrastive_view,
         }
 
     # ------------- persistence
@@ -173,17 +156,27 @@ class TextProcessor(Processor):
         processor.set_state(state)
         return processor
 
-    # ------------- Processor interface
+    # ------------- Processor interface -------------
     def fit(self, values: Iterable[str]) -> bool:
         """
-        Collect the sentence pool NEXT_SENTENCE draws negatives from and the unigram counts REPLACED_TOKEN samples
-        replacements from. The tokenizer itself is fitted separately, see fit_tokenizer.
+        Draw a uniform random sample of pool_size sentences from the corpus, for NEXT_SENTENCE negatives.
+        The corpus is read once and never held, so any iterable works. Refitting replaces the pool.
+        The tokenizer itself is fitted separately, see fit_tokenizer.
         """
+        pool: list[str] = []
+        seen = 0
         for text in values:
             if not isinstance(text, str):
                 continue
-            self.sentence_pool.extend(split_sentences(text))
-            np.add.at(self.token_counts, self.tokenizer.encode(text), 1)
+            for sentence in split_sentences(text):
+                if len(pool) < self.pool_size:
+                    pool.append(sentence)
+                else:
+                    slot = self.rng.integers(seen + 1)
+                    if slot < self.pool_size:
+                        pool[slot] = sentence
+                seen += 1
+        self.sentence_pool = pool
         self.fitted = True
         return True
 
@@ -249,15 +242,6 @@ class TextProcessor(Processor):
     def random_content_tokens(self, size: int) -> np.ndarray:
         return self.rng.integers(self.special.TOKEN_OFFSET, self.vocab_size, size=size)
 
-    def unigram_content_tokens(self, size: int) -> np.ndarray:
-        """draws from the fitted unigram counts, uniform before fit()"""
-        counts = self.token_counts[self.special.TOKEN_OFFSET:]
-        if counts.sum() == 0:
-            return self.random_content_tokens(size)
-        return self.rng.choice(
-            np.arange(self.special.TOKEN_OFFSET, self.vocab_size), size=size, p=counts / counts.sum()
-        )
-
     def adjacent_segments(self, text: str) -> tuple[list[int], list[int]]:
         """two consecutive sentences, or one sentence split at a random token"""
         sentences = split_sentences(text)
@@ -313,16 +297,15 @@ class TextProcessor(Processor):
 
     def replaced_token(self, text: str) -> dict:
         """
-        ELECTRA replaced-token detection. Replacements come from the fitted
-        unigram distribution rather than a trained generator, which makes
-        them less plausible and the task easier than ELECTRA's. Every content
-        position is scored; label 1 where the token changed, so a draw that
-        happens to equal the original is labelled 0.
+        ELECTRA-style replaced-token detection. Replacements are drawn uniformly from the content vocabulary rather
+        than from a trained generator, which makes them less plausible and the task easier than ELECTRA's.
+        Every content position is scored -- label 1 where the token changed, so a draw that happens to equal the
+        original is labeled 0.
         """
         original = self.single_sequence(text)
         sample = self.blank_sample(original.copy())
         chosen = self.choose_positions(original, self.replace_prob)
-        sample["input_ids"][chosen] = self.unigram_content_tokens(chosen.size)
+        sample["input_ids"][chosen] = self.random_content_tokens(chosen.size)
 
         sample["target_mask"][self.content_positions(original)] = True
         sample["labels"] = (sample["input_ids"] != original).astype(int)
@@ -499,46 +482,6 @@ class TextProcessor(Processor):
         sample["original_ids"] = original
         return sample
 
-    # ------------- stubbed distortions
-    def sentence_order(self, text: str) -> dict:
-        """
-        ALBERT sentence-order prediction: two adjacent segments, swapped half
-        the time; label whether they are in their original order. Negatives
-        share a topic, so unlike NEXT_SENTENCE it cannot be solved by topic
-        alone. Scored at [CLS].
-        """
-        raise NotImplementedError("sentence_order is stubbed")
-
-    def sentence_boundary(self, text: str) -> dict:
-        """
-        Sentence boundary detection: concatenate sentences with their end
-        punctuation stripped; label each token 1 where a new sentence begins.
-        """
-        raise NotImplementedError("sentence_boundary is stubbed")
-
-    def sentence_permutation(self, text: str) -> dict:
-        """
-        BART sentence permutation: shuffle sentence order; predict each
-        sentence's original index.
-        """
-        raise NotImplementedError("sentence_permutation is stubbed")
-
-    def document_rotation(self, text: str) -> dict:
-        """
-        BART document rotation: rotate the sequence to start at a random
-        token; predict the position of the true start.
-        """
-        raise NotImplementedError("document_rotation is stubbed")
-
-    def contrastive_view(self, text: str) -> dict:
-        """
-        Two independently distorted views of the same text as a positive
-        pair, with the rest of the batch as negatives (SimCSE / InfoNCE).
-        The objective that trains sentence embeddings directly; returns a
-        pair of samples rather than one.
-        """
-        raise NotImplementedError("contrastive_view is stubbed")
-
     # ------------- dispatch and batching
     def distort(self, text: str, task: Optional[DistortionTask | str] = None) -> dict:
         """one distorted sample; task drawn from self.tasks if not given"""
@@ -590,6 +533,6 @@ if __name__ == "__main__":
 
     processor = TextProcessor(tokenizer, max_length=32, random_seed=0)
     processor.fit(corpus)
-    for task in IMPLEMENTED_TASKS:
+    for task in DistortionTask:
         batch = processor.distort_batch(corpus[:4], task)
         print(task.value, {name: value.shape for name, value in batch.items() if name != "task"})

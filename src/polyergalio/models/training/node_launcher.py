@@ -15,7 +15,7 @@ from polyergalio.models.training.orchestration import Task
 from polyergalio.models.training.transport import receive_frame, receive_message, send_frame, send_message, sign
 from polyergalio.models.constants import ClassificationTask
 from polyergalio.models.model_loss import (
-    CosineLoss, CrossEntropyLoss, DifferenceLoss, Loss, MAELoss, MSELoss, RMSELoss, SSELoss,
+    CosineLoss, CrossEntropyLoss, DifferenceLoss, Loss, MAELoss, MSELoss, RMSELoss, SparseCrossEntropyLoss, SSELoss,
 )
 from polyergalio.models.network import Network
 from polyergalio.models.optimizers import Adam, Optimizer, SGD
@@ -25,7 +25,9 @@ log = logging.getLogger(__name__)
 OPTIMIZERS = {"SGD": SGD, "Adam": Adam}
 LOSSES = {
     loss.__name__: loss
-    for loss in (CosineLoss, CrossEntropyLoss, DifferenceLoss, MAELoss, MSELoss, RMSELoss, SSELoss)
+    for loss in (
+        CosineLoss, CrossEntropyLoss, DifferenceLoss, MAELoss, MSELoss, RMSELoss, SparseCrossEntropyLoss, SSELoss
+    )
 }
 
 

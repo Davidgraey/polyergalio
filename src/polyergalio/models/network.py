@@ -26,18 +26,26 @@ from __future__ import annotations
 
 import inspect
 import time
+from itertools import islice
 from typing import Iterable, Optional, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
 
-from polyergalio.base_model import BasalEstimator
+from polyergalio.base_model import BasalEstimator, resolve_data_types
+from polyergalio.composite_model import Composite, CompositeNode
 from polyergalio.models.constants import ANY_SHAPE
 from polyergalio.utilities import shape_conflict
-from polyergalio.composite_model import Composite, CompositeNode
 
 INPUT_NAME = "input"
 GRADIENT_PREFIX = "gradient_"
+
+
+def describe_shape(value) -> tuple:
+    """Shape of an array, or the shapes of the arrays in a tuple."""
+    if isinstance(value, (tuple, list)):
+        return tuple(np.shape(member) for member in value)
+    return np.shape(value)
 
 
 def forward_options(layer: BasalEstimator) -> tuple[frozenset[str], bool]:
@@ -59,12 +67,12 @@ class Node(CompositeNode):
     Shapes, logic, and processes are held in the estimator that the Node wraps.
 
         Network
-            Node(Layer) -- Node(Layer) --> Node(Layer)
+            Node(Layer) -[edge]-> Node(Layer) -[edge]-> Node(Layer)
 
     A layer node's `in_shape` is the layer's declared input shapes, one per source. Its
     `out_shape` is what it produces for downstream edges, resolved from the sources it was
     wired to. That is what the next node's check is made against, so an array width flows
-    down the graph as it is wired and checked on connect.
+    down the graph as it is wired and checked on connect().
     """
 
     def __init__(
@@ -92,17 +100,61 @@ class Node(CompositeNode):
         else:
             self.in_shape = layer.shapes["input"]
             self.forward_kwargs, self.accepts_any_kwarg = forward_options(layer)
-            self.resolve_shapes()
 
-        for source in sources:
-            source.consumers.append(self)
+        try:
+            for position, source in enumerate(sources):
+                source.add_consumer(self, position)
+            if layer is not None:
+                self.resolve_shapes()
+        except Exception:
+            for source in sources:
+                source.remove_consumer(self)
+            raise
+
+    def add_consumer(self, consumer: Node, position: int) -> None:
+        """Record that consumer reads this node as its argument at position."""
+        self.consumers.append(consumer)
+
+    def remove_consumer(self, consumer: Node) -> None:
+        """Forget every edge from this node to consumer."""
+        self.consumers = [member for member in self.consumers if member is not consumer]
+
+    def shape_for(self, consumer: Node, position: int) -> tuple:
+        """Trailing shape of what the edge to consumer at position carries."""
+        return self.out_shape
+
+    def candidate_shape(self, taken: int = 0, replacing: Optional[Node] = None) -> tuple:
+        """Trailing shape a new edge would carry; taken counts earlier new edges from this node in the same connection."""
+        return self.out_shape
+
+    def read(self, values: dict, consumer: Node, position: int):
+        """The value the edge to consumer at position carries, from the forward values."""
+        return values[self]
+
+    def receive(self, gradients: dict, consumer: Node, position: int, part: NDArray) -> None:
+        """Add the gradient consumer sent back along its edge at position."""
+        if self in gradients:
+            if gradients[self].shape != part.shape:
+                raise ValueError(
+                    f"{consumer.name!r} sent a {part.shape} gradient to "
+                    f"{self.name!r}, but another consumer already "
+                    f"sent {gradients[self].shape} -- every consumer "
+                    "of a shared source has to agree on its shape"
+                )
+            gradients[self] = gradients[self] + part
+        else:
+            gradients[self] = part
+
+    def take(self, gradients: dict, values: dict):
+        """The gradient with respect to this node's output, removed from gradients; values are the forward activations by name."""
+        return gradients.pop(self)
 
     def resolve_shapes(self) -> None:
         """
         Work out the shape this node produces from what its sources produce
         now; a node with no sources yields its layer's declared output.
         """
-        incoming = tuple(source.out_shape for source in self.sources)
+        incoming = tuple(source.shape_for(self, position) for position, source in enumerate(self.sources))
         resolved = self.layer.infer_output_shapes(incoming) if incoming else self.layer.shapes["output"]
         if len(resolved) != 1:
             raise ValueError(
@@ -142,6 +194,231 @@ class Node(CompositeNode):
 
     def __str__(self):
         return f"{self.__repr__()} producing {self.out_shape}"
+
+
+class RoutingNode(Node):
+    """
+    A node whose layer returns several outputs (the layer sets multi_output), and which decides which edges read which.
+
+    It owns the routing, output index -> the edges reading that output, each edge a (consumer node, argument position).
+    A new connection takes the lowest output with no edges, so consumers receive output 0, 1, 2 in the order they connect.
+    assign() routes an edge to a chosen output, and several edges may share one.
+
+        Network
+            Node(Layer) -[edge]-> RoutingNode(Layer)--output 0  -[edge]-> Node(Layer)
+                                                    --output 1  -[edge]-> Node(Layer)
+
+    A layer that declares n output shapes has n outputs; one that declares a single shape has any number, all of that
+    shape, checked against what forward returns. Outputs with no edge are dropped, with zero gradient.
+    """
+
+    def __init__(self, name: str, layer: BasalEstimator, sources: tuple = ()):
+        """
+        Parameters
+        ----------
+        name : label, and the key the network stores this node's gradients under
+        layer : the estimator to run; its multi_output is True
+        sources : nodes feeding this one, in the order the layer's forward takes them
+        """
+        self.routing: dict[int, list[tuple[Node, int]]] = {}
+        super().__init__(name, layer, sources)
+
+    @property
+    def num_outputs(self) -> Optional[int]:
+        """Number of outputs the layer declares, None when it is open-ended."""
+        declared = len(self.layer.shapes["output"])
+        return declared if declared > 1 else None
+
+    def resolve_shapes(self) -> None:
+        incoming = tuple(source.shape_for(self, position) for position, source in enumerate(self.sources))
+        resolved = self.layer.infer_output_shapes(incoming) if incoming else self.layer.shapes["output"]
+        if len(resolved) != 1 and len(resolved) != self.num_outputs:
+            raise ValueError(
+                f"{self.layer.__class__.__name__}.infer_output_shapes returned {len(resolved)} shapes, "
+                f"but the layer declares {self.num_outputs or 1}"
+            )
+        self.out_shapes = tuple(resolved)
+        self.out_shape = resolved[0]
+
+    def output_shape(self, output: int) -> tuple:
+        """Trailing shape of one output."""
+        return self.out_shapes[output] if len(self.out_shapes) > 1 else self.out_shapes[0]
+
+    def copy_routing(self) -> dict[int, list[tuple[Node, int]]]:
+        """A copy of the routing; changes replace the dict, so a rolled-back snapshot gets the old one."""
+        return {output: list(edges) for output, edges in self.routing.items()}
+
+    def free_outputs(self, replacing: Optional[Node] = None):
+        """
+        Iterate the outputs with no edges, lowest first. Edges of replacing, a consumer being rewired, do not count.
+        """
+        output = 0
+        while self.num_outputs is None or output < self.num_outputs:
+            if all(consumer is replacing for consumer, _ in self.routing.get(output, ())):
+                yield output
+            output += 1
+
+    def unrouted_outputs(self) -> list[int]:
+        """Outputs with no edge, for a layer that declares its count."""
+        return [output for output in range(self.num_outputs or 0) if output not in self.routing]
+
+    def output_for(self, consumer: Node, position: int) -> int:
+        """The output the edge-to-consumer at [position] reads."""
+        for output, edges in self.routing.items():
+            if any(member is consumer and place == position for member, place in edges):
+                return output
+        raise ValueError(f"{consumer.name!r} reads {self.name!r} at position {position}, but no output is routed to it")
+
+    def shape_for(self, consumer: Node, position: int) -> tuple:
+        return self.output_shape(self.output_for(consumer, position))
+
+    def candidate_shape(self, taken: int = 0, replacing: Optional[Node] = None) -> tuple:
+        output = next(islice(self.free_outputs(replacing), taken, taken + 1), None)
+        if output is None:
+            raise ValueError(self.full_message())
+        return self.output_shape(output)
+
+    def full_message(self) -> str:
+        return f"every output of {self.name!r} already feeds an edge; assign() routes another edge onto one"
+
+    def add_consumer(self, consumer: Node, position: int) -> None:
+        """
+        adding the mapping or routing for this node's odwnstreams. updates `self.routing` object
+        ---inplace---
+
+        Parameters
+        ----------
+        consumer: the downstream node to build an edge FROM self TO consumer
+        position: index of the consumer node
+        """
+        if not any(member is consumer and place == position for edges in self.routing.values() for member, place in edges):
+            output = next(self.free_outputs(), None)
+            if output is None:
+                raise ValueError(self.full_message())
+            routing = self.copy_routing()
+            routing[output] = [(consumer, position)]
+            self.routing = routing
+        super().add_consumer(consumer, position)
+
+    def remove_consumer(self, consumer: Node) -> None:
+        """
+        Remove the downstream node from THIS node's connected outputs. updates `self.routing` object
+        ---inplace---
+
+        Parameters
+        ----------
+        consumer: the downstream (consumer) node
+        """
+        routing = {}
+        for output, edges in self.routing.items():
+            kept = [(member, place) for member, place in edges if member is not consumer]
+            if kept:
+                routing[output] = kept
+        self.routing = routing
+        super().remove_consumer(consumer)
+
+    def sync(self, live) -> None:
+        """
+        Drop edges whose consumer is not in live or no longer reads this node at that position. Edges that remain keep
+        their output, so rewiring one consumer does not move the others.
+        ---inplace---
+
+        Parameters
+        ----------
+        live : the nodes still in the graph
+        """
+        routing = {}
+        for output, edges in self.routing.items():
+            kept = [
+                (member, place) for member, place in edges
+                if member in live and place < len(member.sources) and member.sources[place] is self
+            ]
+            if kept:
+                routing[output] = kept
+        self.routing = routing
+
+    def assign(self, output_index: int, consumer: Node, position: Optional[int] = None) -> None:
+        """
+        Route an edge to an output, moving it from wherever it was. Changes the routing only.
+
+        Parameters
+        ----------
+        output_index : the output the consumer should read
+        consumer : a node that reads this one
+        position : the consumer's argument position; None when it reads this node once
+
+        Raises
+        ------
+        ValueError, with nothing changed, if the output does not exist, the consumer does not read this node at that
+        position, or the output's shape cannot feed that argument
+        """
+        positions = [place for place, source in enumerate(consumer.sources) if source is self]
+        if position is None:
+            if len(positions) != 1:
+                raise ValueError(
+                    f"{consumer.name!r} reads {self.name!r} at {len(positions)} positions; say which with position"
+                )
+            position = positions[0]
+        elif position not in positions:
+            raise ValueError(f"{consumer.name!r} does not read {self.name!r} at position {position}")
+
+        count = self.num_outputs
+        if output_index < 0 or (count is not None and output_index >= count):
+            raise ValueError(f"{self.name!r} has no output {output_index}; it has {count if count is not None else 'any number of'}")
+
+        expected = consumer.in_shape
+        wanted = expected[position] if position < len(expected) else ANY_SHAPE
+        conflict = shape_conflict(self.output_shape(output_index), wanted)
+        if conflict:
+            raise ValueError(f"output {output_index} of {self.name!r} cannot feed {consumer.name!r} at position {position}: {conflict}")
+
+        routing = {}
+        for output, edges in self.routing.items():
+            kept = [(member, place) for member, place in edges if not (member is consumer and place == position)]
+            if kept:
+                routing[output] = kept
+        routing.setdefault(output_index, []).append((consumer, position))
+        self.routing = routing
+
+    def read(self, values: dict, consumer: Node, position: int):
+        output = self.output_for(consumer, position)
+        produced = values[self]
+        if not isinstance(produced, (tuple, list)):
+            raise ValueError(f"{self.name!r} ({self.layer.__class__.__name__}) must return a tuple of outputs")
+        if output >= len(produced):
+            raise ValueError(
+                f"{self.name!r} ({self.layer.__class__.__name__}) returned {len(produced)} outputs, "
+                f"but output {output} feeds {consumer.name!r}"
+            )
+        return produced[output]
+
+    def receive(self, gradients: dict, consumer: Node, position: int, part: NDArray) -> None:
+        output = self.output_for(consumer, position)
+        parts = gradients.setdefault(self, {})
+        if output in parts:
+            if parts[output].shape != part.shape:
+                raise ValueError(
+                    f"{consumer.name!r} sent a {part.shape} gradient to output {output} of "
+                    f"{self.name!r}, but another consumer already sent {parts[output].shape} -- "
+                    "every consumer of a shared output has to agree on its shape"
+                )
+            parts[output] = parts[output] + part
+        else:
+            parts[output] = part
+
+    def take(self, gradients: dict, values: dict) -> tuple:
+        parts = gradients.pop(self)
+        return tuple(
+            parts[output] if output in parts else np.zeros_like(produced)
+            for output, produced in enumerate(values[self.name])
+        )
+
+    def routing_text(self) -> str:
+        """The routing as one line: output -> consumers."""
+        return "; ".join(
+            f"{output} -> {', '.join(consumer.name for consumer, _ in edges)}"
+            for output, edges in sorted(self.routing.items())
+        )
 
 
 class Network(Composite):
@@ -198,6 +475,8 @@ class Network(Composite):
         layers: Optional[Iterable[BasalEstimator]] = None,
         name: Optional[str] = None,
         input_shape: tuple = ANY_SHAPE,
+        data_type=np.float64,
+        complex_data_type=None,
     ):
         """
         Parameters
@@ -209,8 +488,11 @@ class Network(Composite):
             None for any axis that varies. Given, the first edge is checked
             like every other one; left out, the first layer is taken on trust
             until data arrives.
+        data_type : numpy floating type the network's real arrays and inputs use; see recast()
+        complex_data_type : numpy complex type for complex arrays; defaults to the precision matching data_type
         """
         super().__init__(name)
+        self.data_type, self.complex_data_type = resolve_data_types(data_type, complex_data_type)
         self._output = None
         self.training = True
         self.activations = {}
@@ -363,7 +645,7 @@ class Network(Composite):
 
         if strict:
             self.check_graph(layer, len(sources))
-            self.check_shapes(layer, sources)
+            self.check_shapes(layer, sources, replacing=replacing)
 
     def check_rewire(self, node: Node, sources: tuple) -> None:
         downstream = self.descendants(node)
@@ -374,16 +656,19 @@ class Network(Composite):
                 )
 
     def after_rewire(self, node: Node, strict: bool) -> None:
+        live = set(self._nodes)
         for member in self._nodes:
+            if isinstance(member, RoutingNode):
+                member.sync(live)
             member.consumers = []
         for member in self._nodes:
-            for source in member.sources:
-                source.consumers.append(member)
+            for position, source in enumerate(member.sources):
+                source.add_consumer(member, position)
         self.sort_nodes()
         for member in [node, *self.descendants(node)]:
             member.resolve_shapes()
             if strict and member is not node:
-                self.check_shapes(member.layer, member.sources)
+                self.check_shapes(member.layer, member.sources, consumer=member)
 
     def descendants(self, node: Node) -> list[Node]:
         """every node that depends on this one, in execution order"""
@@ -420,7 +705,8 @@ class Network(Composite):
         self._nodes[:] = ordered
 
     def make_node(self, name: str, layer: BasalEstimator, sources: tuple) -> Node:
-        return Node(name, layer, sources)
+        node_class = RoutingNode if layer.multi_output else Node
+        return node_class(name, layer, sources)
 
     def after_connect(self, node: Node) -> None:
         node.train(self.training)
@@ -440,7 +726,7 @@ class Network(Composite):
         name = layer.__class__.__name__
         shapes = layer.shapes
         emitted = len(shapes["output"])
-        if emitted != 1:
+        if emitted != 1 and not layer.multi_output:
             raise ValueError(
                 f"{name} declares {emitted} outputs. A node carries one value"
             )
@@ -459,7 +745,13 @@ class Network(Composite):
                 "one shape per input!"
             )
 
-    def check_shapes(self, layer: BasalEstimator, sources: tuple[Node, ...]) -> None:
+    def check_shapes(
+        self,
+        layer: BasalEstimator,
+        sources: tuple[Node, ...],
+        consumer: Optional[Node] = None,
+        replacing: Optional[Node] = None,
+    ) -> None:
         """
         Compare what each source produces against what the layer says it takes,
         pairing them by position.
@@ -472,12 +764,28 @@ class Network(Composite):
         shape-preserving layer declares no width of its own, so reading its
         declaration would report None and silently pass every edge below it --
         the resolved shape is the one that carries the width down the graph.
+
+        A source with several outputs is compared on the output the edge reads:
+        for a node already in the graph (consumer), the one it is routed to; for
+        a new connection, the output it would take, skipping the edges of
+        replacing, the node being rewired.
+
+        Parameters
+        ----------
+        consumer : the node whose existing edges are being checked, None for a new connection
+        replacing : the node whose sources are being replaced
         """
         expected = layer.shapes["input"]
+        taken = {}
 
         for position, source in enumerate(sources):
             wanted = expected[position] if position < len(expected) else ANY_SHAPE
-            conflict = shape_conflict(source.shapes["output"], wanted)
+            if consumer is not None:
+                produced = source.shape_for(consumer, position)
+            else:
+                produced = source.candidate_shape(taken.get(source, 0), replacing)
+                taken[source] = taken.get(source, 0) + 1
+            conflict = shape_conflict(produced, wanted)
 
             if conflict:
                 raise ValueError(
@@ -492,7 +800,7 @@ class Network(Composite):
             node = self.connect(layer, node)
         return node
 
-    # ------------- the output
+    # ---------------- OUTPUTS ---------------
     @property
     def output(self) -> Node:
         if self._output is None:
@@ -503,11 +811,13 @@ class Network(Composite):
     def output(self, node: Node) -> None:
         if not isinstance(node, Node):
             raise TypeError("the output must be a Node() returned by connect()")
+        if isinstance(node, RoutingNode):
+            raise ValueError(f"{node.name!r} is a RoutingNode with several outputs; the network's output is a single value")
         if not any(known is node for known in self._nodes):
             raise ValueError(f"node {node.name!r} belongs to a different network")
         self._output = node
 
-    # ------------- the passes
+    # ---------------- Passes - forward/ backward -----------------------------
     def forward(self, x_data: NDArray, **kwargs) -> NDArray:
         """
         forward pass -- taking the insertion order or navigating the node-to-node process
@@ -519,6 +829,11 @@ class Network(Composite):
             Mode is not a kwarg: layers read their own `training`, set by train() / eval().
         """
         output = self.output
+        if isinstance(x_data, np.ndarray):
+            if x_data.dtype.kind == "f":
+                x_data = x_data.astype(self.data_type, copy=False)
+            elif x_data.dtype.kind == "c":
+                x_data = x_data.astype(self.complex_data_type, copy=False)
         values = {self._input: x_data}
 
         for node in self._nodes:
@@ -526,7 +841,7 @@ class Network(Composite):
                 continue
             if any(source not in values for source in node.sources):
                 continue
-            arguments = [values[source] for source in node.sources]
+            arguments = [source.read(values, node, position) for position, source in enumerate(node.sources)]
             passthrough = (
                 kwargs
                 if node.accepts_any_kwarg
@@ -561,14 +876,14 @@ class Network(Composite):
             if node.is_source or node not in gradients:
                 continue
 
-            incoming = gradients.pop(node)
+            incoming = node.take(gradients, self.activations)
             start = time.perf_counter()
             try:
                 returned = node.layer.backward(incoming)
             except Exception as error:
                 raise RuntimeError(
                     f"{node.name} ({node.layer.__class__.__name__}).backward failed "
-                    f"on gradient shape {np.shape(incoming)}: {error}"
+                    f"on gradient shape {describe_shape(incoming)}: {error}"
                 ) from error
             self.record_timing(node.name, "backward", time.perf_counter() - start)
             parts = returned if len(node.sources) > 1 else (returned,)
@@ -579,18 +894,8 @@ class Network(Composite):
                     f"its backward returned {len(parts)} gradients"
                 )
 
-            for source, part in zip(node.sources, parts):
-                if source in gradients:
-                    if gradients[source].shape != part.shape:
-                        raise ValueError(
-                            f"{node.name!r} sent a {part.shape} gradient to "
-                            f"{source.name!r}, but another consumer already "
-                            f"sent {gradients[source].shape} -- every consumer "
-                            "of a shared source has to agree on its shape"
-                        )
-                    gradients[source] = gradients[source] + part
-                else:
-                    gradients[source] = part
+            for position, (source, part) in enumerate(zip(node.sources, parts)):
+                source.receive(gradients, node, position, part)
 
         return gradients.get(self._input)
 
@@ -667,6 +972,9 @@ class Network(Composite):
                     f"{node.name} has {len(node.sources)} of {self.required_sources(node.layer)} "
                     "inputs connected, so forward skips it"
                 )
+            if isinstance(node, RoutingNode):
+                for unrouted in node.unrouted_outputs():
+                    problems.append(f"{node.name} output {unrouted} feeds nothing, its slice is dropped")
             if node is output:
                 continue
             if not node.consumers:
@@ -679,15 +987,15 @@ class Network(Composite):
     def prune(self) -> list[str]:
         """
         Drop nodes that are no longer ancestors of the current output.
+        ***** Be careful with this process *****
 
-        A branch left behind by retargeting `net.output` elsewhere (e.g.
-        swapping a trained network's head) keeps running forward every
-        pass and cluttering `layers`, `summary()`, and serialization,
-        even though `backward()` already ignores it -- `validate()` flags
-        it but leaves it in place. This removes such nodes outright, by
-        walking `.sources` back from the output and dropping anything
-        that walk never reaches. It only ever removes nodes; edges among
-        the ones that remain are untouched.
+        A branch left behind by retargeting `net.output` elsewhere (e.g. swapping a trained network's head) keeps
+        running forward every pass and cluttering `layers`, `summary()`, and serialization, even though `backward()`
+        will ignore such unconnected nodes
+
+        `validate()` flags disconnected nodes, but prune() removes these nodes outright, by walking `.sources` back
+        from the output and dropping anything that walk never reaches.
+        It only ever removes nodes; edges among intact nodes that remain are not modified.
 
         Returns
         -------
@@ -710,14 +1018,25 @@ class Network(Composite):
                 consumer for consumer in node.consumers if consumer in reachable
             ]
 
+        live = set(kept)
+        for node in kept:
+            if isinstance(node, RoutingNode):
+                node.sync(live)
+
         self._nodes = kept
         for node in dropped:
             self.after_delete(node)
+
         return [node.name for node in dropped]
 
-    # ------------- serialization
+    # -------------------------- serialization --------------------------
     def get_config(self) -> dict:
-        return {"name": self.name, "input_shape": self._input_shape}
+        return {
+            "name": self.name,
+            "input_shape": self._input_shape,
+            "data_type": self.data_type,
+            "complex_data_type": self.complex_data_type,
+        }
 
     def resolve_source(self, name: str) -> Node:
         try:
@@ -729,10 +1048,54 @@ class Network(Composite):
             ) from error
 
     def extra_state(self) -> dict:
-        return {"output": self.output.name}
+        state = {"output": self.output.name}
+        routing = {
+            node.name: [
+                [output, consumer.name, position]
+                for output, edges in sorted(node.routing.items())
+                for consumer, position in edges
+            ]
+            for node in self._nodes
+            if isinstance(node, RoutingNode)
+        }
+        if routing:
+            state["routing"] = routing
+        return state
 
     def restore_extras(self, state: dict) -> None:
         self._output = self.node(state["output"])
+        for name, entries in state.get("routing", {}).items():
+            node = self.node(name)
+            node.routing = {}
+            for output, consumer_name, position in entries:
+                node.assign(output, self.node(consumer_name), position)
+            wanted = sum(1 for consumer in self._nodes for source in consumer.sources if source is node)
+            if sum(len(edges) for edges in node.routing.values()) != wanted:
+                raise ValueError(f"the saved routing of {name!r} does not cover every edge that reads it")
+        self.recast(self.data_type, self.complex_data_type)
+
+    # ------------------------ precision and data types --------------------------
+    def recast(self, data_type=np.float64, complex_data_type=None) -> Network:
+        """
+        Change the network's precision, and every layer's with it.
+
+        Layers connected afterwards keep their own dtype until the next recast. Gradients are reset to zeros and
+        stored activations are cleared; recast before creating an optimizer, whose state is keyed to the gradients.
+
+        Parameters
+        ----------
+        data_type : numpy floating type, e.g. np.float32
+        complex_data_type : numpy complex type; defaults to the precision matching data_type
+
+        Returns
+        -------
+        self, so calls chain
+        """
+        self.data_type, self.complex_data_type = resolve_data_types(data_type, complex_data_type)
+        for layer in self.layers:
+            layer.recast(self.data_type, self.complex_data_type)
+        self.activations = {}
+        return self
 
     # ------------- mode
     def train(self, mode: bool = True) -> Network:
@@ -818,7 +1181,7 @@ class Network(Composite):
         """
         if x_data is not None:
             self.forward(x_data)
-        shapes = {name: np.shape(value) for name, value in self.activations.items()}
+        shapes = {name: describe_shape(value) for name, value in self.activations.items()}
 
         listed = [node for node in self._nodes if not node.is_source]
         width = max((len(node.name) for node in listed), default=4)
@@ -832,6 +1195,10 @@ class Network(Composite):
                 f"{','.join(source.name for source in node.sources):<26} "
                 f"{shapes.get(node.name, node.out_shape)}{marker}"
             )
+
+        for node in listed:
+            if isinstance(node, RoutingNode):
+                lines.append(f"  routing {node.name}: {node.routing_text()}")
 
         for problem in self.validate():
             lines.append(f"  warning: {problem}")

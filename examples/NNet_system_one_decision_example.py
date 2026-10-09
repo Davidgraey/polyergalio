@@ -21,7 +21,7 @@ import numpy as np
 from polyergalio.generators.data_generators import RandomDatasetGenerator
 from polyergalio.models.constants import DECISION_TYPES, EPSILON
 from polyergalio.models.embedding.embedding import TextEmbedding
-from polyergalio.models.layers.decision_layers import (
+from polyergalio.models.heads import (
     DecisionHead,
     calibrated_probabilities,
     decision_confidence,

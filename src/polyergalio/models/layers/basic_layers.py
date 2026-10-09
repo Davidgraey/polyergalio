@@ -13,8 +13,9 @@ from numpy.typing import NDArray
 
 import polyergalio.models.activations as activations
 from polyergalio.base_model import BasalEstimator
-from polyergalio.models.constants import GLOBAL_DTYPE
+from polyergalio.models.constants import EPSILON
 from polyergalio.models.weight_initialization import get_weight_init
+from polyergalio.utilities import init_standardize, standardize, unstandardize, update_running_standardize
 
 RNG = np.random.default_rng()
 
@@ -47,8 +48,8 @@ class FullyConnectedLayer(Layer):
     cache_names = ("input", "output", "z", "in_shape")
 
     def __init__(self,
-                 ni: int,
-                 no: int,
+                 input_dimension: int,
+                 output_dimension: int,
                  activation_type: str,
                  is_output: bool = False,
                  initialization_override: Optional[str] = None,
@@ -57,16 +58,16 @@ class FullyConnectedLayer(Layer):
         """
         Parameters
         ----------
-        ni : number of input units
-        no : number of output units
+        input_dimension : number of input units
+        output_dimension : number of output units
         activation_type : name of an activation, 'linear', 'sigmoid', 'tanh', etc.
         is_output : marks the final layer of a network
         initialization_override : weight initializer name, used instead of the activation's default
         initialization_kwargs : keyword arguments bound to the initializer, e.g. {"std": 0.01}
         """
         super().__init__()
-        self.ni = ni
-        self.no = no
+        self.input_dimension = input_dimension
+        self.output_dimension = output_dimension
         self.activation_type = activation_type
         self.is_output = is_output
         self.initialization_override = initialization_override
@@ -75,9 +76,9 @@ class FullyConnectedLayer(Layer):
         initializer = get_weight_init(
             initialization_override or activation_type, **self.initialization_kwargs
         )
-        self.weights: NDArray = initializer(RNG, ni=ni, no=no)
-        self.bias: NDArray = np.zeros((1, no), dtype=GLOBAL_DTYPE)
-        self.declare_shapes(inputs=((ni,),), outputs=((no,),))
+        self.weights: NDArray = initializer(RNG, ni=input_dimension, no=output_dimension)
+        self.bias: NDArray = np.zeros((1, output_dimension))
+        self.declare_shapes(inputs=((input_dimension,),), outputs=((output_dimension,),))
         self.zero_gradients()
 
     @property
@@ -180,7 +181,6 @@ class DropoutLayer(Layer):
         -------
         the input with elements dropped in training mode, unchanged in inference
         """
-        self.input = incoming_x
         if not self.training:
             self.mask = None
             self.output = incoming_x
@@ -210,23 +210,23 @@ class NormalizeLayer(Layer):
     parameter_names = ("shift_beta", "scale_gamma")
     cache_names = ("in_shape", "input", "x_norm", "std")
 
-    def __init__(self, ni: int, shift_scale: bool = True, eps: float = 1e-6):
+    def __init__(self, input_dimension: int, shift_scale: bool = True, eps: float = 1e-6):
         """
         Parameters
         ----------
-        ni : size of the last axis
+        input_dimension : size of the last axis
         shift_scale : learn a per-feature shift_beta and scale_gamma; without them the layer has no parameters
         eps : added to the variance for numerical stability
         """
         super().__init__()
-        self.ni = ni
+        self.input_dimension = input_dimension
         self.eps = eps
         self.shift_scale = shift_scale
-        self.declare_shapes(inputs=((ni,),), outputs=((ni,),))
+        self.declare_shapes(inputs=((input_dimension,),), outputs=((input_dimension,),))
 
         if shift_scale:
-            self.scale_gamma = np.ones((1, ni), dtype=GLOBAL_DTYPE)
-            self.shift_beta = np.zeros((1, ni), dtype=GLOBAL_DTYPE)
+            self.scale_gamma = np.ones((1, input_dimension))
+            self.shift_beta = np.zeros((1, input_dimension))
         else:
             self.parameter_names = ()
         self.zero_gradients()
@@ -240,11 +240,11 @@ class NormalizeLayer(Layer):
             compatibility with the graph
         """
         self.in_shape = incoming_x.shape
-        self.input = incoming_x.reshape(-1, self.in_shape[-1])
+        input_reshaped = incoming_x.reshape(-1, self.in_shape[-1])
 
-        mean = np.mean(self.input, axis=-1, keepdims=True)
-        self.std = np.sqrt(np.var(self.input, axis=-1, keepdims=True) + self.eps)
-        self.x_norm = (self.input - mean) / self.std
+        mean = np.mean(input_reshaped, axis=-1, keepdims=True)
+        self.std = np.sqrt(np.var(input_reshaped, axis=-1, keepdims=True) + self.eps)
+        self.x_norm = (input_reshaped - mean) / self.std
 
         output = self.x_norm
         if self.shift_scale:
@@ -269,7 +269,7 @@ class NormalizeLayer(Layer):
 
     def __str__(self):
         affine = "affine" if self.shift_scale else "no affine"
-        return f"LayerNorm over {self.ni}, {affine}"
+        return f"LayerNorm over {self.input_dimension}, {affine}"
 
     def __repr__(self):
         return self.__str__()
@@ -283,18 +283,18 @@ class RMSNormLayer(Layer):
     parameter_names = ("scale_gamma",)
     cache_names = ("input", "x_norm", "rms")
 
-    def __init__(self, ni: int, eps: float = 1e-6):
+    def __init__(self, input_dimension: int, padding_epsilon: float = 1e-10):
         """
         Parameters
         ----------
-        ni : size of the last axis
-        eps : added to the mean square for numerical stability
+        input_dimension : size of the last axis
+        padding_epsilon : added to the mean square for numerical stability (avoid zero divide
         """
         super().__init__()
-        self.ni = ni
-        self.eps = eps
-        self.scale_gamma = np.ones((1, ni), dtype=GLOBAL_DTYPE)
-        self.declare_shapes(inputs=((ni,),), outputs=((ni,),))
+        self.input_dimension = input_dimension
+        self.padding_epsilon = padding_epsilon
+        self.scale_gamma = np.ones((1, input_dimension))
+        self.declare_shapes(inputs=((input_dimension,),), outputs=((input_dimension,),))
         self.zero_gradients()
 
     def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
@@ -306,9 +306,9 @@ class RMSNormLayer(Layer):
             compatibility with the graph
         """
         in_shape = incoming_x.shape
-        self.input = incoming_x.reshape(-1, in_shape[-1])
-        self.rms = np.sqrt(np.mean(self.input**2, axis=-1, keepdims=True) + self.eps)
-        self.x_norm = self.input / self.rms
+        input_reshaped = incoming_x.reshape(-1, in_shape[-1])
+        self.rms = np.sqrt(np.mean(input_reshaped ** 2, axis=-1, keepdims=True) + self.padding_epsilon)
+        self.x_norm = input_reshaped / self.rms
         return (self.x_norm * self.scale_gamma).reshape(in_shape)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
@@ -321,7 +321,68 @@ class RMSNormLayer(Layer):
         return gradient.reshape(original_shape)
 
     def __str__(self):
-        return f"RMSNorm over {self.ni}"
+        return f"RMSNorm over {self.input_dimension}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class StandardizeLayer(Layer):
+    """
+    Feature-wise standardization with a moving mean and standard deviation, for layers that expect normalized rows.
+
+    Training mode folds every batch into the statistics before standardizing it; eval mode uses them as they stand.
+    The statistics are not trained, so optimizers skip the layer.
+    """
+    preserves_shape = True
+    state_names = ("x_means", "x_stds", "num_seen_samples")
+
+    def __init__(self, input_dimension: int):
+        """
+        Parameters
+        ----------
+        input_dimension : size of the last axis
+        """
+        super().__init__()
+        self.input_dimension = input_dimension
+        self.x_means = np.zeros(input_dimension)
+        self.x_stds = np.ones(input_dimension)
+        self.num_seen_samples = 0.0
+        self.declare_shapes(inputs=((input_dimension,),), outputs=((input_dimension,),))
+        self.zero_gradients()
+
+    def forward(self, incoming_x: NDArray, training_now: Optional[bool] = None) -> NDArray:
+        """
+        Parameters
+        ----------
+        incoming_x : (..., input_dimension)
+        training_now : whether the batch updates the statistics; None follows train() / eval()
+
+        Returns
+        -------
+        (..., input_dimension) standardized rows
+        """
+        training_now = self.training if training_now is None else training_now
+        incoming_x = np.asarray(incoming_x)
+        flat = incoming_x.reshape(-1, self.input_dimension)
+        if training_now and self.num_seen_samples == 0:
+            init_standardize(self, flat)
+        elif training_now:
+            batch_std = flat.std(axis=0, ddof=min(1, len(flat) - 1))
+            update_running_standardize(self, flat.mean(axis=0), batch_std, len(flat))
+        elif self.num_seen_samples == 0:
+            raise ValueError("nothing has been seen yet; run a training pass first")
+        return standardize(self, incoming_x)
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        return incoming_grad / (self.x_stds + EPSILON)
+
+    def inverse(self, standardized_x: NDArray) -> NDArray:
+        """Return standardized rows to their original units."""
+        return unstandardize(self, standardized_x)
+
+    def __str__(self):
+        return f"Standardize over {self.input_dimension}, seen {self.num_seen_samples:g}"
 
     def __repr__(self):
         return self.__str__()

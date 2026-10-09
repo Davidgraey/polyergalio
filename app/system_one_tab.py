@@ -16,7 +16,7 @@ from NNet_system_one_decision_example import (
 from polyergalio.generators.data_generators import RandomDatasetGenerator
 from polyergalio.models.constants import DECISION_TYPES
 from polyergalio.models.embedding.embedding import TextEmbedding
-from polyergalio.models.layers.decision_layers import DecisionHead
+from polyergalio.models.heads import DecisionHead
 from polyergalio.models.layers.spectre_layers import SpectreAttention
 from polyergalio.models.model_loss import DecisionLoss
 from polyergalio.models.network import Network

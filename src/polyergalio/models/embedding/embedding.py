@@ -4,7 +4,7 @@ Token embeddings: a trainable lookup table from token id to vector.
 from typing import Optional
 
 import numpy as np
-from polyergalio.models.constants import ANY_SHAPE, GLOBAL_DTYPE
+from polyergalio.models.constants import ANY_SHAPE
 from polyergalio.models.layers.basic_layers import RNG, Layer
 from polyergalio.models.weight_initialization import get_weight_init
 from numpy.typing import NDArray
@@ -99,7 +99,7 @@ class TextEmbedding(Layer):
         )
         if self.padding_idx is not None:
             self.gradient_weights[self.padding_idx] = 0.0
-        return np.zeros(self.token_ids.shape, dtype=GLOBAL_DTYPE)
+        return np.zeros(self.token_ids.shape)
 
     def __str__(self):
         padding = "" if self.padding_idx is None else f", padding_idx {self.padding_idx}"

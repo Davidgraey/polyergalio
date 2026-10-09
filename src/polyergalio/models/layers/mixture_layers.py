@@ -240,8 +240,8 @@ class VotingWeight(VotingBase):
         self.activation = "sigmoid"
         self.set_stack(
             FullyConnectedLayer(
-                ni=input_shape,
-                no=num_experts,
+                input_dimension=input_shape,
+                output_dimension=num_experts,
                 activation_type="sigmoid",
                 is_output=True,
             ),
@@ -291,15 +291,15 @@ class VotingWeightBalanced(VotingBase):
             if hidden_size is None
             else (
                 FullyConnectedLayer(
-                    ni=input_shape, no=hidden_size, activation_type="relu"
+                    input_dimension=input_shape, output_dimension=hidden_size, activation_type="relu"
                 ),
             )
         )
         self.set_stack(
             *hidden,
             FullyConnectedLayer(
-                ni=score_width,
-                no=num_experts,
+                input_dimension=score_width,
+                output_dimension=num_experts,
                 activation_type=gate_activation,
                 is_output=True,
             ),
@@ -334,10 +334,10 @@ class VotingGate(VotingBase):
         self.activation = "sigmoid"
         self.hidden_size = hidden_size
         self.set_stack(
-            FullyConnectedLayer(ni=input_shape, no=hidden_size, activation_type="relu"),
+            FullyConnectedLayer(input_dimension=input_shape, output_dimension=hidden_size, activation_type="relu"),
             FullyConnectedLayer(
-                ni=hidden_size,
-                no=num_experts,
+                input_dimension=hidden_size,
+                output_dimension=num_experts,
                 activation_type="sigmoid",
                 is_output=True,
             ),
@@ -390,13 +390,13 @@ class Expert(Layer):
         self.declare_shapes(inputs=((input_dim,),), outputs=((hidden_dim,),))
 
         self.gate_proj = FullyConnectedLayer(
-            ni=input_dim, no=upscale_dim, activation_type=activation_type
+            input_dimension=input_dim, output_dimension=upscale_dim, activation_type=activation_type
         )
         self.up_proj = FullyConnectedLayer(
-            ni=input_dim, no=upscale_dim, activation_type="linear"
+            input_dimension=input_dim, output_dimension=upscale_dim, activation_type="linear"
         )
         self.down_proj = FullyConnectedLayer(
-            ni=upscale_dim, no=hidden_dim, activation_type="linear"
+            input_dimension=upscale_dim, output_dimension=hidden_dim, activation_type="linear"
         )
 
     def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
@@ -460,8 +460,8 @@ class MixtureOfExperts(Layer):
         hidden_dim : width of the outgoing hidden state
         num_shared_experts : experts every token passes through
         num_routed_experts : size of the routed expert pool the gate chooses top_k from
-        top_k : routed experts per token, 2 <= top_k <= num_routed_experts -- the renormalised gate has no gradient at 1
-        activation_type : the experts' gate-projection activation, swish for SwiGLU
+        top_k : routed experts per token, 2 <= top_k <= num_routed_experts
+        activation_type : the experts' gate-projection activation, swish for Swish
         gate_activation : "sigmoid" (default, DeepSeek-V3) scores experts independently; "softmax" makes them compete
         routed_scaling : multiplier on the routed experts' combined output (DeepSeek-V3 uses 2.5)
         num_groups, top_groups : group-limited routing, see VotingBase. None routes over every expert
@@ -581,6 +581,164 @@ class MixtureOfExperts(Layer):
         return (
             f"MixtureOfExperts, {self.num_shared_experts} shared + top "
             f"{self.top_k} of {self.num_routed_experts} routed experts, "
+            f"{self.input_dim} -> {self.upscale_dim} -> {self.hidden_dim}"
+        )
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class SimpleMixtureOfExperts(Layer):
+    """
+    Sample-level mixture of experts:
+
+        output = sum(shared experts(x)) + mean_{i in top_k} routed_i(x)
+
+    Routing is decided once per sample, not per token. Each sample's tokens are mean-pooled over the sequence
+    (padding excluded) and a VotingGate picks the top_k routed experts from that pooled vector; every token of the
+    sample then goes through the same experts. Shared experts are always on.
+
+    The gate is boolean, so chosen experts fire at full strength and the gate trains by straight-through gradients.
+    expert_bias evens out the load across samples.
+
+    Input shape: (batch, ..., input_dim), axis 0 is the sample, the axes before input_dim are pooled for routing
+    Output shape: (batch, ..., hidden_dim)
+    """
+    cache_names = ("in_shape", "selected", "expert_samples", "expert_outputs", "output")
+
+    def __init__(self,
+                 input_dim: int,
+                 upscale_dim: int,
+                 hidden_dim: int,
+                 num_shared_experts: int,
+                 num_routed_experts: int,
+                 top_k: int,
+                 gate_hidden: Optional[int] = None,
+                 activation_type: str = "swish"):
+        """
+        Parameters
+        ----------
+        input_dim : width of the incoming hidden state
+        upscale_dim : width of each expert's gated projection
+        hidden_dim : width of the outgoing hidden state
+        num_shared_experts : experts every sample passes through
+        num_routed_experts : size of the pool the gate chooses top_k from
+        top_k : routed experts per sample, 1 <= top_k <= num_routed_experts
+        gate_hidden : width of the gate's relu hidden layer, input_dim if None
+        activation_type : the experts' gate-projection activation, swish for SwiGLU
+        """
+        super().__init__()
+        assert num_shared_experts >= 0, "num_shared_experts must be >= 0"
+        assert 1 <= top_k <= num_routed_experts, (
+            f"top_k must fall in [1, {num_routed_experts}], got {top_k}"
+        )
+
+        self.input_dim = input_dim
+        self.upscale_dim = upscale_dim
+        self.hidden_dim = hidden_dim
+        self.num_shared_experts = num_shared_experts
+        self.num_routed_experts = num_routed_experts
+        self.top_k = top_k
+        self.gate_hidden = gate_hidden
+        self.activation_type = activation_type
+
+        self.declare_shapes(inputs=((input_dim,),), outputs=((hidden_dim,),))
+
+        shared_names = tuple(f"shared_{n}" for n in range(1, num_shared_experts + 1))
+        routed_names = tuple(f"routed_{n}" for n in range(1, num_routed_experts + 1))
+        for name in shared_names + routed_names:
+            setattr(self, name, Expert(input_dim, upscale_dim, hidden_dim, activation_type))
+        self.pooling = PoolingLayer()
+        self.gate = VotingGate(
+            input_shape=input_dim,
+            hidden_size=gate_hidden or input_dim,
+            num_experts=num_routed_experts,
+            top_k=top_k,
+        )
+        self.parameter_names = shared_names + routed_names + ("gate",)
+        self.zero_gradients()
+
+    @property
+    def shared_experts(self) -> tuple[Expert, ...]:
+        return tuple(getattr(self, f"shared_{n}") for n in range(1, self.num_shared_experts + 1))
+
+    @property
+    def routed_experts(self) -> tuple[Expert, ...]:
+        return tuple(getattr(self, f"routed_{n}") for n in range(1, self.num_routed_experts + 1))
+
+    def forward(self, hidden_state: NDArray, mask: Optional[NDArray] = None) -> NDArray:
+        """
+        Parameters
+        ----------
+        hidden_state : (batch, ..., input_dim)
+        mask : (batch, ...) matching hidden_state's leading axes, 1 for a real token and 0 for padding;
+            a sample with no real token routes to no expert
+
+        Returns
+        -------
+        (batch, ..., hidden_dim)
+        """
+        self.in_shape = hidden_state.shape
+        batch = self.in_shape[0]
+        tokens = hidden_state.reshape(batch, -1, self.input_dim)
+
+        token_mask, sample_mask = None, None
+        if mask is not None:
+            assert mask.shape == self.in_shape[:-1], (
+                f"mask shape {mask.shape} must match hidden_state's leading axes {self.in_shape[:-1]}"
+            )
+            token_mask = mask.reshape(batch, -1)
+            sample_mask = token_mask.any(axis=1)
+        pooled = self.pooling(tokens, mask=token_mask)[:, 0]
+
+        output = np.zeros((batch, tokens.shape[1], self.hidden_dim), dtype=tokens.dtype)
+        for expert in self.shared_experts:
+            output = output + expert(tokens)
+
+        self.selected = self.gate(pooled, mask=sample_mask).astype(bool)
+        if sample_mask is not None:
+            self.selected = self.selected & sample_mask[:, None]
+
+        scale = 1.0 / self.top_k
+        self.expert_samples, self.expert_outputs = [], []
+        for e, expert in enumerate(self.routed_experts):
+            chosen = np.flatnonzero(self.selected[:, e])
+            expert_out = expert(tokens[chosen]) if chosen.size else None
+            if chosen.size:
+                output[chosen] += scale * expert_out
+            self.expert_samples.append(chosen)
+            self.expert_outputs.append(expert_out)
+
+        self.output = output.reshape(self.in_shape[:-1] + (self.hidden_dim,))
+        return self.output
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        batch = self.in_shape[0]
+        grad_tokens = incoming_grad.reshape(batch, -1, self.hidden_dim)
+        grad_input = np.zeros((batch, grad_tokens.shape[1], self.input_dim), dtype=grad_tokens.dtype)
+
+        for expert in self.shared_experts:
+            grad_input = grad_input + expert.backward(grad_tokens)
+
+        scale = 1.0 / self.top_k
+        gate_grad = np.zeros((batch, self.num_routed_experts), dtype=grad_tokens.dtype)
+        for e, expert in enumerate(self.routed_experts):
+            chosen, expert_out = self.expert_samples[e], self.expert_outputs[e]
+            if not chosen.size:
+                expert.zero_gradients()
+                continue
+            upstream = grad_tokens[chosen]
+            grad_input[chosen] += expert.backward(scale * upstream)
+            gate_grad[chosen, e] = scale * np.sum(upstream * expert_out, axis=(1, 2))
+
+        grad_pooled = self.gate.backward(gate_grad)
+        grad_input = grad_input + self.pooling.backward(grad_pooled[:, None, :])
+        return grad_input.reshape(self.in_shape)
+
+    def __str__(self):
+        return (
+            f"SimpleMixtureOfExperts, {self.num_shared_experts} shared + top "
+            f"{self.top_k} of {self.num_routed_experts} routed experts per sample, "
             f"{self.input_dim} -> {self.upscale_dim} -> {self.hidden_dim}"
         )
 

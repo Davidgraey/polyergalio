@@ -2,16 +2,16 @@
 ERROR and LOSS FUNCTIONS all done in Numpy--
 """
 
-import numpy as np
 from abc import ABC, abstractmethod
-from numpy.typing import NDArray
 from typing import Optional
-from polyergalio.models.activations import sigmoid, softmax
-from polyergalio.models.constants import ClassificationTask, Reductions
-from polyergalio.distances import cosine_distance
-from polyergalio.models.constants import DECISION_TYPES, EPSILON
-from polyergalio.models.layers.decision_layers import decision_type_ids, masked_softmax
 
+import numpy as np
+from numpy.typing import NDArray
+
+from polyergalio.models.activations import sigmoid, softmax
+from polyergalio.models.constants import ClassificationTask
+from polyergalio.models.constants import DECISION_TYPES, EPSILON
+from polyergalio.models.heads.decision_utilities import decision_type_ids, masked_softmax
 
 loss_dictionary, derivative_dictionary = {}, {}
 
@@ -270,6 +270,50 @@ class CrossEntropyLoss(Loss):
 
     def __call__(self, predictions: NDArray, targets: NDArray, mask: Optional[NDArray] = None):
         return self.forward(predictions, targets, mask)
+
+
+class SparseCrossEntropyLoss(Loss):
+    """
+    Multinomial cross-entropy on logits with integer class labels (no need for a one-hot)
+
+    Predictions are (..., classes) logits and targets are (...) integers.
+    A mask is (...) or (..., 1) with 1 for real content, and masked positions still need valid labels.
+    """
+
+    def forward(self, prediction, targets, mask: Optional[NDArray] = None):
+        """
+        Parameters
+        ----------
+        prediction : (..., classes) logits
+        targets : (...) integer class labels
+        mask : optional per-position masking to identify targets
+
+        Returns
+        -------
+        mean loss over the unmasked positions
+        """
+        labels = np.asarray(targets, dtype=int)
+        shifted = prediction - np.max(prediction, axis=-1, keepdims=True)
+        exponentials = np.exp(shifted)
+        total = np.sum(exponentials, axis=-1, keepdims=True)
+        self.probabilities = exponentials / total
+        self.labels = labels
+        correct = np.take_along_axis(shifted, labels[..., None], axis=-1)[..., 0]
+        loss = np.log(total[..., 0]) - correct
+        self.reduce_mask = self._position_mask(mask, loss)
+        self.valid_elements = max(self.reduce_mask.sum(), 1.0) if self.reduce_mask is not None else loss.size
+        if self.reduce_mask is not None:
+            return np.sum(loss * self.reduce_mask) / self.valid_elements
+        return np.mean(loss)
+
+    def backward(self):
+        """ dL / d(logits): softmax - 1  at each label, masked and averaged """
+        grad = self.probabilities.copy()
+        flat = grad.reshape(-1, grad.shape[-1])
+        flat[np.arange(flat.shape[0]), self.labels.reshape(-1)] -= 1.0
+        if self.reduce_mask is not None:
+            grad = grad * self.reduce_mask[..., None]
+        return grad / self.valid_elements
 
 
 class MultiHeadLoss(Loss):

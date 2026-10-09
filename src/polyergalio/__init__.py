@@ -4,7 +4,7 @@ supervised learning, and clustering -- built on NumPy and SciPy.
 """
 import logging
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())

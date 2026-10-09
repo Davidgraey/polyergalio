@@ -5,7 +5,6 @@ from typing import Optional
 import numpy as np
 from numpy.typing import NDArray
 
-from polyergalio.models.constants import GLOBAL_DTYPE
 from polyergalio.models.layers.basic_layers import RNG, FullyConnectedLayer, Layer
 
 
@@ -71,10 +70,7 @@ class HaarWaveletTransform:
 
         batch, sequence, hidden = self.input_shape
 
-        dx = np.zeros(
-            (batch, sequence, hidden),
-            dtype=GLOBAL_DTYPE,
-        )
+        dx = np.zeros((batch, sequence, hidden))
 
         for coefficient in range(self.num_coefficients):
             even = self.even_indices[coefficient]
@@ -114,24 +110,24 @@ class WaveletRefinementModule(Layer):
 
     def __init__(
         self,
-        hidden_dim: int,
+        input_dimension: int,
         sequence_length: int,
         on_rate: float = 0.1,
         skip_threshold: float = 0.5,
     ):
         super().__init__()
 
-        self.hidden_dim = hidden_dim
+        self.input_dimension = input_dimension
         self.sequence_length = sequence_length
         self.on_rate = on_rate
         self.skip_threshold = skip_threshold
 
-        self.declare_shapes(inputs=((hidden_dim,), (hidden_dim,)), outputs=((hidden_dim,),))
+        self.declare_shapes(inputs=((input_dimension,), (input_dimension,)), outputs=((input_dimension,),))
 
         self.wavelet = HaarWaveletTransform(sequence_length)
-        self.gate_projection = FullyConnectedLayer(ni=hidden_dim, no=hidden_dim, activation_type="swish")
-        self.gate_output = FullyConnectedLayer(ni=hidden_dim, no=hidden_dim, activation_type="linear")
-        self.control_gate = np.array([[np.log(on_rate / (1.0 - on_rate))]], dtype=GLOBAL_DTYPE)
+        self.gate_projection = FullyConnectedLayer(input_dimension=input_dimension, output_dimension=input_dimension, activation_type="swish")
+        self.gate_output = FullyConnectedLayer(input_dimension=input_dimension, output_dimension=input_dimension, activation_type="linear")
+        self.control_gate = np.array([[np.log(on_rate / (1.0 - on_rate))]])
         self.zero_gradients()
 
     def _pool_gate(self, gate: NDArray) -> NDArray:
@@ -147,7 +143,7 @@ class WaveletRefinementModule(Layer):
         participating sequence position, returning (B, N, D).
         """
         batch = dgate_coeff.shape[0]
-        dgate = np.zeros((batch, self.sequence_length, self.hidden_dim), dtype=GLOBAL_DTYPE)
+        dgate = np.zeros((batch, self.sequence_length, self.input_dimension))
 
         for coefficient in range(self.wavelet.num_coefficients):
             even = self.wavelet.even_indices[coefficient]
@@ -158,13 +154,12 @@ class WaveletRefinementModule(Layer):
 
         return dgate
 
-    def forward(
-        self,
-        v_tilde: NDArray,
-        descriptor: NDArray,
-        training_now: Optional[bool] = None,
-        mask: Optional[NDArray] = None,
-    ) -> NDArray:
+    def forward(self,
+                v_tilde: NDArray,
+                descriptor: NDArray,
+                training_now: Optional[bool] = None,
+                mask: Optional[NDArray] = None,
+                ) -> NDArray:
         """
         Parameters
         ----------
@@ -187,8 +182,8 @@ class WaveletRefinementModule(Layer):
         assert sequence == self.sequence_length, (
             f"sequence mismatch: expected {self.sequence_length}, got {sequence}"
         )
-        assert hidden == self.hidden_dim, (
-            f"hidden mismatch: expected {self.hidden_dim}, got {hidden}"
+        assert hidden == self.input_dimension, (
+            f"hidden mismatch: expected {self.input_dimension}, got {hidden}"
         )
         assert descriptor.ndim in (2, 3), (
             "descriptor must be (batch, hidden) or "
@@ -197,8 +192,8 @@ class WaveletRefinementModule(Layer):
         assert descriptor.shape[0] == batch, (
             f"descriptor batch mismatch: expected {batch}, got {descriptor.shape[0]}"
         )
-        assert descriptor.shape[-1] == self.hidden_dim, (
-            f"descriptor hidden mismatch: expected {self.hidden_dim}, got {descriptor.shape[-1]}"
+        assert descriptor.shape[-1] == self.input_dimension, (
+            f"descriptor hidden mismatch: expected {self.input_dimension}, got {descriptor.shape[-1]}"
         )
         if descriptor.ndim == 3:
             assert descriptor.shape[1] == sequence, (
@@ -212,10 +207,10 @@ class WaveletRefinementModule(Layer):
 
         self.run_prob = 1.0 / (1.0 + np.exp(-self.control_gate))
         if training_now:
-            self.run_mask = (RNG.random((batch, 1, 1)) < self.run_prob[0, 0]).astype(GLOBAL_DTYPE)
+            self.run_mask = RNG.random((batch, 1, 1)) < self.run_prob[0, 0]
         else:
             should_run = self.run_prob[0, 0] > self.skip_threshold
-            self.run_mask = np.full((batch, 1, 1), should_run, dtype=GLOBAL_DTYPE)
+            self.run_mask = np.full((batch, 1, 1), should_run)
 
         if not np.any(self.run_mask):
             self.output = v_tilde
@@ -275,7 +270,7 @@ class WaveletRefinementModule(Layer):
         self.wavelet.purge()
 
     def __str__(self):
-        return f"WaveletRefinementModule ({self.hidden_dim}, Haar, on_rate={self.on_rate})"
+        return f"WaveletRefinementModule ({self.input_dimension}, Haar, on_rate={self.on_rate})"
 
     def __repr__(self):
         return self.__str__()

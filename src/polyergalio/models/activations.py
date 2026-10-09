@@ -1,9 +1,7 @@
 import numpy as np
 from numpy.typing import NDArray
 
-from typing import Optional
-
-EPSILON = 1e-15
+from polyergalio.models.constants import MASKED_LOGIT
 
 activation_dictionary = {}
 activation = lambda f: activation_dictionary.setdefault(f.__name__, f)
@@ -14,19 +12,16 @@ derivative = lambda f: derivative_dictionary.setdefault(f.__name__[:-11], f)
 
 @activation
 def sigmoid(x_array: NDArray) -> NDArray:
-    """Numerically stable version of sigmoid"""
-    result = np.empty_like(x_array)
+    """Numerically stable version of sigmoid via clipping -- the bool masks previously were costly"""
+    limit = np.log(np.finfo(x_array.dtype).max) - 1.0
 
-    # Handle positive x
-    positive_mask = x_array >= 0
-    result[positive_mask] = 1 / (1 + np.exp(-x_array[positive_mask]))
+    out = np.clip(x_array, -limit, limit)
 
-    # Handle negative x
-    negative_mask = x_array < 0
-    exp_x = np.exp(x_array[negative_mask])
-    result[negative_mask] = exp_x / (1 + exp_x)
-
-    return result
+    np.negative(out, out=out)
+    np.exp(out, out=out)
+    out += 1.0
+    np.reciprocal(out, out=out)
+    return out
 
 
 @activation
@@ -46,6 +41,12 @@ def swish(x: NDArray):
 
 
 @activation
+def elu(x: NDArray, alpha: float = 1.0) -> NDArray:
+    """f(x) = x for x > 0, alpha * (exp(x) - 1) otherwise"""
+    return np.where(x > 0, x, alpha * np.expm1(np.minimum(x, 0)))
+
+
+@activation
 def softmax(x_array: NDArray) -> NDArray:
     """
     N-dimensional vector with values that sum to one - probabilistic multiclass
@@ -61,6 +62,27 @@ def softmax(x_array: NDArray) -> NDArray:
     exps = np.exp(x_array - np.max(x_array, axis=-1, keepdims=True))
     return exps / np.sum(exps, axis=-1, keepdims=True)
 
+
+def masked_softmax(
+    logits: NDArray, token_mask: NDArray, temperature: float | NDArray = 1.0
+) -> NDArray:
+    """
+    Softmax over each row's valid options only.
+
+    Parameters
+    ----------
+    logits : (batch, options)
+    token_mask : (batch, options), 1 for a real option
+    temperature : scalar, or (batch,) per-row
+
+    Returns
+    -------
+    (batch, options) probabilities, exactly 0 on padded slots
+    """
+    temperature = np.reshape(temperature, (-1, 1))
+    scaled = np.where(token_mask, logits / temperature, MASKED_LOGIT)
+    exps = np.exp(scaled - scaled.max(axis=-1, keepdims=True)) * token_mask
+    return exps / exps.sum(axis=-1, keepdims=True)
 
 @activation
 def linear(x_array: NDArray) -> NDArray:
@@ -144,6 +166,11 @@ def tanh_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray
 def swish_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray:
     s = sigmoid(x)
     return upstream * s * (1 + x * (1 - s))
+
+
+@derivative
+def elu_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray:
+    return upstream * np.where(x > 0, 1.0, np.exp(np.minimum(x, 0)))
 
 
 @derivative

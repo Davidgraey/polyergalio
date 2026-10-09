@@ -144,7 +144,7 @@ def causal_reference(layer, x, mask=None):
     mask = np.ones(x.shape[:2]) if mask is None else mask
     combined = x
     if memory:
-        bank = np.broadcast_to(layer.memory.get_memory()[None], (batch, memory, layer.hidden_dim))
+        bank = np.broadcast_to(layer.memory.get_memory()[None], (batch, memory, layer.input_dimension))
         combined = np.concatenate([bank, x], axis=1)
     queries = layer.query_projection.project(combined)
     values = layer.value_projection.project(combined)
@@ -220,7 +220,7 @@ def test_decoding_past_the_window_matches_a_forward_over_the_last_window(config)
 
 # -------------    head layers    --------------------------
 def test_head_projection_gradients_match_finite_differences():
-    projection = HeadProjection(num_heads=2, head_dim=3)
+    projection = HeadProjection(num_heads=2, head_dimension=3)
     rng = np.random.default_rng(6)
     x = rng.normal(size=(2, 5, 6))
     upstream = rng.normal(size=x.shape)
@@ -237,7 +237,7 @@ def test_head_projection_gradients_match_finite_differences():
 
 @pytest.mark.parametrize("band_radius", [0, 2])
 def test_head_gate_gradients_match_finite_differences(band_radius):
-    gate = HeadGate(num_heads=2, head_dim=3, num_frequencies=5, gate_hidden=4, band_radius=band_radius)
+    gate = HeadGate(num_heads=2, head_dimension=3, num_frequencies=5, gate_dimension=4, band_radius=band_radius)
     rng = np.random.default_rng(8)
     gate.output_layer.weights = rng.normal(size=gate.output_layer.weights.shape)
     if band_radius:
@@ -265,7 +265,7 @@ def test_head_gate_gradients_match_finite_differences(band_radius):
 
 @pytest.mark.parametrize("activation_type", ["linear", "relu", "tanh", "softmax"])
 def test_dense_head_gradients_match_finite_differences(activation_type):
-    layer = DenseHead(num_heads=3, ni=2, no=4, activation_type=activation_type)
+    layer = DenseHead(num_heads=3, input_dimension=2, output_dimension=4, activation_type=activation_type)
     rng = np.random.default_rng(9)
     layer.bias = rng.normal(size=layer.bias.shape)
     x = rng.normal(size=(2, 5, 6))

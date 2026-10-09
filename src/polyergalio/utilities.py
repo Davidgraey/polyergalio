@@ -212,7 +212,7 @@ def update_running_standardize(model, new_data_mean, new_data_std, new_data_coun
 
     Returns
     -------
-    No returns - we update the self. params with the updated mean of the MEAN and STD DEV
+    No returns - we update the model params with the updated mean, STD DEV and num_seen_samples
     """
     full_count = model.num_seen_samples + new_data_count
     full_mean = (model.num_seen_samples  * model.x_means + new_data_count * new_data_mean) / full_count
@@ -228,6 +228,7 @@ def update_running_standardize(model, new_data_mean, new_data_std, new_data_coun
 
     model.x_means = full_mean
     model.x_stds = full_std
+    model.num_seen_samples = full_count
 
 def standardize(model, data_array: NDArray) -> NDArray:
     """

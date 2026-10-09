@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 from numpy.typing import NDArray
 
-from polyergalio.models.constants import EPSILON, GLOBAL_DTYPE
+from polyergalio.models.constants import EPSILON
 from polyergalio.models.layers.basic_layers import RNG, Layer
 
 OUTPUT_TYPES = ("assignment", "distance", "quantized", "coordinates")
@@ -83,7 +83,7 @@ class PrototypeLayer(Layer):
     def __init__(
         self,
         num_prototypes: int,
-        input_dim: int,
+        input_dimension: int,
         temperature: float = 1.0,
         energy_weight: float = 1.0,
         output_type: str = "assignment",
@@ -95,19 +95,19 @@ class PrototypeLayer(Layer):
         if output_type == "coordinates" and self.positions is None:
             raise ValueError(f"{self.__class__.__name__} has no prototype positions to emit")
 
-        self.input_dim = input_dim
+        self.input_dimension = input_dimension
         self.temperature = temperature
         self.energy_weight = energy_weight
         self.output_type = output_type
         self.learning_rate = learning_rate
 
-        self.weights = RNG.normal(0.0, 0.1, size=(num_prototypes, input_dim)).astype(GLOBAL_DTYPE)
+        self.weights = RNG.normal(0.0, 0.1, size=(num_prototypes, input_dimension))
         self.initialized = False
         self.energy = 0.0
 
         count = None if self.grows else num_prototypes
-        width = {"assignment": count, "distance": count, "quantized": input_dim, "coordinates": 2}[output_type]
-        self.declare_shapes(inputs=((input_dim,),), outputs=((width,),))
+        width = {"assignment": count, "distance": count, "quantized": input_dimension, "coordinates": 2}[output_type]
+        self.declare_shapes(inputs=((input_dimension,),), outputs=((width,),))
         self.zero_gradients()
 
     @abstractmethod
@@ -135,7 +135,7 @@ class PrototypeLayer(Layer):
         """Place prototypes on randomly drawn samples, jittered so duplicates can separate."""
         rows = RNG.choice(len(x_data), size=self.num_prototypes, replace=len(x_data) < self.num_prototypes)
         jitter = 1e-3 * (np.std(x_data, axis=0) + EPSILON)
-        self.weights = x_data[rows] + RNG.normal(size=(self.num_prototypes, self.input_dim)) * jitter
+        self.weights = x_data[rows] + RNG.normal(size=(self.num_prototypes, self.input_dimension)) * jitter
         self.initialized = True
 
     def distances(self, x_data: NDArray) -> NDArray:
@@ -149,7 +149,7 @@ class PrototypeLayer(Layer):
 
     def labels(self, x_data: NDArray) -> NDArray:
         """Hard nearest-prototype index per sample."""
-        flat = np.asarray(x_data, dtype=GLOBAL_DTYPE).reshape(-1, self.input_dim)
+        flat = np.asarray(x_data).reshape(-1, self.input_dimension)
         return np.argmin(self.distances(flat), axis=-1).reshape(np.shape(x_data)[:-1])
 
     def anneal(self, factor: float) -> None:
@@ -168,9 +168,9 @@ class PrototypeLayer(Layer):
         the output selected at construction, leading axes kept
         """
         training_now = self.training if training_now is None else training_now
-        x_data = np.asarray(x_data, dtype=GLOBAL_DTYPE)
+        x_data = np.asarray(x_data)
         self.lead_shape = x_data.shape[:-1]
-        flat = x_data.reshape(-1, self.input_dim)
+        flat = x_data.reshape(-1, self.input_dimension)
         if not self.initialized:
             self.initialize(flat)
 
@@ -235,7 +235,7 @@ class PrototypeLayer(Layer):
         self.gradient_weights = grad_weights
 
         grad_input = 2.0 * (grad_distances.sum(axis=1, keepdims=True) * self.input - grad_distances @ self.weights)
-        return grad_input.reshape(*self.lead_shape, self.input_dim)
+        return grad_input.reshape(*self.lead_shape, self.input_dimension)
 
     def set_weights(self, weights: dict) -> None:
         super().set_weights(weights)
@@ -256,20 +256,20 @@ class CentroidLayer(PrototypeLayer):
     def __init__(
         self,
         num_centroids: int,
-        input_dim: int,
+        input_dimension: int,
         temperature: float = 1.0,
         energy_weight: float = 1.0,
         output_type: str = "assignment",
         learning_rate: float = 1.0,
     ):
-        super().__init__(num_centroids, input_dim, temperature, energy_weight, output_type, learning_rate)
+        super().__init__(num_centroids, input_dimension, temperature, energy_weight, output_type, learning_rate)
 
     @property
     def num_centroids(self) -> int:
         return self.num_prototypes
 
     def neighborhood(self, distances: NDArray, training_now: bool) -> tuple[None, NDArray]:
-        return None, np.ones(len(distances), dtype=GLOBAL_DTYPE)
+        return None, np.ones(len(distances))
 
 
 class ParameterlessLayer(PrototypeLayer):
@@ -289,7 +289,7 @@ class ParameterlessLayer(PrototypeLayer):
     def __init__(
         self,
         num_prototypes: int,
-        input_dim: int,
+        input_dimension: int,
         theta_min: float,
         theta_max: Optional[float],
         r_decay: float,
@@ -310,9 +310,9 @@ class ParameterlessLayer(PrototypeLayer):
         self.epoch = 0
         self.frozen = False
         self.structure_trace: list[tuple[int, str, int]] = []
-        super().__init__(num_prototypes, input_dim, temperature, energy_weight, output_type, learning_rate)
-        self.hit_map = np.zeros(num_prototypes, dtype=GLOBAL_DTYPE)
-        self.node_error = np.zeros(num_prototypes, dtype=GLOBAL_DTYPE)
+        super().__init__(num_prototypes, input_dimension, temperature, energy_weight, output_type, learning_rate)
+        self.hit_map = np.zeros(num_prototypes)
+        self.node_error = np.zeros(num_prototypes)
 
     @abstractmethod
     def neighborhood_kernel(self) -> Optional[NDArray]:
@@ -389,7 +389,7 @@ class PLSOMLayer(ParameterlessLayer):
         self,
         width: int,
         height: int,
-        input_dim: int,
+        input_dimension: int,
         theta_min: float = 1.0,
         theta_max: Optional[float] = None,
         r_decay: float = 0.99,
@@ -414,7 +414,7 @@ class PLSOMLayer(ParameterlessLayer):
         self.build_lattice()
         super().__init__(
             width * height,
-            input_dim,
+            input_dimension,
             theta_min,
             theta_max if theta_max else float(max(width, height)),
             r_decay,
@@ -429,10 +429,8 @@ class PLSOMLayer(ParameterlessLayer):
     def build_lattice(self) -> None:
         """Row-major lattice positions (K, 2) and manhattan distances between them (K, K)."""
         rows, cols = np.divmod(np.arange(self.width * self.height), self.width)
-        self.positions = np.stack([rows, cols], axis=-1).astype(GLOBAL_DTYPE)
-        self.lattice = (
-            np.abs(rows[:, None] - rows[None, :]) + np.abs(cols[:, None] - cols[None, :])
-        ).astype(GLOBAL_DTYPE)
+        self.positions = np.stack([rows, cols], axis=-1)
+        self.lattice = np.abs(rows[:, None] - rows[None, :]) + np.abs(cols[:, None] - cols[None, :])
 
     def neighborhood_kernel(self) -> NDArray:
         """Lattice gaussian at the current theta, (K, K)."""
@@ -440,7 +438,7 @@ class PLSOMLayer(ParameterlessLayer):
 
     def weight_grid(self) -> NDArray:
         """Prototypes as (height, width, input_dim)."""
-        return self.weights.reshape(self.height, self.width, self.input_dim)
+        return self.weights.reshape(self.height, self.width, self.input_dimension)
 
 
 class GPLSOMLayer(PLSOMLayer):
@@ -464,7 +462,7 @@ class GPLSOMLayer(PLSOMLayer):
         self,
         width: int,
         height: int,
-        input_dim: int,
+        input_dimension: int,
         theta_min: float = 1.0,
         theta_max: Optional[float] = None,
         r_decay: float = 0.99,
@@ -494,7 +492,7 @@ class GPLSOMLayer(PLSOMLayer):
         if not 0.0 < spread_factor < 1.0:
             raise ValueError("spread_factor must be in (0, 1)")
         self.spread_factor = spread_factor
-        self.growth_threshold = -input_dim * np.log(spread_factor)
+        self.growth_threshold = -input_dimension * np.log(spread_factor)
         self.growth_anneal = growth_anneal
         self.prune_ratio = prune_ratio
         self.min_shape = tuple(min_shape)
@@ -502,7 +500,7 @@ class GPLSOMLayer(PLSOMLayer):
         self.settle_epochs = settle_epochs
         self.last_structural_epoch = -settle_epochs
         super().__init__(
-            width, height, input_dim, theta_min, theta_max, r_decay, theta_decay, hit_decay,
+            width, height, input_dimension, theta_min, theta_max, r_decay, theta_decay, hit_decay,
             temperature, energy_weight, output_type, learning_rate,
         )
 
@@ -619,7 +617,7 @@ class GPLSOMLayer(PLSOMLayer):
     def reshape_map(self, grid: NDArray) -> None:
         """Adopt a (rows, cols, input_dim) prototype grid and rebuild the lattice."""
         self.height, self.width = grid.shape[:2]
-        self.weights = grid.reshape(-1, self.input_dim)
+        self.weights = grid.reshape(-1, self.input_dimension)
         self.build_lattice()
         self.after_restructure()
 
@@ -663,7 +661,7 @@ class FreePLSOMLayer(ParameterlessLayer):
 
     def __init__(self,
                  n_neurons: int,
-                 input_dim: int,
+                 input_dimension: int,
                  theta_min: float = 1.0,
                  theta_max: Optional[float] = None,
                  merge_radius: Optional[float] = None,
@@ -696,7 +694,7 @@ class FreePLSOMLayer(ParameterlessLayer):
             raise ValueError("spread_factor must be in (0, 1)")
         self.merge_radius = merge_radius
         self.spread_factor = spread_factor
-        self.growth_threshold = -input_dim * np.log(spread_factor)
+        self.growth_threshold = -input_dimension * np.log(spread_factor)
         self.growth_anneal = growth_anneal
         self.prune_ratio = prune_ratio
         self.min_neurons = min_neurons
@@ -704,7 +702,7 @@ class FreePLSOMLayer(ParameterlessLayer):
         self.settle_epochs = settle_epochs
         self.last_structural_epoch = -settle_epochs
         super().__init__(
-            n_neurons, input_dim, theta_min, theta_max if theta_max else max(1.0, n_neurons / 2),
+            n_neurons, input_dimension, theta_min, theta_max if theta_max else max(1.0, n_neurons / 2),
             r_decay, theta_decay, hit_decay, temperature, energy_weight, output_type, learning_rate,
         )
 
@@ -795,7 +793,7 @@ class FreePLSOMLayer(ParameterlessLayer):
         """Move a cold prototype at the size floor beside the worst one, with fresh records."""
         worst = int(np.argmax(self.mean_node_error()))
         self.weights[index] = self.weights[worst] + RNG.uniform(
-            -self.theta_min, self.theta_min, size=self.input_dim
+            -self.theta_min, self.theta_min, size=self.input_dimension
         )
         self.hit_map[index] = 0.0
         self.node_error[index] = 0.0

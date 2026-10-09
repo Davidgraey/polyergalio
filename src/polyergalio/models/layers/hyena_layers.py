@@ -17,7 +17,6 @@ from typing import Optional
 import numpy as np
 from numpy.typing import NDArray
 
-from polyergalio.models.constants import GLOBAL_DTYPE
 from polyergalio.models.layers.basic_layers import RNG, FullyConnectedLayer, Layer
 from polyergalio.models.weight_initialization import get_weight_init
 
@@ -32,10 +31,10 @@ def positional_features(sequence_length: int, num_bands: int) -> NDArray:
     (sequence_length, 2 * num_bands + 1): [t, Re rho_0 .. Re rho_K-1, Im rho_0 .. Im rho_K-1],
     rho_k(t) = exp(i 2 pi k t / L), t normalised to [0, 1] in the first column
     """
-    steps = np.arange(sequence_length, dtype=GLOBAL_DTYPE)
+    steps = np.arange(sequence_length)
     angles = 2 * np.pi * np.outer(steps, np.arange(num_bands)) / sequence_length
     time = np.linspace(0.0, 1.0, sequence_length)[:, None]
-    return np.concatenate([time, np.cos(angles), np.sin(angles)], axis=1).astype(GLOBAL_DTYPE)
+    return np.concatenate([time, np.cos(angles), np.sin(angles)], axis=1)
 
 
 def exponential_window(sequence_length: int,
@@ -59,7 +58,7 @@ def exponential_window(sequence_length: int,
     """
     time = np.linspace(0.0, 1.0, sequence_length)[:, None]
     rates = np.abs(np.linspace(np.log(decay_target) / fast_decay, np.log(decay_target) / slow_decay, channels))
-    return (np.exp(-time * rates[None]) + window_shift).astype(GLOBAL_DTYPE)
+    return np.exp(-time * rates[None]) + window_shift
 
 
 # -------------    causal FFT convolution    -----------------------
@@ -75,7 +74,7 @@ def causal_convolution(signal: NDArray, filters: NDArray) -> NDArray:
     length = signal.shape[1]
     padded = 2 * length
     spectrum = np.fft.rfft(signal, n=padded, axis=1) * np.fft.rfft(filters, n=padded, axis=0)[None]
-    return np.fft.irfft(spectrum, n=padded, axis=1)[:, :length].astype(GLOBAL_DTYPE)
+    return np.fft.irfft(spectrum, n=padded, axis=1)[:, :length]
 
 
 def causal_convolution_backward(
@@ -97,7 +96,7 @@ def causal_convolution_backward(
 
     signal_gradient = np.fft.irfft(gradient_transform * np.conj(filter_transform), n=padded, axis=1)[:, :length]
     filter_gradient = np.fft.irfft(gradient_transform * np.conj(signal_transform), n=padded, axis=1)[:, :length]
-    return signal_gradient.astype(GLOBAL_DTYPE), filter_gradient.sum(axis=0).astype(GLOBAL_DTYPE)
+    return signal_gradient, filter_gradient.sum(axis=0)
 
 
 def delay(array: NDArray, steps: int) -> NDArray:
@@ -149,7 +148,7 @@ class ShortConvolution(Layer):
         self.declare_shapes(inputs=((channels,),), outputs=((channels,),))
 
         self.weights = get_weight_init(initialization)(RNG, ni=kernel_size, no=channels)
-        self.bias = np.zeros(channels, dtype=GLOBAL_DTYPE)
+        self.bias = np.zeros(channels)
         self.zero_gradients()
 
     def forward(self, input_data: NDArray, mask: Optional[NDArray] = None) -> NDArray:
@@ -252,11 +251,11 @@ class HyenaFilter(Layer):
         features = self.positions.shape[1]
         initializer = get_weight_init(initialization)
         self.weights_1 = sine_frequency * initializer(RNG, ni=features, no=filter_features)
-        self.bias_1 = np.zeros(filter_features, dtype=GLOBAL_DTYPE)
+        self.bias_1 = np.zeros(filter_features)
         self.weights_2 = sine_frequency * initializer(RNG, ni=filter_features, no=filter_features)
-        self.bias_2 = np.zeros(filter_features, dtype=GLOBAL_DTYPE)
+        self.bias_2 = np.zeros(filter_features)
         self.weights_3 = initializer(RNG, ni=filter_features, no=order * channels)
-        self.skip = np.zeros((order, channels), dtype=GLOBAL_DTYPE)
+        self.skip = np.zeros((order, channels))
         self.zero_gradients()
 
     def forward(self) -> NDArray:
@@ -400,9 +399,7 @@ class HyenaOperator(Layer):
         assert input_data.shape[2] == self.hidden_dim
 
         self.input = input_data
-        self.mask = (
-            mask.astype(GLOBAL_DTYPE) if mask is not None else np.ones(input_data.shape[:2], dtype=GLOBAL_DTYPE)
-        )
+        self.mask = mask if mask is not None else np.ones(input_data.shape[:2])
 
         projected = self.input_projection.forward(input_data) * self.mask[..., None]
         mixed = self.short_convolution.forward(projected)

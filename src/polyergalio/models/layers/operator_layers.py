@@ -174,6 +174,99 @@ class LatentDifference(BroadcastOperator):
         return incoming_grad, -incoming_grad
 
 
+class SplitLayer(Layer):
+    """
+    Divides one axis into consecutive slices of slice_size indices, zero-padding the end so they are all equal.
+
+    The slices come back as a tuple, ceil(length / slice_size) -- so indexing matters here!
+
+    A core assumption: arrays formatted where sequence = dim1, hidden = dim-1
+    axis "sequence": (batch, sequence, hidden) -> n x (batch, slice_size, hidden)
+    axis "hidden": (batch, sequence, hidden) -> n x (batch, sequence, slice_size)
+    """
+    parameter_names = ()
+    cache_names = ("in_shape",)
+    multi_output = True
+
+    def __init__(self, target_axis: str, slice_size: int, hidden_dimension: int):
+        """
+        Parameters
+        ----------
+        target_axis : "sequence" (axis 1) or "hidden" (last axis)
+        slice_size : number of indices along the axis in each slice
+        """
+        super().__init__()
+        if target_axis not in ("sequence", "hidden"):
+            raise ValueError(f"axis must be 'sequence' or 'hidden', got {target_axis!r}")
+
+        self.target_axis = target_axis
+        self.hidden_dimension = hidden_dimension
+        self.slice_size = slice_size
+
+        outputs = ((slice_size,),) if target_axis == "hidden" else (self.hidden_dimension,)
+        self.declare_shapes(inputs=(ANY_SHAPE,), outputs=outputs)
+
+    @property
+    def split_axis(self) -> int:
+        """Index of the axis that is divided."""
+        return 1 if self.target_axis == "sequence" else -1
+
+    def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
+        if self.target_axis == "hidden":
+            return ((self.slice_size,),)
+        return (input_shapes[0],)
+
+    def forward(self, input_data: NDArray) -> tuple[NDArray, ...]:
+        """
+        Parameters
+        ----------
+        input_data : (batch, sequence, hidden); (batch, hidden) when axis is "hidden"
+
+        Returns
+        -------
+        tuple of equal slices along the axis, the last padded with zeros
+        """
+        if self.target_axis == "sequence" and input_data.ndim < 2:
+            raise ValueError(f"axis 'sequence' needs (batch, sequence, ...), got shape {input_data.shape}")
+        self.in_shape = input_data.shape
+        length = input_data.shape[self.split_axis]
+        num_slices = -(-length // self.slice_size)
+        padding = [(0, 0)] * input_data.ndim
+        padding[self.split_axis] = (0, num_slices * self.slice_size - length)
+
+        return tuple(np.split(np.pad(input_data, padding), num_slices, axis=self.split_axis))
+
+    def backward(self, incoming_grads: tuple[NDArray, ...]) -> NDArray:
+        """
+        Parameters
+        ----------
+        incoming_grads : one gradient per slice, in the order forward returned them
+
+        Returns
+        -------
+        gradient with respect to the input, padding removed
+        """
+        length = self.in_shape[self.split_axis]
+        num_slices = -(-length // self.slice_size)
+        if len(incoming_grads) != num_slices:
+            raise ValueError(f"expected {num_slices} gradients, got {len(incoming_grads)}")
+
+        joined = np.concatenate(
+            [np.asarray(grad) for grad in incoming_grads],
+            axis=self.split_axis
+        )
+        keep = [slice(None)] * joined.ndim
+        keep[self.split_axis] = slice(0, length)
+
+        return joined[tuple(keep)]
+
+    def __str__(self):
+        return f"Split of the {self.axis} axis into slices of {self.slice_size}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
 class ShiftRight(Layer):
     """
     Shift a sequence right by one position along the sequence axis, so position t sees position t-1's value

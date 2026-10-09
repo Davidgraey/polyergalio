@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-from polyergalio.encoders.encoder_constants import DELTA_LOOKUP, Period
+from polyergalio.encoders.constants import DELTA_LOOKUP, Period
 from polyergalio.encoders.encoder_utils import (
     DISPATCHER,
     INVERT_DISPATCHER,
