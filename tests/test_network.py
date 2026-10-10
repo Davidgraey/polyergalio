@@ -1,6 +1,5 @@
 """
-The NeuralNetwork graph container (DAG): wiring checks, gradient flow through
-fan-out and merges, and end-to-end training.
+The Network graph container (DAG): wiring checks, gradient flow through fan-out and merges, and end-to-end training.
 """
 
 import inspect
@@ -8,16 +7,16 @@ import inspect
 import numpy as np
 import pytest
 from conftest import GRADIENT_TOLERANCE, numeric_gradient, relative_error
-from polyergalio.models.layers.basal_layers import (
+from polyergalio.models.layers.basic_layers import (
     DropoutLayer,
     FullyConnectedLayer,
     Layer,
-    shape_conflict,
 )
 from polyergalio.models.layers.operator_layers import LatentStack
 from polyergalio.models.model_loss import MSELoss
-from polyergalio.models.neural_network import INPUT_NAME, NeuralNetwork
+from polyergalio.models.network import INPUT_NAME, Network as NeuralNetwork
 from polyergalio.models.optimizers import SGD
+from polyergalio.utilities import shape_conflict
 
 
 def as_float64(layer):

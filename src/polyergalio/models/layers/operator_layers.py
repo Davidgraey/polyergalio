@@ -2,28 +2,38 @@
 Operations -- track the incoming streams and backpropagate appropriately.
 I started calling them latentXYZ because I was using them in latent spaces. No other reason.
 """
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
 from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
 
-from polyergalio.models.layers.basal_layers import ANY_SHAPE, Layer
+from polyergalio.models.constants import ANY_SHAPE
+from polyergalio.models.layers.basic_layers import Layer
+
+
+def reduce_to_shape(grad: NDArray, target_shape: tuple) -> NDArray:
+    """Sum a gradient down to target_shape wherever the forward pass broadcast."""
+    while grad.ndim > len(target_shape):
+        grad = grad.sum(axis=0)
+    for i, dim in enumerate(target_shape):
+        if dim == 1 and grad.shape[i] != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad
 
 
 class LatentStack(Layer):
-    """
-    stack via latent dimension (-1) position
-    """
+    """Stack two arrays along the latent dimension (-1)."""
+    cache_names = ("split_dims", "a_shape", "b_shape")
 
     def __init__(self):
         super().__init__()
         self.declare_shapes(inputs=(ANY_SHAPE, ANY_SHAPE), outputs=(ANY_SHAPE,))
-        self.split_dims = ()
 
     def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
-        """
-        The output width is the sum of the two incoming widths, so it is only known once those widths enter the layer.
-        """
+        """The output width is the sum of the incoming widths, so it is known only once they enter the layer."""
         widths = [shape[-1] for shape in input_shapes]
         if any(width is None for width in widths):
             return (ANY_SHAPE,)
@@ -31,15 +41,9 @@ class LatentStack(Layer):
 
     def forward(self, array_a: NDArray, array_b: NDArray = None) -> NDArray:
         """
-        Stack the data together along the hidden dimension
-        Parameters
-        ----------
-        array_a
-        array_b
-
         Returns
         -------
-        [array_a, array_b]
+        [array_a, array_b] joined along the hidden dimension
         """
         self.a_shape = array_a.shape
         self.b_shape = array_b.shape
@@ -56,452 +60,221 @@ class LatentStack(Layer):
 
     def backward(self, incoming_gradient: NDArray) -> tuple[NDArray, NDArray]:
         """
-        # send the gradients to their correct inputs ("slices")
-        Parameters
-        ----------
-        incoming_gradient : backpassed grad
-
         Returns
         -------
-        the "split" gradients -> ordered in the same fashion as the inputs to the forward kwargs (a, b).
+        the gradient split back into slices, ordered like the inputs to forward (a, b)
         """
         a_dim, b_dim = self.split_dims
-
-        grad_a = incoming_gradient[..., :a_dim]
-        grad_b = incoming_gradient[..., a_dim:a_dim + b_dim]
-
-        return grad_a, grad_b
-
-    def purge(self):
-        self.split_dims, self.a_shape, self.b_shape = None, None, None
-
-    def update_weights(self, **kwargs) -> None:
-        pass
-
-    def zero_gradients(self) -> None:
-        pass
-
-    def get_weights(self, for_serialize: bool = False):
-        return {} if for_serialize else None
-
-    def set_weights(self, weights: dict) -> None:
-        pass
+        return incoming_gradient[..., :a_dim], incoming_gradient[..., a_dim:a_dim + b_dim]
 
 
-class LatentSum(Layer):
+class BroadcastOperator(Layer, ABC):
     """
-    sum two arrays together, element-wise
+    Element-wise operation on two arrays. The lower-rank input is expanded at broadcast_axis (default 1), and
+    gradients are summed back down to each input's own shape.
+
+    A subclass supplies combine(), the operation, and partials(), the gradient with respect to each broadcast input.
     """
+    cache_names = (
+        "shape_a", "shape_b", "bcast_a", "bcast_b", "expanded_dim",
+        "array_a", "array_b", "output", "gradient_array_a", "gradient_array_b",
+    )
+
     def __init__(self, broadcast_axis: Optional[int] = None):
         super().__init__()
-        self.array_a: Optional[NDArray] = None
-        self.array_b: Optional[NDArray] = None
-        self.output: Optional[NDArray] = None
-
         self.broadcast_axis = broadcast_axis
-        self._expanded_dim = None
-
-
-        # Gradients calculated during backward pass
-        self.gradient_array_a: Optional[NDArray] = None
-        self.gradient_array_b: Optional[NDArray] = None
-
-        self.is_output: bool = False
-
         self.declare_shapes(inputs=(ANY_SHAPE, ANY_SHAPE), outputs=(ANY_SHAPE,))
-        self.zero_gradients()
 
+    @abstractmethod
+    def combine(self, array_a: NDArray, array_b: NDArray) -> NDArray:
+        """The operation, applied to the broadcast inputs."""
 
-    @staticmethod
-    def _reduce_to_shape(grad: NDArray, target_shape: tuple) -> NDArray:
-        """ sum the gradients down to target_shape wherever we have to broadcast"""
-        while grad.ndim > len(target_shape):
-            grad = grad.sum(axis=0)
-        for i, dim in enumerate(target_shape):
-            if dim == 1 and grad.shape[i] != 1:
-                grad = grad.sum(axis=i, keepdims=True)
-        return grad
+    @abstractmethod
+    def partials(self, incoming_grad: NDArray) -> tuple[NDArray, NDArray]:
+        """Gradient with respect to each broadcast input, before it is summed back to the input's shape."""
 
-    def forward(self,
-                array_a: NDArray,
-                array_b: NDArray,
-                mask: Optional[NDArray] = None) -> NDArray:
+    def forward(self, array_a: NDArray, array_b: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """
-        Sums array_a and array_b element-wise.
-
-        mask : unused -- the sum is per-position; accepted for pass-through
-        compatibility with the graph.
+        Parameters
+        ----------
+        mask : unused; the operation is per-position, kept for pass-through compatibility with the graph
         """
-        self.in_shape_1 = array_a.shape
-        self.in_shape_2 = array_b.shape
-        ndim1, ndim2 = len(self.in_shape_1), len(self.in_shape_2)
-        axis = self.broadcast_axis if self.broadcast_axis is not None else 1
+        self.shape_a = array_a.shape
+        self.shape_b = array_b.shape
+        axis = 1 if self.broadcast_axis is None else self.broadcast_axis
+        self.bcast_a, self.bcast_b, self.expanded_dim = array_a, array_b, None
 
         try:
-            if ndim1 < ndim2:
-                sum_array = np.expand_dims(array_a, axis) + array_b
-                self._expanded_dim = (1, axis)
-            elif ndim1 > ndim2:
-                sum_array = array_a + np.expand_dims(array_b, axis)
-                self._expanded_dim = (2, axis)
-            else:
-                sum_array = array_a + array_b
-                self._expanded_dim = None
-        except ValueError as e:
-            raise RuntimeError(f"SummingLayer: Inputs not broadcastable. {e}")
+            if array_a.ndim < array_b.ndim:
+                self.bcast_a = np.expand_dims(array_a, axis)
+                self.expanded_dim = (1, axis)
+            elif array_a.ndim > array_b.ndim:
+                self.bcast_b = np.expand_dims(array_b, axis)
+                self.expanded_dim = (2, axis)
+            self.output = self.combine(self.bcast_a, self.bcast_b)
+        except ValueError as error:
+            raise RuntimeError(f"{self.__class__.__name__}: Inputs not broadcastable. {error}")
 
         self.array_a = array_a
         self.array_b = array_b
-        self.output = sum_array
-
         return self.output
 
-    def backward(
-            self, incoming_grad: NDArray
-    ) -> tuple[NDArray, NDArray]:
+    def backward(self, incoming_grad: NDArray) -> tuple[NDArray, NDArray]:
         """
-        Backward pass. Calculates gradients for array_a and array_b.
-
-        Parameters
-        ----------
-        incoming_grad : NDArray
-            Gradient of the loss with respect to the output of this layer.
-
         Returns
         -------
-        Tuple[NDArray, NDArray]
+        gradient with respect to array_a and array_b, each in its own input shape
         """
-        if self._expanded_dim is not None:
-            which, axis = self._expanded_dim
+        grad_a, grad_b = self.partials(incoming_grad)
+        if self.expanded_dim is not None:
+            which, axis = self.expanded_dim
             if which == 1:
-                grad_1 = incoming_grad.sum(axis=axis)
-                grad_2 = incoming_grad
+                grad_a = grad_a.sum(axis=axis)
             else:
-                grad_1 = incoming_grad
-                grad_2 = incoming_grad.sum(axis=axis)
-        else:
-            grad_1 = incoming_grad
-            grad_2 = incoming_grad
+                grad_b = grad_b.sum(axis=axis)
 
-        self.gradient_array_a = self._reduce_to_shape(grad_1, self.in_shape_1)
-        self.gradient_array_b = self._reduce_to_shape(grad_2, self.in_shape_2)
-
+        self.gradient_array_a = reduce_to_shape(grad_a, self.shape_a)
+        self.gradient_array_b = reduce_to_shape(grad_b, self.shape_b)
         return self.gradient_array_a, self.gradient_array_b
 
-    def update_weights(self, **kwargs) -> None:
-        """
-        Pass through -- no weights to update
-        """
-        pass
-
-    def purge(self) -> None:
-        self.array_a = None
-        self.array_b = None
-        self.output = None
-        self._expanded_dim = None
-
-    def get_weights(self, for_serialize: bool = False):
-        return {} if for_serialize else None
-
-    def set_weights(self, weights: dict) -> None:
-        pass
-
-    def zero_gradients(self) -> None:
-        """
-        Zeroes the stored gradient values.
-        """
-        self.gradient_array_a = np.zeros_like(self.array_a)
-        self.gradient_array_b = np.zeros_like(self.array_b)
-        self.gradient = None
-
-    @property
-    def num_parameters(self) -> int:
-        return 0
-
     def __str__(self):
-        return "SummingLayer"
+        return self.__class__.__name__
 
     def __repr__(self):
         return f"{self}"
 
 
-class LatentProduct(Layer):
+class LatentSum(BroadcastOperator):
+    """array_a + array_b, element-wise"""
+
+    def combine(self, array_a: NDArray, array_b: NDArray) -> NDArray:
+        return array_a + array_b
+
+    def partials(self, incoming_grad: NDArray) -> tuple[NDArray, NDArray]:
+        return incoming_grad, incoming_grad
+
+
+class LatentProduct(BroadcastOperator):
+    """array_a * array_b, element-wise"""
+
+    def combine(self, array_a: NDArray, array_b: NDArray) -> NDArray:
+        return array_a * array_b
+
+    def partials(self, incoming_grad: NDArray) -> tuple[NDArray, NDArray]:
+        return incoming_grad * self.bcast_b, incoming_grad * self.bcast_a
+
+
+class LatentDifference(BroadcastOperator):
+    """array_a - array_b, element-wise; array_b's gradient carries the sign flip"""
+
+    def combine(self, array_a: NDArray, array_b: NDArray) -> NDArray:
+        return array_a - array_b
+
+    def partials(self, incoming_grad: NDArray) -> tuple[NDArray, NDArray]:
+        return incoming_grad, -incoming_grad
+
+
+class SplitLayer(Layer):
     """
-    multiply two arrays together, element-wise
+    Divides one axis into consecutive slices of slice_size indices, zero-padding the end so they are all equal.
+
+    The slices come back as a tuple, ceil(length / slice_size) -- so indexing matters here!
+
+    A core assumption: arrays formatted where sequence = dim1, hidden = dim-1
+    axis "sequence": (batch, sequence, hidden) -> n x (batch, slice_size, hidden)
+    axis "hidden": (batch, sequence, hidden) -> n x (batch, sequence, slice_size)
     """
-    def __init__(self, broadcast_axis: Optional[int] = None):
-        super().__init__()
-        self.array_a: Optional[NDArray] = None
-        self.array_b: Optional[NDArray] = None
-        self.output: Optional[NDArray] = None
+    parameter_names = ()
+    cache_names = ("in_shape",)
+    multi_output = True
 
-        self.broadcast_axis = broadcast_axis
-        self._expanded_dim = None
-        self._bcast_1: Optional[NDArray] = None
-        self._bcast_2: Optional[NDArray] = None
-
-        self.gradient_array_a: Optional[NDArray] = None
-        self.gradient_array_b: Optional[NDArray] = None
-
-        self.declare_shapes(inputs=(ANY_SHAPE, ANY_SHAPE), outputs=(ANY_SHAPE,))
-        self.zero_gradients()
-
-    @staticmethod
-    def _reduce_to_shape(grad: NDArray, target_shape: tuple) -> NDArray:
-        """sum the gradients down to target_shape wherever we have to broadcast"""
-        while grad.ndim > len(target_shape):
-            grad = grad.sum(axis=0)
-        for i, dim in enumerate(target_shape):
-            if dim == 1 and grad.shape[i] != 1:
-                grad = grad.sum(axis=i, keepdims=True)
-        return grad
-
-    def forward(self,
-                array_a: NDArray,
-                array_b: NDArray) -> NDArray:
+    def __init__(self, target_axis: str, slice_size: int, hidden_dimension: int):
         """
-        Multiplies array_a and array_b element-wise.
-
-        mask : unused -- the product is per-position; accepted for
-        pass-through compatibility with the graph.
-        """
-        self.in_shape_1 = array_a.shape
-        self.in_shape_2 = array_b.shape
-        ndim1, ndim2 = len(self.in_shape_1), len(self.in_shape_2)
-        axis = self.broadcast_axis if self.broadcast_axis is not None else 1
-
-        try:
-            if ndim1 < ndim2:
-                self._bcast_1 = np.expand_dims(array_a, axis)
-                self._bcast_2 = array_b
-                self._expanded_dim = (1, axis)
-            elif ndim1 > ndim2:
-                self._bcast_1 = array_a
-                self._bcast_2 = np.expand_dims(array_b, axis)
-                self._expanded_dim = (2, axis)
-            else:
-                self._bcast_1 = array_a
-                self._bcast_2 = array_b
-                self._expanded_dim = None
-            product_array = self._bcast_1 * self._bcast_2
-        except ValueError as e:
-            raise RuntimeError(f"LatentProduct: Inputs not broadcastable. {e}")
-
-        self.array_a = array_a
-        self.array_b = array_b
-        self.output = product_array
-
-        return self.output
-
-    def backward(
-            self, incoming_grad: NDArray
-    ) -> tuple[NDArray, NDArray]:
-        """
-        Backward pass. Product rule against the other (broadcast) input.
-
         Parameters
         ----------
-        incoming_grad : NDArray
-            Gradient of the loss with respect to the output of this layer.
+        target_axis : "sequence" (axis 1) or "hidden" (last axis)
+        slice_size : number of indices along the axis in each slice
+        """
+        super().__init__()
+        if target_axis not in ("sequence", "hidden"):
+            raise ValueError(f"axis must be 'sequence' or 'hidden', got {target_axis!r}")
+
+        self.target_axis = target_axis
+        self.hidden_dimension = hidden_dimension
+        self.slice_size = slice_size
+
+        outputs = ((slice_size,),) if target_axis == "hidden" else (self.hidden_dimension,)
+        self.declare_shapes(inputs=(ANY_SHAPE,), outputs=outputs)
+
+    @property
+    def split_axis(self) -> int:
+        """Index of the axis that is divided."""
+        return 1 if self.target_axis == "sequence" else -1
+
+    def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
+        if self.target_axis == "hidden":
+            return ((self.slice_size,),)
+        return (input_shapes[0],)
+
+    def forward(self, input_data: NDArray) -> tuple[NDArray, ...]:
+        """
+        Parameters
+        ----------
+        input_data : (batch, sequence, hidden); (batch, hidden) when axis is "hidden"
 
         Returns
         -------
-        Tuple[NDArray, NDArray]
+        tuple of equal slices along the axis, the last padded with zeros
         """
-        grad_1 = incoming_grad * self._bcast_2
-        grad_2 = incoming_grad * self._bcast_1
+        if self.target_axis == "sequence" and input_data.ndim < 2:
+            raise ValueError(f"axis 'sequence' needs (batch, sequence, ...), got shape {input_data.shape}")
+        self.in_shape = input_data.shape
+        length = input_data.shape[self.split_axis]
+        num_slices = -(-length // self.slice_size)
+        padding = [(0, 0)] * input_data.ndim
+        padding[self.split_axis] = (0, num_slices * self.slice_size - length)
 
-        if self._expanded_dim is not None:
-            which, axis = self._expanded_dim
-            if which == 1:
-                grad_1 = grad_1.sum(axis=axis)
-            else:
-                grad_2 = grad_2.sum(axis=axis)
+        return tuple(np.split(np.pad(input_data, padding), num_slices, axis=self.split_axis))
 
-        self.gradient_array_a = self._reduce_to_shape(grad_1, self.in_shape_1)
-        self.gradient_array_b = self._reduce_to_shape(grad_2, self.in_shape_2)
-
-        return self.gradient_array_a, self.gradient_array_b
-
-    def update_weights(self, **kwargs) -> None:
+    def backward(self, incoming_grads: tuple[NDArray, ...]) -> NDArray:
         """
-        Pass through -- no weights to update
-        """
-        pass
-
-    def purge(self) -> None:
-        self.array_a = None
-        self.array_b = None
-        self.output = None
-        self._bcast_1 = None
-        self._bcast_2 = None
-        self._expanded_dim = None
-
-    def get_weights(self, for_serialize: bool = False):
-        return {} if for_serialize else None
-
-    def set_weights(self, weights: dict) -> None:
-        pass
-
-    def zero_gradients(self) -> None:
-        """
-        Zeroes the stored gradient values.
-        """
-        self.gradient_array_a = np.zeros_like(self.array_a)
-        self.gradient_array_b = np.zeros_like(self.array_b)
-        self.gradient = None
-
-    @property
-    def num_parameters(self) -> int:
-        return 0
-
-    def __str__(self):
-        return "LatentProduct"
-
-    def __repr__(self):
-        return f"{self}"
-
-
-class LatentDifference(Layer):
-    """
-    subtract two arrays element-wise: array_a - array_b
-    """
-    def __init__(self, broadcast_axis: Optional[int] = None):
-        super().__init__()
-        self.array_a: Optional[NDArray] = None
-        self.array_b: Optional[NDArray] = None
-        self.output: Optional[NDArray] = None
-
-        self.broadcast_axis = broadcast_axis
-        self._expanded_dim = None
-
-        self.gradient_array_a: Optional[NDArray] = None
-        self.gradient_array_b: Optional[NDArray] = None
-
-        self.declare_shapes(inputs=(ANY_SHAPE, ANY_SHAPE), outputs=(ANY_SHAPE,))
-        self.zero_gradients()
-
-    @staticmethod
-    def _reduce_to_shape(grad: NDArray, target_shape: tuple) -> NDArray:
-        """sum the gradients down to target_shape wherever we have to broadcast"""
-        while grad.ndim > len(target_shape):
-            grad = grad.sum(axis=0)
-        for i, dim in enumerate(target_shape):
-            if dim == 1 and grad.shape[i] != 1:
-                grad = grad.sum(axis=i, keepdims=True)
-        return grad
-
-    def forward(self,
-                array_a: NDArray,
-                array_b: NDArray,
-                mask: Optional[NDArray] = None) -> NDArray:
-        """
-        Subtracts array_b from array_a, element-wise.
-
-        mask : unused -- the difference is per-position; accepted for
-        pass-through compatibility with the graph.
-        """
-        self.in_shape_1 = array_a.shape
-        self.in_shape_2 = array_b.shape
-        ndim1, ndim2 = len(self.in_shape_1), len(self.in_shape_2)
-        axis = self.broadcast_axis if self.broadcast_axis is not None else 1
-
-        try:
-            if ndim1 < ndim2:
-                diff_array = np.expand_dims(array_a, axis) - array_b
-                self._expanded_dim = (1, axis)
-            elif ndim1 > ndim2:
-                diff_array = array_a - np.expand_dims(array_b, axis)
-                self._expanded_dim = (2, axis)
-            else:
-                diff_array = array_a - array_b
-                self._expanded_dim = None
-        except ValueError as e:
-            raise RuntimeError(f"LatentDifference: Inputs not broadcastable. {e}")
-
-        self.array_a = array_a
-        self.array_b = array_b
-        self.output = diff_array
-
-        return self.output
-
-    def backward(
-            self, incoming_grad: NDArray
-    ) -> tuple[NDArray, NDArray]:
-        """
-        Backward pass. array_b's gradient carries the sign flip from the
-        subtraction; array_a's does not.
-
         Parameters
         ----------
-        incoming_grad : NDArray
-            Gradient of the loss with respect to the output of this layer.
+        incoming_grads : one gradient per slice, in the order forward returned them
 
         Returns
         -------
-        Tuple[NDArray, NDArray]
+        gradient with respect to the input, padding removed
         """
-        if self._expanded_dim is not None:
-            which, axis = self._expanded_dim
-            if which == 1:
-                grad_1 = incoming_grad.sum(axis=axis)
-                grad_2 = -incoming_grad
-            else:
-                grad_1 = incoming_grad
-                grad_2 = -incoming_grad.sum(axis=axis)
-        else:
-            grad_1 = incoming_grad
-            grad_2 = -incoming_grad
+        length = self.in_shape[self.split_axis]
+        num_slices = -(-length // self.slice_size)
+        if len(incoming_grads) != num_slices:
+            raise ValueError(f"expected {num_slices} gradients, got {len(incoming_grads)}")
 
-        self.gradient_array_a = self._reduce_to_shape(grad_1, self.in_shape_1)
-        self.gradient_array_b = self._reduce_to_shape(grad_2, self.in_shape_2)
+        joined = np.concatenate(
+            [np.asarray(grad) for grad in incoming_grads],
+            axis=self.split_axis
+        )
+        keep = [slice(None)] * joined.ndim
+        keep[self.split_axis] = slice(0, length)
 
-        return self.gradient_array_a, self.gradient_array_b
-
-    def update_weights(self, **kwargs) -> None:
-        """
-        Pass through -- no weights to update
-        """
-        pass
-
-    def purge(self) -> None:
-        self.array_a = None
-        self.array_b = None
-        self.output = None
-        self._expanded_dim = None
-
-    def get_weights(self, for_serialize: bool = False):
-        return {} if for_serialize else None
-
-    def set_weights(self, weights: dict) -> None:
-        pass
-
-    def zero_gradients(self) -> None:
-        """
-        Zeroes the stored gradient values.
-        """
-        self.gradient_array_a = np.zeros_like(self.array_a)
-        self.gradient_array_b = np.zeros_like(self.array_b)
-        self.gradient = None
-
-    @property
-    def num_parameters(self) -> int:
-        return 0
+        return joined[tuple(keep)]
 
     def __str__(self):
-        return "LatentDifference"
+        return f"Split of the {self.axis} axis into slices of {self.slice_size}"
 
     def __repr__(self):
-        return f"{self}"
+        return self.__str__()
 
 
 class ShiftRight(Layer):
     """
-    Shift a sequence right by one position along the sequence axis, so
-    position t sees position t-1's value instead of its own
+    Shift a sequence right by one position along the sequence axis, so position t sees position t-1's value
+    instead of its own. The vacated first position holds the learnable start_token.
     """
-
     preserves_shape = True
+    parameter_names = ("start_token",)
+    cache_names = ("output",)
 
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -513,6 +286,8 @@ class ShiftRight(Layer):
 
     def forward(self, input_data: NDArray) -> NDArray:
         """
+        Parameters
+        ----------
         input_data : (batch, sequence, hidden)
         """
         assert input_data.ndim == 3, (
@@ -527,38 +302,10 @@ class ShiftRight(Layer):
         return self.output
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
-        self.gradient_start_token = incoming_gradient[:, :1, :].sum(
-            axis=0, keepdims=True
-        )
-        # -1?
+        self.gradient_start_token = incoming_gradient[:, :1, :].sum(axis=0, keepdims=True)
         grad_input = np.zeros_like(incoming_gradient)
         grad_input[:, :-1, :] = incoming_gradient[:, 1:, :]
         return grad_input
-
-    def update_weights(self, gradient_start_token: NDArray) -> None:
-        self.start_token -= gradient_start_token
-
-    def zero_gradients(self) -> None:
-        self.gradient_start_token = np.zeros_like(self.start_token)
-
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"start_token": self.start_token}
-        return self.start_token
-
-    def set_weights(self, weights: dict) -> None:
-        if weights:
-            self.start_token = np.asarray(weights["start_token"])
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {"gradient_start_token": self.gradient_start_token}
-
-    def purge(self) -> None:
-        self.output = None
-
-    @property
-    def num_parameters(self) -> int:
-        return self.start_token.size
 
     def __str__(self):
         return f"ShiftRight, hidden {self.hidden_dim}"
@@ -566,40 +313,35 @@ class ShiftRight(Layer):
     def __repr__(self):
         return self.__str__()
 
+
 class MaskGather(Layer):
     """
-    Selects specific positions out of a (batch, sequence, hidden) tensor
-    for a downstream head to run on; scatters the gradient back into the
-    full shape on the way back. No learnable parameters.
+    Selects specific positions out of a (batch, sequence, hidden) tensor for a downstream head to run on, and
+    scatters the gradient back into the full shape on the way back. No learnable parameters.
 
     Input shape: (batch, sequence, hidden)
-    Output shape: (num_selected, hidden) -- flattened across batch and
-        sequence, since a downstream head only needs a bag of vectors,
-        not which row or position each one came from
+    Output shape: (num_selected, hidden), flattened across batch and sequence, since a downstream head only needs
+    a bag of vectors, not which row or position each one came from
     """
     preserves_shape = False
+    cache_names = ("select_mask", "in_shape")
 
     def __init__(self):
         super().__init__()
         self.declare_shapes(inputs=((None, None, None),), outputs=((None, None),))
-        self.select_mask = None
-        self.in_shape = None
-        self.zero_gradients()
 
-    def forward(self, incoming_x, mask=None, target_mask=None):
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None, target_mask: Optional[NDArray] = None):
         """
-
-
         Parameters
         ----------
-        incoming_x
-        mask: (batch, sequence) or (batch, sequence, 1)
-        target_mask: (batch, sequence) or (batch, sequence, 1) bool/0-1, which positions to pass forward (for training tasks like MLM)
-        None keeps everything.
+        incoming_x : (batch, sequence, hidden)
+        mask : (batch, sequence) or (batch, sequence, 1) attention mask
+        target_mask : (batch, sequence) or (batch, sequence, 1) bool or 0-1, which positions to pass forward
+            (for training tasks like MLM); None keeps everything
 
         Returns
         -------
-
+        (num_selected, hidden) the selected positions
         """
         self.in_shape = incoming_x.shape
 
@@ -613,16 +355,7 @@ class MaskGather(Layer):
 
         return incoming_x[self.select_mask]
 
-    def backward(self, incoming_grad):
+    def backward(self, incoming_grad: NDArray) -> NDArray:
         full_grad = np.zeros(self.in_shape, dtype=incoming_grad.dtype)
         full_grad[self.select_mask] = incoming_grad
         return full_grad
-
-    def update_weights(self): pass
-    def zero_gradients(self): pass
-    def get_weights(self, for_serialize=False): return {} if for_serialize else None
-    def get_gradients(self): return {}
-    def purge(self): self.select_mask = None; self.in_shape = None
-
-    @property
-    def num_parameters(self): return 0

@@ -16,24 +16,21 @@ from polyergalio.models.activations import (
     linear,
 )
 from polyergalio.models.supervised import log
-from polyergalio.types import BasalModel
+from polyergalio.fitted_model import FittedModel
 
 
-class SupervisedTreeModel(BasalModel):
+class SupervisedTreeModel(FittedModel):
     pass
 
 
-class ExplainableBoostedTreeModel(BasalModel):
+class ExplainableBoostedTreeModel(FittedModel):
     """
     Explainable Boosting Machine (EBM) — additive model with
     pairwise interactions, fit via cyclic gradient boosting of bagged / histogram learning
 
     supports regression and classification (binary / multinomial / multilabel)
     """
-    # input_dimension is included since fit() overwrites it from the data
-    _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
-        "main_effects", "interactions", "intercept", "input_dimension",
-    )
+    parameter_names = ("main_effects", "interactions", "intercept")
 
     def __init__(
         self,
@@ -47,9 +44,7 @@ class ExplainableBoostedTreeModel(BasalModel):
         interaction_num_bins: int = 16,
         seed: int = 42,
     ):
-        super().__init__(input_dimension, output_dimension, seed)
-        self.seed = seed
-
+        super().__init__(seed=seed, input_dimension=input_dimension, output_dimension=output_dimension)
         self.task = task
         self.num_bins = num_bins
         self.learning_rate = learning_rate
@@ -403,9 +398,9 @@ class ExplainableBoostedTreeModel(BasalModel):
                 break
 
         log.info(f"EBM training complete. Final loss: {losses[-1]:.6f}")
+        self.fitted = True
         return losses
 
-    # BasalModel contract
     def fit_predict(
         self,
         x_data: NDArray,

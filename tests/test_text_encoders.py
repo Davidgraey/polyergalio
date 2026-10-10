@@ -9,7 +9,6 @@ import pytest
 pytest.importorskip("sentencepiece")
 
 from polyergalio.encoders.text_encoders import (
-    IMPLEMENTED_TASKS,
     DistortionTask,
     TextProcessor,
 )
@@ -58,7 +57,7 @@ def structural_positions(processor, input_ids):
     return np.isin(input_ids, [processor.special.CLS, processor.special.SEP])
 
 
-@pytest.mark.parametrize("task", IMPLEMENTED_TASKS, ids=lambda task: task.value)
+@pytest.mark.parametrize("task", ids=lambda task: task.value)
 def test_targets_never_fall_on_padding(processor, task):
     batch = processor.distort_batch(CORPUS, task)
     assert not (batch["target_mask"] & (batch["attention_mask"] == 0)).any()

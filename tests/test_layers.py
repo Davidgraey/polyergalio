@@ -10,7 +10,7 @@ from conftest import (
     input_gradient_error,
     parameter_gradient_error,
 )
-from polyergalio.models.layers.basal_layers import (
+from polyergalio.models.layers.basic_layers import (
     DropoutLayer,
     FullyConnectedLayer,
     NormalizeLayer,

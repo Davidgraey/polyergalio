@@ -62,14 +62,16 @@ def train(seed, memory_tokens, use_wrm):
     optimizer = Adam(LEARNING_RATE)
     order = np.random.default_rng(seed)
     losses = []
+    layer.train()
     for _ in range(STEPS):
         idx = order.integers(0, len(x_train), BATCH_SIZE)
         layer.zero_gradients()
-        output = layer.forward(x_train[idx], training_now=True)
+        output = layer.forward(x_train[idx])
         losses.append(np.mean((output - y_train[idx]) ** 2))
         layer.backward(2 * (output - y_train[idx]) / output.size)
-        optimizer.step([layer])
-    error = (layer.forward(x_test, training_now=False) - y_test) ** 2
+        optimizer.step(layer)
+    layer.eval()
+    error = (layer.forward(x_test) - y_test) ** 2
     return np.array(losses), error[:, 1:].mean(), error.mean()
 
 

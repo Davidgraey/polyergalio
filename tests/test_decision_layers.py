@@ -15,14 +15,12 @@ from polyergalio.generators.data_generators import (
 )
 from polyergalio.models.constants import DECISION_TYPES
 from polyergalio.models.model_loss import DecisionLoss
-from polyergalio.models.layers.decision_layers import (
-    DecisionHead,
-    calibrated_probabilities,
+from polyergalio.models.heads import DecisionHead
+from polyergalio.models.heads.decision_utilities import (calibrated_probabilities,
     decision_correct,
     decode_decisions,
     fit_temperatures,
-    masked_softmax,
-)
+    masked_softmax)
 from polyergalio.models.optimizers import Adam
 
 BATCH, SEQUENCE, HIDDEN = 4, 9, 6

@@ -2,27 +2,38 @@
 System-one decision example.
 
 Wires the minimal encoder-head setup from decision-head-overview.md --
-TextEmbedding -> SpectreAttention -> DecisionHead -- into one NeuralNetwork
+TextEmbedding -> SpectreAttention -> DecisionHead -- into one Network
 graph, then trains it on RandomDatasetGenerator's "decision" task. A single
 forward pass answers every question (no chain-of-thought, no decoding loop),
 which is the "system one" part: one Spectre mixing pass over the sequence,
 then one shared scorer read off the [MARK] positions.
 
+Rows are split into train, calibration and test sets. The network trains on
+the train rows (main loss plus the act branch), temperatures are fit on the
+calibration rows, and the test rows are decoded with calibrated probabilities,
+scored for confidence, and escalated by the act branch.
+
 Run: python NNet_system_one_decision_example.py
 """
 
+import numpy as np
+
 from polyergalio.generators.data_generators import RandomDatasetGenerator
-from polyergalio.models.constants import DECISION_TYPES
+from polyergalio.models.constants import DECISION_TYPES, EPSILON
 from polyergalio.models.embedding.embedding import TextEmbedding
-from polyergalio.models.layers.decision_layers import (
+from polyergalio.models.heads import (
     DecisionHead,
+    calibrated_probabilities,
+    decision_confidence,
     decision_correct,
+    decision_type_ids,
     decode_decisions,
+    fit_temperatures,
     masked_softmax,
 )
 from polyergalio.models.layers.spectre_layers import SpectreAttention
 from polyergalio.models.model_loss import DecisionLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network
 from polyergalio.models.optimizers import SGD
 
 HIDDEN_DIM = 32
@@ -30,9 +41,12 @@ HEAD_HIDDEN = 16
 NUM_HEADS = 4
 LEARNING_RATE = 0.05
 TRAIN_STEPS = 200
+NUM_SAMPLES = 768
+SPLIT_FRACTIONS = (0.6, 0.2, 0.2)
+ESCALATION_THRESHOLD = 0.5
 
 
-def build_network(vocab_size: int, sequence_length: int, padding_idx: int) -> NeuralNetwork:
+def build_network(vocab_size: int, sequence_length: int, padding_idx: int) -> Network:
     """
     Encoder-head system-one network: TextEmbedding -> SpectreAttention -> DecisionHead.
 
@@ -44,9 +58,9 @@ def build_network(vocab_size: int, sequence_length: int, padding_idx: int) -> Ne
 
     Returns
     -------
-    NeuralNetwork mapping token ids (batch, sequence_length) to option logits
+    Network mapping token ids (batch, sequence_length) to option logits
     """
-    net = NeuralNetwork(name="system_one", input_shape=(sequence_length,))
+    net = Network(name="system_one", input_shape=(sequence_length,))
     embedded = net.connect(
         TextEmbedding(vocab_size, HIDDEN_DIM, padding_idx=padding_idx),
         net.input,
@@ -70,16 +84,107 @@ def row_correctness(logits, y, kwargs: dict):
     return decision_correct(decisions, y, kwargs["decisiontypes"])
 
 
+def predicted_options(decisions, decisiontypes) -> np.ndarray:
+    """(batch,) option index each decoded decision resolves to: P(true) past 0.5 for binary, the rounded level otherwise."""
+    binary = decision_type_ids(decisiontypes) == DECISION_TYPES.BINARY.value
+    return np.where(binary, (decisions >= 0.5).astype(int), np.rint(decisions).astype(int))
+
+
 def accuracy(logits, y, kwargs: dict) -> float:
     """Fraction of rows decoded correctly against the generator's answers."""
     return float(row_correctness(logits, y, kwargs).mean())
+
+
+def split_rows(x, y, kwargs: dict, fractions=SPLIT_FRACTIONS) -> list[tuple]:
+    """
+    Split rows in order into train, calibration and test sets.
+
+    Returns
+    -------
+    one (x, y, kwargs) tuple per fraction
+    """
+    edges = np.cumsum([int(len(x) * fraction) for fraction in fractions[:-1]])
+    return [
+        (x[rows], y[rows], {name: value[rows] for name, value in kwargs.items()})
+        for rows in np.split(np.arange(len(x)), edges)
+    ]
+
+
+def fit_calibration(net: Network, x, y, kwargs: dict) -> dict[str, float]:
+    """Temperature per (type, option count) bucket, fit on rows the model did not train on."""
+    net.eval()
+    head = net.node("decision_head").layer
+    logits = net.forward(x, **kwargs)
+    return fit_temperatures(logits, y, kwargs["token_mask"], kwargs["decisiontypes"], head.TEMPERATURE_GRID)
+
+
+def answer_nll(probabilities, y) -> float:
+    picked = np.take_along_axis(probabilities, y[:, None], axis=-1)[:, 0]
+    return float(-np.mean(np.log(np.maximum(picked, EPSILON))))
+
+
+def rate(values, rows) -> float:
+    return float(values[rows].mean()) if rows.any() else float("nan")
+
+
+def evaluate(net: Network, x, y, kwargs: dict, temperatures: dict, threshold: float = ESCALATION_THRESHOLD) -> dict:
+    """
+    Decode, score and escalate every row with the head's three outputs.
+
+    Returns
+    -------
+    per-row arrays (probabilities, decisions, predicted, correct, confidence, act, escalated)
+    and the answer NLL before and after calibration
+    """
+    net.eval()
+    head = net.node("decision_head").layer
+    token_mask, decisiontypes = kwargs["token_mask"], kwargs["decisiontypes"]
+    logits = net.forward(x, **kwargs)
+    raw = masked_softmax(logits, token_mask)
+    probabilities = calibrated_probabilities(logits, token_mask, decisiontypes, temperatures)
+    decisions = decode_decisions(probabilities, decisiontypes)
+    return dict(
+        probabilities=probabilities,
+        decisions=decisions,
+        predicted=predicted_options(decisions, decisiontypes),
+        correct=decision_correct(decisions, y, decisiontypes),
+        confidence=decision_confidence(probabilities, token_mask),
+        act=head.act_probabilities,
+        escalated=head.escalate(threshold),
+        nll_raw=answer_nll(raw, y),
+        nll_calibrated=answer_nll(probabilities, y),
+    )
+
+
+def print_evaluation(results: dict, temperatures: dict) -> None:
+    """Print temperatures, calibration effect, confidence and the escalation split."""
+    escalated, correct = results["escalated"], results["correct"]
+    print("temperatures: " + ", ".join(f"{bucket}={value:.2f}" for bucket, value in temperatures.items()))
+    print(f"NLL raw {results['nll_raw']:.3f} -> calibrated {results['nll_calibrated']:.3f}")
+    print(f"accuracy {correct.mean():.3f}  mean confidence {results['confidence'].mean():.3f}  mean P(act) {results['act'].mean():.3f}")
+    print(f"escalated to system two: {escalated.mean():.3f} of rows")
+    print(f"accuracy kept {rate(correct, ~escalated):.3f}  escalated {rate(correct, escalated):.3f}")
+
+
+def print_predictions(results: dict, y, kwargs: dict, count: int = 8) -> None:
+    """Print the head's calibrated option probabilities, prediction and escalation for the first rows."""
+    names = {member.value: member.name.lower() for member in DECISION_TYPES}
+    print(f"\nfirst {count} test rows (answer -> predicted, calibrated option probabilities)")
+    for row in range(min(count, len(y))):
+        options = kwargs["token_mask"][row].astype(bool)
+        probabilities = " ".join(f"{p:.2f}" for p in results["probabilities"][row][options])
+        print(
+            f"  {names[int(kwargs['decisiontypes'][row])]:6s} {y[row]} -> {results['predicted'][row]}  "
+            f"[{probabilities}]  confidence {results['confidence'][row]:.2f}  P(act) {results['act'][row]:.2f}  "
+            f"{'escalated' if results['escalated'][row] else 'kept'}"
+        )
 
 
 def main():
     generator = RandomDatasetGenerator(random_seed=0)
     X, y, meta = generator.generate(
         "decision",
-        num_samples=256,
+        num_samples=NUM_SAMPLES,
         num_choices=4,
         num_levels=4,
         decision_types=tuple(DECISION_TYPES),
@@ -92,6 +197,9 @@ def main():
         token_mask=meta["token_mask"],
         decisiontypes=meta["decisiontypes"],
     )
+    train_set, calibration_set, test_set = split_rows(X, y, kwargs)
+    x_train, y_train, train_kwargs = train_set
+    x_test, y_test, test_kwargs = test_set
 
     net = build_network(
         vocab_size=meta["vocab_size"],
@@ -100,31 +208,29 @@ def main():
     )
 
     net.eval()
-    logits = net.forward(X, **kwargs)
     print(net.summary())
-    print(f"accuracy before training: {accuracy(logits, y, kwargs):.3f}")
+    print(f"test accuracy before training: {accuracy(net.forward(x_test, **test_kwargs), y_test, test_kwargs):.3f}")
 
     loss_fn = DecisionLoss(ordinal_weight=0.25)
     optimizer = SGD(LEARNING_RATE)
-
     head = net.node("decision_head").layer
 
     net.train()
     for step in range(TRAIN_STEPS):
         net.zero_gradients()
-        logits = net.forward(X, **kwargs)
-        loss = loss_fn(logits, y, kwargs["token_mask"], kwargs["decisiontypes"])
-        act_loss = head.score_act(row_correctness(logits, y, kwargs))
+        logits = net.forward(x_train, **train_kwargs)
+        loss = loss_fn(logits, y_train, train_kwargs["token_mask"], train_kwargs["decisiontypes"])
+        act_loss = head.score_act(row_correctness(logits, y_train, train_kwargs))
         net.backward(loss_fn.backward())
-        optimizer.step(net.layers)
+        optimizer.step(net)
         if step % 50 == 0:
             print(f"step {step:4d}  loss {loss:.4f}  act loss {act_loss:.4f}")
 
-    net.eval()
-    logits = net.forward(X, **kwargs)
-    print(f"accuracy after training: {accuracy(logits, y, kwargs):.3f}")
-    escalated = head.escalate()
-    print(f"escalated to system two: {escalated.mean():.3f} of rows")
+    temperatures = fit_calibration(net, *calibration_set)
+    print("\n--- test rows ---")
+    results = evaluate(net, x_test, y_test, test_kwargs, temperatures)
+    print_evaluation(results, temperatures)
+    print_predictions(results, y_test, test_kwargs)
 
 
 if __name__ == "__main__":

@@ -5,18 +5,16 @@ from numpy.typing import NDArray
 from scipy.spatial.distance import cdist, pdist
 from polyergalio.visuals.cluster_visuals import plot_clusters
 from polyergalio.models.clustering.cluster_metrics import silhouette_score
-from polyergalio.types import BasalModel
+from polyergalio.fitted_model import FittedModel
 from polyergalio.models.clustering import log
 
 EPSILON = 1e-12
 
 
-class CentroidNeuralNetwork(BasalModel):
-    # The per-k growth history (centroid tracker, label tracker, metrics) is
-    # training-time bookkeeping and deliberately left out.
-    _structural_state_keys: tuple[str, ...] = BasalModel._structural_state_keys + (
-        "centroids", "skip_standardize",
-    )
+class CentroidNeuralNetwork(FittedModel):
+    """The per-k growth history (centroid tracker, label tracker, metrics) is training-time bookkeeping and is not persisted."""
+    parameter_names = ("centroids",)
+    state_names = ("skip_standardize",)
 
     def __init__(self,
                  max_clusters: int,
@@ -24,8 +22,8 @@ class CentroidNeuralNetwork(BasalModel):
                  initial_clusters: NDArray | None = None,
                  epsilon: float = 2e-3):
         super().__init__(seed=seed)
-        self.seed = seed
         self.max_clusters = max_clusters
+        self.initial_clusters = initial_clusters
         self.epsilon: float = epsilon
         self.num_dims: int = 0
 
@@ -35,14 +33,11 @@ class CentroidNeuralNetwork(BasalModel):
             self.centroids = None
         self.previous_labels = None
         self.volume = None
-        self.num_seen_samples: int = 0
-
 
         self._label_tracker = {}
         self._centroid_tracker = {}
 
-        self._is_fitted = False
-        self.skip_standardize=False
+        self.skip_standardize = False
 
         self.metrics = {k: 0.0 for k in range(2, max_clusters + 1)}
         self._scored = False
@@ -147,13 +142,13 @@ class CentroidNeuralNetwork(BasalModel):
         """
         # refitting an already-fitted instance starts clean rather than growing
         # from wherever the previous fit left off
-        if self._is_fitted:
+        if self.fitted:
             self.centroids = None
             self._label_tracker = {}
             self._centroid_tracker = {}
             self.metrics = {k: 0.0 for k in range(2, self.max_clusters + 1)}
             self._scored = False
-            self._is_fitted = False
+            self.fitted = False
 
         # check and see if we've done the standardization process:
         if skip_standardize:
@@ -268,7 +263,7 @@ class CentroidNeuralNetwork(BasalModel):
             self._update_labels(num_centroids, closest_centroids, shuffle_mask)
 
         # ending conditions ========================================
-        self._is_fitted = True
+        self.fitted = True
 
         # Calculate for all datapoints ---- do we need this?
         # full_distances = self.distance_metric(data_x=x_data, data_y=self.centroids[:num_centroids])
@@ -386,7 +381,7 @@ class CentroidNeuralNetwork(BasalModel):
         NDArray
             integer cluster label per sample, nearest centroid by distance
         """
-        if not self._is_fitted:
+        if not self.fitted:
             raise RuntimeError("Model is not fitted yet. Call fit() first.")
 
         xs = x_data if self.skip_standardize else self.standardize(x_data)
@@ -438,7 +433,7 @@ class CentroidNeuralNetwork(BasalModel):
         wants to show growth over time (e.g. an animation) without reaching
         into the internal trackers.
         """
-        if not self._is_fitted:
+        if not self.fitted:
             raise RuntimeError("Model is not fitted yet. Call fit() first.")
 
         history = []
@@ -457,7 +452,7 @@ class CentroidNeuralNetwork(BasalModel):
         """
         Get the optimal number of clusters based on the metrics collected during fitting.
         """
-        if not self._is_fitted:
+        if not self.fitted:
             raise RuntimeError("Model is not fitted yet. Call fit() first.")
         if not self._scored:
             raise RuntimeError(
@@ -476,13 +471,10 @@ class CentroidNeuralNetwork(BasalModel):
             self._label_tracker[best_scoring]
         )
 
-    def get_weights(self, for_serialize: bool = False) -> dict:
-        """
-        Fitted state; when serializing, centroids are cut to the optimal
-        cluster count and the per-k growth history is left out.
-        """
-        state = super().get_weights(for_serialize)
-        if for_serialize and self._centroid_tracker:
+    def get_state(self) -> dict:
+        """Fitted state; the centroids are cut to the optimal cluster count and the per-k growth history is left out."""
+        state = super().get_state()
+        if self._centroid_tracker and self._scored:
             best_scoring, _, _ = self.get_optimal()
             state["centroids"] = copy.deepcopy(self._centroid_tracker[best_scoring])
         return state

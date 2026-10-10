@@ -13,8 +13,7 @@ dependencies = [
     "matplotlib",
     "numpy",
     "scipy",
-    "sentencepiece",
-    "streamlit"
+    "sentencepiece"
 ]
 
 description = "From-scratch machine learning methods -- encoding, supervised learning, and clustering -- built on NumPy and SciPy"

@@ -1,67 +1,15 @@
 """Tokenizer module using SentencePiece with special token management."""
-
-import glob
 import json
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import sentencepiece as spm
 
 from polyergalio.models.constants import DECISION_TYPES
-from polyergalio.types import Serializable
+from polyergalio.encoders.constants import SpecialTokens, CORE_FIELDS, SPECIAL_TOKEN_PIECES
 
-SPECIAL_TOKEN_PIECES: Dict[str, str] = {
-    "PAD": "<pad>",
-    "BOS": "<s>",
-    "EOS": "</s>",
-    "UNK": "<unk>",
-    "CLS": "<cls>",
-    "SEP": "<sep>",
-    "MARK": "<mark>",
-    "MASK": "<mask>",
-    "INSTRUCTION": "<instruction>",
-    "END_INSTRUCTION": "</instruction>",
-    "SYSTEM": "<system>",
-    "END_SYSTEM": "</system>",
-    "USER": "<user>",
-    "END_USER": "</user>",
-    "AGENT": "<agent>",
-    "END_AGENT": "</agent>",
-    "QUESTION": "<question>",
-    "END_QUESTION": "</question>",
-    "ANSWER": "<answer>",
-    "END_ANSWER": "</answer>",
-}
-
-CORE_FIELDS = ("PAD", "BOS", "EOS", "UNK")
-
-@dataclass
-class SpecialTokens:
-    """Special token identifiers and their values."""
-
-    PAD: int = 0
-    BOS: int = 1
-    EOS: int = 2
-    CLS: int = 3
-    SEP: int = 4
-    MARK: int = 5
-    UNK: int = 6
-    MASK: int = 7
-    INSTRUCTION: int = 8
-    END_INSTRUCTION: int = 9
-    SYSTEM: int = 10
-    END_SYSTEM: int = 11
-    USER: int = 12
-    END_USER: int = 13
-    AGENT: int = 14
-    END_AGENT: int = 15
-    QUESTION: int = 16
-    END_QUESTION: int = 17
-    ANSWER: int = 18
-    END_ANSWER: int = 19
-    TOKEN_OFFSET: int = 20
+from polyergalio.base_model import Serializable
 
 
 class Tokenizer(Serializable, ABC):
@@ -113,45 +61,14 @@ class SentencePieceTokenizer(Tokenizer):
         else:
             raise ValueError("give a model_path or a model_proto")
         self.model_path = model_path
+        self.model_proto = self.sp.serialized_model_proto()
         self.special_tokens = special_tokens or SpecialTokens()
         self._validate_special_tokens()
-
-    def get_config(self) -> dict:
-        return {"special_tokens": self.special_tokens}
-
-    def get_weights(self, for_serialize: bool = False) -> dict:
-        return {"model_proto": self.sp.serialized_model_proto()}
-
-    def set_weights(self, weights: dict) -> None:
-        pass
-
-    @classmethod
-    def rebuild(cls, config: dict, weights: dict) -> "SentencePieceTokenizer":
-        return cls(model_proto=weights["model_proto"], **config)
 
     def _validate_special_tokens(self) -> None:
         """Verify special token ids are within vocab bounds."""
         vocab_size = self.sp.get_piece_size()
-        max_special = max(
-            self.special_tokens.PAD,
-            self.special_tokens.BOS,
-            self.special_tokens.EOS,
-            self.special_tokens.CLS,
-            self.special_tokens.SEP,
-            self.special_tokens.MARK,
-            self.special_tokens.UNK,
-            self.special_tokens.MASK,
-            self.special_tokens.INSTRUCTION,
-            self.special_tokens.END_INSTRUCTION,
-            self.special_tokens.SYSTEM,
-            self.special_tokens.END_SYSTEM,
-            self.special_tokens.USER,
-            self.special_tokens.END_USER,
-            self.special_tokens.QUESTION,
-            self.special_tokens.END_QUESTION,
-            self.special_tokens.ANSWER,
-            self.special_tokens.END_ANSWER,
-        )
+        max_special = max(self.special_tokens.ids)
         if max_special >= vocab_size:
             raise ValueError(
                 f"Special token ids exceed vocab size. "
@@ -210,26 +127,7 @@ class SentencePieceTokenizer(Tokenizer):
 
     def _filter_special_tokens(self, ids: List[int]) -> List[int]:
         """Remove special token ids from sequence."""
-        special_ids = {
-            self.special_tokens.PAD,
-            self.special_tokens.BOS,
-            self.special_tokens.EOS,
-            self.special_tokens.CLS,
-            self.special_tokens.SEP,
-            self.special_tokens.MARK,
-            self.special_tokens.UNK,
-            self.special_tokens.MASK,
-            self.special_tokens.INSTRUCTION,
-            self.special_tokens.END_INSTRUCTION,
-            self.special_tokens.SYSTEM,
-            self.special_tokens.END_SYSTEM,
-            self.special_tokens.USER,
-            self.special_tokens.END_USER,
-            self.special_tokens.QUESTION,
-            self.special_tokens.END_QUESTION,
-            self.special_tokens.ANSWER,
-            self.special_tokens.END_ANSWER,
-        }
+        special_ids = self.special_tokens.ids
         return [tid for tid in ids if tid not in special_ids]
 
     def get_vocab_size(self) -> int:
@@ -245,26 +143,7 @@ class SentencePieceTokenizer(Tokenizer):
 
     def is_special_token(self, token_id: int) -> bool:
         """Check if token id is special."""
-        special_ids = {
-            self.special_tokens.PAD,
-            self.special_tokens.BOS,
-            self.special_tokens.EOS,
-            self.special_tokens.CLS,
-            self.special_tokens.SEP,
-            self.special_tokens.MARK,
-            self.special_tokens.UNK,
-            self.special_tokens.MASK,
-            self.special_tokens.INSTRUCTION,
-            self.special_tokens.END_INSTRUCTION,
-            self.special_tokens.SYSTEM,
-            self.special_tokens.END_SYSTEM,
-            self.special_tokens.USER,
-            self.special_tokens.END_USER,
-            self.special_tokens.QUESTION,
-            self.special_tokens.END_QUESTION,
-            self.special_tokens.ANSWER,
-            self.special_tokens.END_ANSWER,
-        }
+        special_ids = self.special_tokens.ids
         return token_id in special_ids
 
     def get_special_token_id(self, name: str) -> int:
@@ -901,7 +780,7 @@ def fit_tokenizer(
     Parameters
     ----------
     corpus : list of str
-        Text files or glob patterns to train on, one sample per line.
+        Training sentences, one sample each.
     model_prefix : str
         Output path prefix; produces `<model_prefix>.model` and `.vocab`.
     vocab_size : int, optional
@@ -920,8 +799,6 @@ def fit_tokenizer(
 
     Raises
     ------
-    FileNotFoundError
-        If no file matches `corpus_paths`.
     ValueError
         If the trained model's special token ids do not match
         `special_tokens` (see `verify_tokenizer_alignment`).

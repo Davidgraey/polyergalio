@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Optional
 
 import numpy as np
@@ -5,13 +7,12 @@ from numpy.typing import NDArray
 
 import polyergalio.models.activations as activations
 from polyergalio.models.activations import mod_relu, mod_relu_derivative
-from polyergalio.models.constants import EPSILON, GLOBAL_COMPLEX_DTYPE, GLOBAL_DTYPE
-from polyergalio.models.layers.basal_layers import Layer
-from polyergalio.models.weight_initialization import get_weight_init
+from polyergalio.models.layers.basic_layers import RNG, Layer
 from polyergalio.models.layers.wavelet_layers import WaveletRefinementModule
+from polyergalio.models.weight_initialization import get_weight_init
 
 # LayerNorm epsilon for the pooled query within the Head
-DESCRIPTOR_EPS = 0.1
+DESCRIPTOR_EPS = 1e-8
 
 # -------------    adjoints of the real FFT pair    ----------------
 def rfft_adjoint(grad_freq: NDArray, sequence_length: int, axis: int = 1) -> NDArray:
@@ -20,20 +21,19 @@ def rfft_adjoint(grad_freq: NDArray, sequence_length: int, axis: int = 1) -> NDA
     pad_width[axis] = (0, sequence_length - frequencies)
     padded = np.pad(grad_freq, pad_width)
     out = np.fft.ifft(padded, n=sequence_length, axis=axis) * sequence_length
-    return out.real.astype(GLOBAL_DTYPE)
+    return out.real
 
 
-def irfft_adjoint(
-    grad_time: NDArray,
-    sequence_length: int,
-    axis: int = 1,
-) -> NDArray:
+def irfft_adjoint(grad_time: NDArray,
+                  sequence_length: int,
+                  axis: int = 1,
+                  ) -> NDArray:
     out = np.fft.rfft(grad_time, n=sequence_length, axis=axis) / sequence_length
     interior = [slice(None)] * out.ndim
     interior[axis] = slice(1, -1 if sequence_length % 2 == 0 else None)
     out[tuple(interior)] *= 2
 
-    return out.astype(GLOBAL_COMPLEX_DTYPE)
+    return out
 
 
 # -------------head layout funcs----------------------------------
@@ -63,6 +63,7 @@ def shift_frequencies(array: NDArray, offset: int) -> NDArray:
         out[...] = array
     return out
 
+
 class DenseHead(Layer):
     """
     Batched per-head dense layer: FullyConnectedLayer with a head axis. Each head owns an independent
@@ -73,12 +74,14 @@ class DenseHead(Layer):
     Input shape: (..., num_heads * ni)
     Output shape: (..., num_heads * no)
     """
+    parameter_names = ("weights", "bias")
+    cache_names = ("input", "z", "output")
 
     def __init__(
         self,
         num_heads: int,
-        ni: int,
-        no: int,
+        input_dimension: int,
+        output_dimension: int,
         activation_type: str = "linear",
         initialization: Optional[str] = None,
         initialization_kwargs: Optional[dict] = None,
@@ -87,27 +90,26 @@ class DenseHead(Layer):
         Parameters
         ----------
         num_heads : independent maps, one per head
-        ni, no : input and output width of each head
+        input_dimension, output_dimension : input and output width of each head
         activation_type : activation applied per head, e.g. softmax normalises within a head
         initialization : any WEIGHT_INIT_DISPATCHER name, the activation's rule if None
         initialization_kwargs : keyword arguments bound to the initializer
         """
         super().__init__()
         self.num_heads = num_heads
-        self.ni = ni
-        self.no = no
+        self.input_dimension = input_dimension
+        self.output_dimension = output_dimension
+
         self.activation_type = activation_type
         self.initialization = initialization
         self.initialization_kwargs = dict(initialization_kwargs or {})
         self.activation_function = activations.activation_dictionary[activation_type]
         self.activation_derivative = activations.derivative_dictionary[activation_type]
-        self.declare_shapes(inputs=((num_heads * ni,),), outputs=((num_heads * no,),))
+        self.declare_shapes(inputs=((num_heads * input_dimension,),), outputs=((num_heads * output_dimension,),))
 
         initializer = get_weight_init(initialization or activation_type, **self.initialization_kwargs)
-        self.weights = np.stack([initializer(self.RNG, ni=ni, no=no) for _ in range(num_heads)]).astype(GLOBAL_DTYPE)
-        self.bias = np.zeros((num_heads, no), dtype=GLOBAL_DTYPE)
-
-        self.purge()
+        self.weights = np.stack([initializer(RNG, ni=input_dimension, no=output_dimension) for _ in range(num_heads)])
+        self.bias = np.zeros((num_heads, output_dimension))
         self.zero_gradients()
 
     def pre_activation(self, input_data: NDArray) -> NDArray:
@@ -126,46 +128,15 @@ class DenseHead(Layer):
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         delta = self.activation_derivative(self.output, self.z, split_heads(incoming_gradient, self.num_heads))
-        flat_input = split_heads(self.input, self.num_heads).reshape(-1, self.num_heads, self.ni)
-        flat_delta = delta.reshape(-1, self.num_heads, self.no)
+        flat_input = split_heads(self.input, self.num_heads).reshape(-1, self.num_heads, self.input_dimension)
+        flat_delta = delta.reshape(-1, self.num_heads, self.output_dimension)
 
         self.gradient_weights = np.einsum("nhi,nho->hio", flat_input, flat_delta, optimize=True)
         self.gradient_bias = flat_delta.sum(axis=0)
         return merge_heads(np.einsum("...ho,hio->...hi", delta, self.weights, optimize=True))
 
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"weights": self.weights, "bias": self.bias}
-        return self.weights, self.bias
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        self.weights = np.asarray(weights["weights"], dtype=GLOBAL_DTYPE)
-        self.bias = np.asarray(weights["bias"], dtype=GLOBAL_DTYPE)
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {"gradient_weights": self.gradient_weights, "gradient_bias": self.gradient_bias}
-
-    def update_weights(self, gradient_weights: NDArray, gradient_bias: NDArray) -> None:
-        self.weights -= gradient_weights
-        self.bias -= gradient_bias
-
-    def zero_gradients(self) -> None:
-        self.gradient_weights = np.zeros_like(self.weights)
-        self.gradient_bias = np.zeros_like(self.bias)
-
-    def purge(self) -> None:
-        self.input = None
-        self.z = None
-        self.output = None
-
-    @property
-    def num_parameters(self) -> int:
-        return self.weights.size + self.bias.size
-
     def __str__(self):
-        return f"DenseHead, {self.num_heads} heads of {self.ni} -> {self.no}, {self.activation_type}"
+        return f"DenseHead, {self.num_heads} heads of {self.input_dimension} -> {self.output_dimension}, {self.activation_type}"
 
     def __repr__(self):
         return self.__str__()
@@ -185,7 +156,7 @@ class HeadProjection(DenseHead):
     def __init__(
         self,
         num_heads: int,
-        head_dim: int,
+        head_dimension: int,
         initialization: str = "lecun",
         initialization_kwargs: Optional[dict] = None,
     ):
@@ -193,23 +164,23 @@ class HeadProjection(DenseHead):
         Parameters
         ----------
         num_heads : independent maps, one per head
-        head_dim : width of each head's slice of the hidden axis
+        head_dimension : width of each head's slice of the hidden axis
         initialization : any WEIGHT_INIT_DISPATCHER name, drawn independently per head
         initialization_kwargs : keyword arguments bound to the initializer
         """
         super().__init__(
             num_heads,
-            head_dim,
-            head_dim,
+            head_dimension,
+            head_dimension,
             activation_type="linear",
             initialization=initialization,
             initialization_kwargs=initialization_kwargs,
         )
-        self.head_dim = head_dim
-        self.hidden_dim = num_heads * head_dim
+        self.head_dimension = head_dimension
+        self.hidden_dimension = num_heads * head_dimension
 
     def __str__(self):
-        return f"HeadProjection, {self.num_heads} heads of {self.head_dim} -> {self.head_dim}"
+        return f"HeadProjection, {self.num_heads} heads of {self.head_dimension} -> {self.head_dimension}"
 
 
 class HeadGate(Layer):
@@ -231,16 +202,16 @@ class HeadGate(Layer):
     Input shape: (batch, num_heads * head_dim) pooled query
     Output shape: (batch, num_heads, num_frequencies) complex gate
     """
+    cache_names = ("std", "x_norm", "normed", "gate_raw", "gate_pre_activation", "gate")
 
     def __init__(
         self,
         num_heads: int,
-        head_dim: int,
+        head_dimension: int,
         num_frequencies: int,
-        gate_hidden: int,
+        gate_dimension: int,
         modrelu_bias: float = -0.1,
         band_radius: int = 0,
-        eps: float = DESCRIPTOR_EPS,
         weight_scale: float = 0.1,
         hidden_initialization: str = "relu",
         output_initialization: str = "lecun",
@@ -248,12 +219,11 @@ class HeadGate(Layer):
         """
         Parameters
         ----------
-        num_heads, head_dim : head layout of the pooled query
+        num_heads, head_dimension : head layout of the pooled query
         num_frequencies : gate entries per head
-        gate_hidden : width of each head's hidden layer
+        gate_dimension : width of each head's hidden layer
         modrelu_bias : starting modReLU bias, learned per head and frequency
         band_radius : radius r of the Toeplitz band update, 2r+1 complex taps per head; 0 disables it
-        eps : LayerNorm epsilon, see DESCRIPTOR_EPS
         weight_scale : shrink on W2 at initialisation
         hidden_initialization : WEIGHT_INIT_DISPATCHER name for W1
         output_initialization : WEIGHT_INIT_DISPATCHER name for W2, before weight_scale
@@ -264,28 +234,32 @@ class HeadGate(Layer):
         )
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = head_dim
+        self.head_dimension = head_dimension
         self.num_frequencies = num_frequencies
-        self.gate_hidden = gate_hidden
+        self.gate_dimension = gate_dimension
+
+        self.DESCRIPTOR_EPS = DESCRIPTOR_EPS
+
         self.modrelu_bias = modrelu_bias
         self.band_radius = band_radius
-        self.eps = eps
         self.weight_scale = weight_scale
+
         self.hidden_initialization = hidden_initialization
         self.output_initialization = output_initialization
         self.declare_shapes(
-            inputs=((num_heads * head_dim,),), outputs=((num_heads, num_frequencies),)
+            inputs=((num_heads * head_dimension,),), outputs=((num_heads, num_frequencies),)
         )
 
-        self.activation_bias = np.full((num_heads, num_frequencies), modrelu_bias, dtype=GLOBAL_DTYPE)
-        self.gamma = np.ones((num_heads, head_dim), dtype=GLOBAL_DTYPE)
-        self.beta = np.zeros((num_heads, head_dim), dtype=GLOBAL_DTYPE)
+        self.activation_bias = np.full((num_heads, num_frequencies), modrelu_bias)
 
+        # building parameters --------
+        self.gamma = np.ones((num_heads, head_dimension))
+        self.beta = np.zeros((num_heads, head_dimension))
         self.hidden_layer = DenseHead(
-            num_heads, head_dim, gate_hidden, activation_type="relu", initialization=hidden_initialization
+            num_heads, head_dimension, gate_dimension, activation_type="relu", initialization=hidden_initialization
         )
         self.output_layer = DenseHead(
-            num_heads, gate_hidden, 2 * num_frequencies, activation_type="linear", initialization=output_initialization
+            num_heads, gate_dimension, 2 * num_frequencies, activation_type="linear", initialization=output_initialization
         )
         self.output_layer.weights *= weight_scale
         self.output_layer.bias[:, :num_frequencies] = 1.0 - self.activation_bias
@@ -294,21 +268,12 @@ class HeadGate(Layer):
         # every tap acts on all num_frequencies bins at once, so its gradient grows with sequence
         # length; scaling taps by 1/sqrt(num_frequencies) keeps their step size length-independent
         self.band_scale = 1.0 / np.sqrt(num_frequencies)
+        names = ("gamma", "beta", "activation_bias", "hidden_layer", "output_layer")
         if band_radius:
-            self.band_taps = np.zeros((num_heads, len(self.band_offsets)), dtype=GLOBAL_COMPLEX_DTYPE)
-
-        self.purge()
+            self.band_taps = np.zeros((num_heads, len(self.band_offsets)), dtype=complex)
+            names += ("band_taps",)
+        self.parameter_names = names
         self.zero_gradients()
-
-    @property
-    def parameter_names(self) -> tuple[str, ...]:
-        """parameters held directly, outside the MLP sublayers"""
-        names = ("gamma", "beta", "activation_bias")
-        return names + ("band_taps",) if self.band_radius else names
-
-    def owned_layers(self) -> dict[str, Layer]:
-        """sublayers by the key their weights and gradients are stored under"""
-        return {"hidden_layer": self.hidden_layer, "output_layer": self.output_layer}
 
     def band_update(self, gate: NDArray) -> NDArray:
         """gate plus its band-tap mix of neighbouring frequencies"""
@@ -329,7 +294,7 @@ class HeadGate(Layer):
         """
         heads = split_heads(pooled_query, self.num_heads)
         centred = heads - heads.mean(axis=-1, keepdims=True)
-        self.std = np.sqrt(np.mean(centred ** 2, axis=-1, keepdims=True) + self.eps)
+        self.std = np.sqrt(np.mean(centred ** 2, axis=-1, keepdims=True) + self.DESCRIPTOR_EPS)
         self.x_norm = centred / self.std
         self.normed = self.gamma * self.x_norm + self.beta
 
@@ -337,7 +302,7 @@ class HeadGate(Layer):
         projection = split_heads(self.output_layer.forward(hidden), self.num_heads)
 
         real, imaginary = np.split(projection, 2, axis=-1)
-        self.gate_raw = (real + 1j * imaginary).astype(GLOBAL_COMPLEX_DTYPE)
+        self.gate_raw = real + 1j * imaginary
         self.gate_pre_activation = self.band_update(self.gate_raw) if self.band_radius else self.gate_raw
         self.gate = mod_relu(self.gate_pre_activation, self.activation_bias)
         return self.gate
@@ -393,62 +358,10 @@ class HeadGate(Layer):
         ) / self.std
         return merge_heads(heads_gradient)
 
-    def get_weights(self, for_serialize: bool = False):
-        weights = {name: getattr(self, name) for name in self.parameter_names}
-        weights.update({name: layer.get_weights(for_serialize=for_serialize) for name, layer in self.owned_layers().items()})
-        return weights if for_serialize else tuple(weights.values())
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        for name in self.parameter_names:
-            if name in weights:
-                dtype = GLOBAL_COMPLEX_DTYPE if name == "band_taps" else GLOBAL_DTYPE
-                setattr(self, name, np.asarray(weights[name], dtype=dtype))
-        for name, layer in self.owned_layers().items():
-            if name in weights:
-                layer.set_weights(weights[name])
-
-    def get_gradients(self) -> dict:
-        gradients = {f"gradient_{name}": getattr(self, f"gradient_{name}") for name in self.parameter_names}
-        gradients.update({name: layer.get_gradients() for name, layer in self.owned_layers().items()})
-        return gradients
-
-    def update_weights(self, **gradients) -> None:
-        for name in self.parameter_names:
-            if gradients.get(f"gradient_{name}") is not None:
-                setattr(self, name, getattr(self, name) - gradients[f"gradient_{name}"])
-        for name, layer in self.owned_layers().items():
-            if gradients.get(name):
-                layer.update_weights(**gradients[name])
-
-    def zero_gradients(self) -> None:
-        for name in self.parameter_names:
-            setattr(self, f"gradient_{name}", np.zeros_like(getattr(self, name)))
-        for layer in self.owned_layers().values():
-            layer.zero_gradients()
-
-    def purge(self) -> None:
-        self.std = None
-        self.x_norm = None
-        self.normed = None
-        self.gate_raw = None
-        self.gate_pre_activation = None
-        self.gate = None
-        for layer in self.owned_layers().values():
-            layer.purge()
-
-    @property
-    def num_parameters(self) -> int:
-        total = sum(getattr(self, name).size for name in self.parameter_names)
-        total += sum(layer.num_parameters for layer in self.owned_layers().values())
-        # band taps are complex, two parameters each
-        return total + self.band_taps.size if self.band_radius else total
-
     def __str__(self):
         band = f", band radius {self.band_radius}" if self.band_radius else ""
         return (
-            f"HeadGate, {self.num_heads} heads of {self.head_dim} -> {self.gate_hidden} -> "
+            f"HeadGate, {self.num_heads} heads of {self.head_dimension} -> {self.gate_dimension} -> "
             f"{self.num_frequencies} complex frequencies{band}"
         )
 
@@ -467,11 +380,12 @@ class PersistentMemory(Layer):
     """
 
     preserves_shape = False
+    parameter_names = ("memory",)
 
     def __init__(
         self,
         memory_tokens: int,
-        hidden_dim: int,
+        hidden_dimension: int,
         initialization: str = "truncated_normal",
         initialization_kwargs: Optional[dict] = None,
     ):
@@ -479,21 +393,21 @@ class PersistentMemory(Layer):
         Parameters
         ----------
         memory_tokens : learned slots, zero disables the bank
-        hidden_dim : channel width of each slot
+        hidden_dimension : channel width of each slot
         initialization : any WEIGHT_INIT_DISPATCHER name; slots are token-like, so fan-in is not the slot count
         initialization_kwargs : keyword arguments bound to the initializer
         """
         super().__init__()
         assert memory_tokens >= 0, "memory_tokens must be zero or positive"
         self.memory_tokens = memory_tokens
-        self.hidden_dim = hidden_dim
+        self.hidden_dimension = hidden_dimension
         self.initialization = initialization
         self.initialization_kwargs = dict(initialization_kwargs or {})
 
-        self.declare_shapes(inputs=(), outputs=((self.hidden_dim,),))
+        self.declare_shapes(inputs=(), outputs=((self.hidden_dimension,),))
 
         initializer = get_weight_init(initialization, **self.initialization_kwargs)
-        self.memory = initializer(self.RNG, ni=memory_tokens, no=hidden_dim)
+        self.memory = initializer(RNG, ni=memory_tokens, no=hidden_dimension)
         self.zero_gradients()
 
     def get_memory(self) -> NDArray:
@@ -504,37 +418,6 @@ class PersistentMemory(Layer):
 
     def backward(self, incoming_gradient: NDArray) -> None:
         self.gradient_memory += incoming_gradient
-
-    def update_weights(self, gradient_memory: NDArray) -> None:
-        self.memory -= gradient_memory
-
-    def purge(self) -> None:
-        self._stale = True
-
-    def zero_gradients(self) -> None:
-        self.gradient_memory = np.zeros_like(self.memory)
-
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"memory": self.memory}
-        return self.memory
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            self.memory = np.asarray(
-                weights["memory"],
-                dtype=GLOBAL_DTYPE,
-            )
-            self._stale = True
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        if self.memory_tokens == 0:
-            return {}
-        return {"gradient_memory": self.gradient_memory}
-
-    @property
-    def num_parameters(self) -> int:
-        return self.memory.size
 
 
 class PrefixFFTCache:
@@ -548,46 +431,34 @@ class PrefixFFTCache:
     def __init__(
         self,
         sequence_length: int,
-        hidden_dim: int,
+        hidden_dimension: int,
         batch_size: int,
         memory_tokens: int = 0,
     ):
         self.sequence_length = int(sequence_length)
         self.memory_tokens = int(memory_tokens)
         self.max_sequence = self.memory_tokens + self.sequence_length
-        self.hidden_dim = int(hidden_dim)
+        self.hidden_dimension = int(hidden_dimension)
         self.batch_size = int(batch_size)
         self.n_freq = self.max_sequence // 2 + 1
 
-        self.prefix_fft = np.zeros(
-            shape=(self.batch_size, self.n_freq, self.hidden_dim),
-            dtype=GLOBAL_COMPLEX_DTYPE,
-        )
-        self.value_buffer = np.zeros(
-            shape=(self.batch_size, self.max_sequence, self.hidden_dim),
-            dtype=GLOBAL_DTYPE,
-        )
-        self.query_buffer = np.zeros(
-            shape=(self.batch_size, self.max_sequence, self.hidden_dim),
-            dtype=GLOBAL_DTYPE,
-        )
+        # constructing sublayers and parameters
+        self.prefix_fft = np.zeros((self.batch_size, self.n_freq, self.hidden_dimension), dtype=complex)
+        self.value_buffer = np.zeros((self.batch_size, self.max_sequence, self.hidden_dimension))
+        self.query_buffer = np.zeros((self.batch_size, self.max_sequence, self.hidden_dimension))
         self.mask_buffer = np.zeros((self.batch_size, self.max_sequence), dtype=bool)
-        self.sum_query = np.zeros(
-            (self.batch_size, self.hidden_dim), dtype=GLOBAL_DTYPE
-        )
+        self.sum_query = np.zeros((self.batch_size, self.hidden_dimension))
 
         # absolute step counter for the *sliding* part alone. memory slots are written once (in prefill / set_memory)
         # and not counted
         self.position = 0
         self.length = np.zeros(self.batch_size)
-        self.memory_values = np.zeros((self.memory_tokens, self.hidden_dim), dtype=GLOBAL_DTYPE)
-        self.memory_query_sum = np.zeros(self.hidden_dim, dtype=GLOBAL_DTYPE)
+        self.memory_values = np.zeros((self.memory_tokens, self.hidden_dimension))
+        self.memory_query_sum = np.zeros(self.hidden_dimension)
 
-        k = np.arange(self.n_freq, dtype=GLOBAL_DTYPE)
-        t = np.arange(self.max_sequence, dtype=GLOBAL_DTYPE)
-        self._twiddle = np.exp(-2j * np.pi * np.outer(t, k) / self.max_sequence).astype(
-            GLOBAL_COMPLEX_DTYPE
-        )
+        k = np.arange(self.n_freq)
+        t = np.arange(self.max_sequence)
+        self._twiddle = np.exp(-2j * np.pi * np.outer(t, k) / self.max_sequence)
 
     def reset(self):
         """clear the sliding window, keeping the persistent memory set by set_memory"""
@@ -614,18 +485,16 @@ class PrefixFFTCache:
         """
         if self.memory_tokens == 0:
             return
-        expected = (self.memory_tokens, self.hidden_dim)
+        expected = (self.memory_tokens, self.hidden_dimension)
         if memory_values.shape != expected or memory_queries.shape != expected:
             raise ValueError(
                 f"expected memory shape {expected}, got {memory_values.shape} and {memory_queries.shape}"
             )
-        self.memory_values = memory_values.astype(GLOBAL_DTYPE)
-        self.memory_query_sum = memory_queries.sum(axis=0).astype(GLOBAL_DTYPE)
+        self.memory_values = memory_values.copy()
+        self.memory_query_sum = memory_queries.sum(axis=0)
         self.reset()
 
-    def prefill(
-        self, query: np.ndarray, value: np.ndarray, mask: Optional[np.ndarray] = None
-    ):
+    def prefill(self, query: np.ndarray, value: np.ndarray, mask: Optional[np.ndarray] = None):
         """
         One-shot cache initialisation
 
@@ -635,8 +504,8 @@ class PrefixFFTCache:
         single RFFT seeds the full cache.
         """
         batch, length, hidden_dim = value.shape
-        if hidden_dim != self.hidden_dim:
-            raise ValueError(f"expected hidden_dim={self.hidden_dim}, got {hidden_dim}")
+        if hidden_dim != self.hidden_dimension:
+            raise ValueError(f"expected hidden_dim={self.hidden_dimension}, got {hidden_dim}")
         if length > self.sequence_length:
             raise ValueError(
                 f"prompt length {length} exceeds window={self.sequence_length}"
@@ -645,13 +514,12 @@ class PrefixFFTCache:
             raise ValueError(f"cache batch_size={self.batch_size}, got {batch}")
 
         if mask is None:
-            mask = np.ones((batch, length), dtype=GLOBAL_DTYPE)
-        mask = mask.astype(GLOBAL_DTYPE)
+            mask = np.ones((batch, length))
 
         self.reset()
 
-        query_valid = (query * mask[..., None]).astype(GLOBAL_DTYPE)
-        value_valid = (value * mask[..., None]).astype(GLOBAL_DTYPE)
+        query_valid = query * mask[..., None]
+        value_valid = value * mask[..., None]
 
         start = self.memory_tokens
         self.value_buffer[:, start : start + length] = value_valid
@@ -660,7 +528,7 @@ class PrefixFFTCache:
 
         self.prefix_fft[...] = np.fft.rfft(
             self.value_buffer, n=self.max_sequence, axis=1
-        ).astype(GLOBAL_COMPLEX_DTYPE)
+        )
 
         self.sum_query[...] = self.memory_query_sum[None] + query_valid.sum(axis=1)
         self.length[...] = mask.sum(axis=1).astype(np.int32)
@@ -688,8 +556,8 @@ class PrefixFFTCache:
         t = self.position
         slot = self.memory_tokens + (t % self.sequence_length)
 
-        query_t = np.where(valid[:, None], query_t, 0.0).astype(GLOBAL_DTYPE)
-        value_t = np.where(valid[:, None], value_t, 0.0).astype(GLOBAL_DTYPE)
+        query_t = np.where(valid[:, None], query_t, 0.0)
+        value_t = np.where(valid[:, None], value_t, 0.0)
 
         if t >= self.sequence_length:
             old_slot = self.memory_tokens + (
@@ -734,7 +602,7 @@ class PrefixFFTCache:
         see `read_slot` / `chronological_order` to extract a specific token or the whole window in seqence
         """
         spectrum = self.prefix_fft if spectrum is None else spectrum
-        return np.fft.irfft(spectrum * gate, n=self.max_sequence, axis=1).astype(GLOBAL_DTYPE)
+        return np.fft.irfft(spectrum * gate, n=self.max_sequence, axis=1)
 
     def read_position(self, gate: np.ndarray, slot: int, spectrum: Optional[np.ndarray] = None) -> np.ndarray:
         """
@@ -747,7 +615,7 @@ class PrefixFFTCache:
         if self.max_sequence % 2 == 0:
             weights[-1] /= 2
         spectrum = self.prefix_fft if spectrum is None else spectrum
-        return np.real(np.einsum("bkd,k->bd", spectrum * gate, weights)).astype(GLOBAL_DTYPE)
+        return np.real(np.einsum("bkd,k->bd", spectrum * gate, weights))
 
     def chronological_spectrum(self) -> np.ndarray:
         """
@@ -788,104 +656,100 @@ class SpectreAttention(Layer):
 
     registry_name = "SPECTREAttention"
     preserves_shape = True
+    cache_names = (
+        "input", "mask", "counts", "total_counts", "combined_length", "seq_mu",
+        "gate", "descriptor", "value_transform", "output",
+    )
 
     def __init__(
         self,
         sequence_length: int,
-        hidden_dim: int,
+        hidden_dimension: int,
         num_heads: int = 1,
         band_radius: int = 0,
         memory_tokens: int = 0,
         causal_decode: bool = False,
         modrelu_bias: float = -0.1,
-        use_wrm: bool = False,
+        use_wrm: bool = True,
         use_positional_phase: bool = True,
-        gate_hidden: Optional[int] = None,
+        gate_dimension: Optional[int] = None,
     ):
         """
         Parameters
         ----------
         sequence_length : tokens per sample, the axis the FFT runs over
-        hidden_dim : channel width of the input
-        num_heads : gates learned in parallel, each over its own slice of the
-            channel axis. 1 recovers the single-head layer exactly.
-        band_radius : radius r of the optional Toeplitz band update on the
-            gate. 0 disables it. r > 0 adds 2r+1 complex taps per head.
-        memory_tokens : size of an optional learned, persistent, never-evicted
-            context bank (paper Sec 3.4). 0 disables it.
-        gate_hidden : width of each head's gate MLP hidden layer, head_dim if None
+        hidden_dimension : channel width of the input
+        num_heads : gates learned in parallel, each over its own slice of the channel axis.
+            1 recovers the single-head layer exactly.
+        band_radius : radius r of the optional Toeplitz band update on the gate.
+            0 disables it. r > 0 adds 2r+1 complex taps per head.
+        memory_tokens : size of an optional learned, persistent, never-evicted context bank
+            0 disables it.
+        gate_dimension : width of each head's gate MLP hidden layer, head_dim if None
+        use_positional_phase: bool - used in decoding process to appply positional influence
+        gate_dimension: Optional int - for gate's hidden dimension (if different from hidden_dimension)
         """
         assert memory_tokens >= 0, "memory_tokens must be zero or positive"
         assert num_heads >= 1, f"num_heads must be at least 1, got {num_heads}"
-        assert hidden_dim % num_heads == 0, (
-            f"num_heads {num_heads} must divide hidden_dim {hidden_dim}. Heads "
+        assert hidden_dimension % num_heads == 0, (
+            f"num_heads {num_heads} must divide hidden_dim {hidden_dimension}. Heads "
             "partition the channel axis, so a remainder would leave channels "
             "ungated."
         )
         super().__init__()
 
         self.sequence_length = sequence_length
-        self.hidden_dim: int = hidden_dim
+        self.hidden_dimension: int = hidden_dimension
         self.num_heads: int = num_heads
-        self.head_dim: int = hidden_dim // num_heads
+        self.head_dimension: int = hidden_dimension // num_heads
         self.band_radius = band_radius
         self.memory_tokens: int = memory_tokens
         self.causal_decode: bool = causal_decode
         self.modrelu_bias: float = modrelu_bias
         self.use_wrm = use_wrm
         self.use_positional_phase: bool = use_positional_phase
-        self.gate_hidden = gate_hidden
-
-        self.training_now: bool = True
+        self.gate_dimension = gate_dimension
 
         # sequence axis is pinned, not wildcarded: fft_length / num_frequencies
         # are sized off sequence_length at construction time, so a mismatched
         # sequence length here is a real, catchable error, not a free axis.
         self.declare_shapes(
-            inputs=((self.sequence_length, self.hidden_dim),),
-            outputs=((self.sequence_length, self.hidden_dim),),
+            inputs=((self.sequence_length, self.hidden_dimension),),
+            outputs=((self.sequence_length, self.hidden_dimension),),
         )
 
         if self.memory_tokens > 0:
-            self.memory = PersistentMemory(memory_tokens=self.memory_tokens, hidden_dim=self.hidden_dim)
+            self.memory = PersistentMemory(memory_tokens=self.memory_tokens, hidden_dimension=self.hidden_dimension)
 
         self.fft_length = self.sequence_length + self.memory_tokens
         self.num_frequencies = self.fft_length // 2 + 1
 
-        self.query_projection = HeadProjection(num_heads, self.head_dim)
-        self.value_projection = HeadProjection(num_heads, self.head_dim)
+        self.query_projection = HeadProjection(num_heads, self.head_dimension)
+        self.value_projection = HeadProjection(num_heads, self.head_dimension)
         self.head_gate = HeadGate(
             num_heads=num_heads,
-            head_dim=self.head_dim,
+            head_dimension=self.head_dimension,
             num_frequencies=self.num_frequencies,
-            gate_hidden=gate_hidden or self.head_dim,
+            gate_dimension=gate_dimension or self.head_dimension,
             modrelu_bias=modrelu_bias,
             band_radius=band_radius,
         )
 
         if use_wrm:
             self.wrm = WaveletRefinementModule(
-                hidden_dim=hidden_dim,
+                input_dimension=hidden_dimension,
                 sequence_length=self.sequence_length,
                 on_rate=0.1,
                 skip_threshold=0.5,
             )
 
-        self.purge()
+        names = ("query_projection", "value_projection", "head_gate")
+        if memory_tokens:
+            names += ("memory",)
+        if use_wrm:
+            names += ("wrm",)
+        self.parameter_names = names
         self.zero_gradients()
-
-    def owned_layers(self) -> dict[str, Layer]:
-        """sublayers by the key their weights and gradients are stored under"""
-        owned = {
-            "query_projection": self.query_projection,
-            "value_projection": self.value_projection,
-            "head_gate": self.head_gate,
-        }
-        if self.memory_tokens:
-            owned["persistent_memory"] = self.memory
-        if self.use_wrm:
-            owned["wrm"] = self.wrm
-        return owned
 
     def forward(
         self,
@@ -896,23 +760,17 @@ class SpectreAttention(Layer):
         training_now = self.training if training_now is None else training_now
         assert input_data.ndim == 3
         assert input_data.shape[1] == self.sequence_length
-        assert input_data.shape[2] == self.hidden_dim
+        assert input_data.shape[2] == self.hidden_dimension
 
-        self.input = input_data
-        self.training_now = training_now
         batch = input_data.shape[0]
 
-        self.mask = (
-            mask.astype(GLOBAL_DTYPE)
-            if mask is not None
-            else np.ones(input_data.shape[:2], dtype=GLOBAL_DTYPE)
-        )
+        self.mask = mask if mask is not None else np.ones(input_data.shape[:2])
         self.counts = np.maximum(self.mask.sum(axis=1, keepdims=True), 1.0)
         mask_column = self.mask[..., None]
 
         if self.memory_tokens:
             memory = self.memory.get_memory()
-            memory_batch = np.broadcast_to(memory[None, :, :], (batch, self.memory_tokens, self.hidden_dim))
+            memory_batch = np.broadcast_to(memory[None, :, :], (batch, self.memory_tokens, self.hidden_dimension))
             # the trainable memory tokens are concatenated ahead of the input; backward splits the
             # gradient back out to the memory bank and the input
             combined = np.concatenate([memory_batch, input_data], axis=1)
@@ -942,7 +800,7 @@ class SpectreAttention(Layer):
         self.output = output_all[:, memory_tokens:]
 
         if self.use_wrm:
-            self.output = self.wrm.forward(self.output, self.descriptor, training_now=self.training_now)
+            self.output = self.wrm.forward(self.output, self.descriptor, training_now=training_now)
         return self.output
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
@@ -954,7 +812,7 @@ class SpectreAttention(Layer):
 
         # memory positions produce no output, so their slots receive no gradient
         full_gradient = np.zeros(
-            (incoming_gradient.shape[0], self.combined_length, self.hidden_dim), dtype=incoming_gradient.dtype
+            (incoming_gradient.shape[0], self.combined_length, self.hidden_dimension), dtype=incoming_gradient.dtype
         )
         full_gradient[:, memory_tokens:] = incoming_gradient
 
@@ -972,60 +830,19 @@ class SpectreAttention(Layer):
         value_gradient = rfft_adjoint(transform_gradient, self.combined_length, axis=1)
         value_gradient[:, memory_tokens:] *= mask_column
 
-        input_gradient = self.query_projection.backward(query_gradient.astype(GLOBAL_DTYPE)) + (
-            self.value_projection.backward(value_gradient.astype(GLOBAL_DTYPE))
+        input_gradient = self.query_projection.backward(query_gradient) + (
+            self.value_projection.backward(value_gradient)
         )
         if memory_tokens:
             self.memory.backward(input_gradient[:, :memory_tokens].sum(axis=0))
-        return input_gradient[:, memory_tokens:].real.astype(GLOBAL_DTYPE)
-
-    def get_weights(self, for_serialize: bool = False) -> tuple | dict:
-        weights = {name: layer.get_weights(for_serialize=for_serialize) for name, layer in self.owned_layers().items()}
-        return weights if for_serialize else tuple(weights.values())
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is None:
-            return
-        for name, layer in self.owned_layers().items():
-            if name in weights:
-                layer.set_weights(weights[name])
-
-    def get_gradients(self) -> dict[str, dict]:
-        return {name: layer.get_gradients() for name, layer in self.owned_layers().items()}
-
-    def update_weights(self, **gradients: dict) -> None:
-        for name, layer in self.owned_layers().items():
-            if gradients.get(name):
-                layer.update_weights(**gradients[name])
-
-    def zero_gradients(self) -> None:
-        for layer in self.owned_layers().values():
-            layer.zero_gradients()
-
-    def purge(self) -> None:
-        self.input = None
-        self.mask = None
-        self.counts = None
-        self.total_counts = None
-        self.combined_length = None
-        self.seq_mu = None
-        self.gate = None
-        self.descriptor = None
-        self.value_transform = None
-        self.output = None
-        for layer in self.owned_layers().values():
-            layer.purge()
-
-    @property
-    def num_parameters(self) -> int:
-        return sum(layer.num_parameters for layer in self.owned_layers().values())
+        return input_gradient[:, memory_tokens:].real
 
     def __str__(self):
         band = f", band radius {self.band_radius}" if self.band_radius else ""
         memory = f", {self.memory_tokens} memory slots" if self.memory_tokens else ""
         return (
             f"SPECTRE mixer, sequence {self.sequence_length}, "
-            f"hidden {self.hidden_dim}, {self.num_heads} heads{band}{memory}"
+            f"hidden {self.hidden_dimension}, {self.num_heads} heads{band}{memory}"
         )
 
     def __repr__(self):
@@ -1067,11 +884,12 @@ class SpectreDecoderAttention(SpectreAttention):
     """
 
     registry_name = "SPECTREDecoderAttention"
+    cache_names = ("anchors", "chunk_counts", "filter_transforms")
 
     def __init__(
         self,
         sequence_length: int,
-        hidden_dim: int,
+        hidden_dimension: int,
         num_heads: int = 1,
         band_radius: int = 0,
         memory_tokens: int = 0,
@@ -1079,7 +897,7 @@ class SpectreDecoderAttention(SpectreAttention):
         modrelu_bias: float = -0.1,
         use_wrm: bool = False,
         use_positional_phase: bool = True,
-        gate_hidden: Optional[int] = None,
+        gate_dimension: Optional[int] = None,
         chunk_size: int = 1,
     ):
         """
@@ -1096,7 +914,7 @@ class SpectreDecoderAttention(SpectreAttention):
         )
         super().__init__(
             sequence_length=sequence_length,
-            hidden_dim=hidden_dim,
+            hidden_dimension=hidden_dimension,
             num_heads=num_heads,
             band_radius=band_radius,
             memory_tokens=memory_tokens,
@@ -1104,7 +922,7 @@ class SpectreDecoderAttention(SpectreAttention):
             modrelu_bias=modrelu_bias,
             use_wrm=use_wrm,
             use_positional_phase=use_positional_phase,
-            gate_hidden=gate_hidden,
+            gate_dimension=gate_dimension,
         )
         self.chunk_size = chunk_size
         self.cache: Optional[PrefixFFTCache] = None
@@ -1130,17 +948,14 @@ class SpectreDecoderAttention(SpectreAttention):
         """
         assert input_data.ndim == 3
         batch, length, _ = input_data.shape
-        assert length == self.sequence_length and input_data.shape[2] == self.hidden_dim
+        assert length == self.sequence_length and input_data.shape[2] == self.hidden_dimension
         memory_tokens = self.memory_tokens
 
-        self.input = input_data
-        self.mask = (
-            mask.astype(GLOBAL_DTYPE) if mask is not None else np.ones((batch, length), dtype=GLOBAL_DTYPE)
-        )
+        self.mask = mask if mask is not None else np.ones((batch, length))
         mask_column = self.mask[..., None]
 
         if memory_tokens:
-            memory = np.broadcast_to(self.memory.get_memory()[None], (batch, memory_tokens, self.hidden_dim))
+            memory = np.broadcast_to(self.memory.get_memory()[None], (batch, memory_tokens, self.hidden_dimension))
             combined = np.concatenate([memory, input_data], axis=1)
         else:
             combined = input_data
@@ -1158,7 +973,7 @@ class SpectreDecoderAttention(SpectreAttention):
         pooled = (prefix_queries + memory_query_sum) / self.chunk_counts
 
         num_chunks = self.anchors.size
-        self.gate = self.head_gate.forward(pooled.reshape(batch * num_chunks, self.hidden_dim))
+        self.gate = self.head_gate.forward(pooled.reshape(batch * num_chunks, self.hidden_dimension))
 
         padded_length = 2 * self.combined_length
         self.value_transform = np.fft.rfft(values, n=padded_length, axis=1)
@@ -1185,11 +1000,11 @@ class SpectreDecoderAttention(SpectreAttention):
 
         value_transform_gradient = np.zeros_like(self.value_transform)
         gate_gradient = np.zeros(
-            (batch, self.anchors.size, self.num_heads, self.num_frequencies), dtype=GLOBAL_COMPLEX_DTYPE
+            (batch, self.anchors.size, self.num_heads, self.num_frequencies), dtype=complex
         )
         for chunk, anchor in enumerate(self.anchors):
             rows = slice(anchor, min(anchor + self.chunk_size, length))
-            convolved_gradient = np.zeros((batch, padded_length, self.hidden_dim))
+            convolved_gradient = np.zeros((batch, padded_length, self.hidden_dimension))
             convolved_gradient[:, memory_tokens + rows.start: memory_tokens + rows.stop] = incoming_gradient[:, rows]
             mixed_gradient = split_heads(irfft_adjoint(convolved_gradient, padded_length, axis=1), self.num_heads)
 
@@ -1200,37 +1015,31 @@ class SpectreDecoderAttention(SpectreAttention):
 
         pooled_gradient = self.head_gate.backward(
             gate_gradient.reshape(-1, self.num_heads, self.num_frequencies)
-        ).reshape(batch, self.anchors.size, self.hidden_dim)
+        ).reshape(batch, self.anchors.size, self.hidden_dimension)
         per_anchor = pooled_gradient / self.chunk_counts
         reaching = np.cumsum(per_anchor[:, ::-1], axis=1)[:, ::-1]
         first_chunk = -(-np.arange(length) // self.chunk_size)
         covered = first_chunk < self.anchors.size
-        token_query_gradient = np.zeros((batch, length, self.hidden_dim))
+        token_query_gradient = np.zeros((batch, length, self.hidden_dimension))
         token_query_gradient[:, covered] = reaching[:, first_chunk[covered]]
         token_query_gradient *= mask_column
 
         value_gradient = rfft_adjoint(value_transform_gradient, padded_length, axis=1)[:, : self.combined_length]
         value_gradient[:, memory_tokens:] *= mask_column
         query_gradient = np.concatenate(
-            [np.broadcast_to(reaching[:, :1], (batch, memory_tokens, self.hidden_dim)), token_query_gradient], axis=1
+            [np.broadcast_to(reaching[:, :1], (batch, memory_tokens, self.hidden_dimension)), token_query_gradient], axis=1
         )
 
         input_gradient = self.query_projection.backward(query_gradient) + self.value_projection.backward(value_gradient)
         if memory_tokens:
             self.memory.backward(input_gradient[:, :memory_tokens].sum(axis=0))
-        return input_gradient[:, memory_tokens:].astype(GLOBAL_DTYPE)
-
-    def purge(self) -> None:
-        super().purge()
-        self.anchors = None
-        self.chunk_counts = None
-        self.filter_transforms = None
+        return input_gradient[:, memory_tokens:]
 
     # ------------- decoding
     def reset_cache(self, batch_size: int):
         self.cache = PrefixFFTCache(
             sequence_length=self.sequence_length,
-            hidden_dim=self.hidden_dim,
+            hidden_dimension=self.hidden_dimension,
             batch_size=batch_size,
             memory_tokens=self.memory_tokens,
         )
@@ -1250,7 +1059,7 @@ class SpectreDecoderAttention(SpectreAttention):
         gate = self.head_gate.forward(query_sum / total_counts)
         batch = gate.shape[0]
         return merge_heads(
-            np.broadcast_to(align_gate(gate), (batch, self.num_frequencies, self.num_heads, self.head_dim))
+            np.broadcast_to(align_gate(gate), (batch, self.num_frequencies, self.num_heads, self.head_dimension))
         )
 
     def read_slot(self, gate_full: NDArray, slot: int) -> NDArray:
@@ -1275,10 +1084,10 @@ class SpectreDecoderAttention(SpectreAttention):
         """
         assert input_data.ndim == 3
         batch, length, hidden_dim = input_data.shape
-        assert hidden_dim == self.hidden_dim
+        assert hidden_dim == self.hidden_dimension
 
         self.reset_cache(batch_size=batch)
-        mask = mask.astype(GLOBAL_DTYPE) if mask is not None else np.ones((batch, length), dtype=GLOBAL_DTYPE)
+        mask = mask if mask is not None else np.ones((batch, length))
 
         query_all = self.query_projection.project(input_data)
         value_all = self.value_projection.project(input_data)
@@ -1302,7 +1111,7 @@ class SpectreDecoderAttention(SpectreAttention):
             advances the cache but writes a zero token and does not affect the pooled query.
         """
         assert self.cache is not None, "call reset_cache()/prefill() first"
-        assert input_t.ndim == 2 and input_t.shape[1] == self.hidden_dim
+        assert input_t.ndim == 2 and input_t.shape[1] == self.hidden_dimension
 
         position = self.cache.position
         query_t = self.query_projection.project(input_t)
@@ -1310,6 +1119,6 @@ class SpectreDecoderAttention(SpectreAttention):
         slot = self.cache.decode_step(query_t, value_t, valid=valid)
 
         if self.chunk_gate is None or position % self.chunk_size == 0:
-            total_counts = np.maximum(self.cache.length[:, None].astype(GLOBAL_DTYPE), 1.0) + self.memory_tokens
+            total_counts = np.maximum(self.cache.length[:, None], 1.0) + self.memory_tokens
             self.chunk_gate = self.gate_from_pooled_sum(self.cache.sum_query, total_counts)
         return self.read_slot(self.chunk_gate, slot)

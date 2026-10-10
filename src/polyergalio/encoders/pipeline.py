@@ -13,7 +13,7 @@ import pandas as pd
 from numpy.typing import NDArray
 
 from polyergalio.encoders.encoders import Processor
-from polyergalio.types import Composite, CompositeNode
+from polyergalio.composite_model import Composite, CompositeNode
 
 log = logging.getLogger(__name__)
 

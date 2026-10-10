@@ -1,100 +1,125 @@
+"""
+Optimizers step an estimator, or a container of estimators, from its gradient dict.
+
+The gradient dict mirrors the model: `gradient_<name>` for every parameter, with a nested dict wherever the parameter
+is itself an estimator. A NeuralNetwork is keyed by node name, a layer by parameter name. The optimizer walks that tree
+against the model, scales each leaf, and applies the whole scaled tree once with `update_weights`.
+
+Along the way an estimator that is not training is skipped, and one that is not adaptive (the clustering layers) takes
+a plain step at its own learning_rate, whatever the optimizer. Optimizer state is keyed by the path of gradient names,
+so it needs no layer ordering and survives a graph being rewired.
+"""
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from typing import Optional
+
 import numpy as np
-from polyergalio.models.layers import Layer
+from numpy.typing import NDArray
+
+from polyergalio.composite_model import Composite
+from polyergalio.base_model import BasalEstimator
+
+GRADIENT_PREFIX = "gradient_"
 
 
-def scale_gradients(value, factor: float):
-    """Scale a gradient, or a nested dict of gradients, by factor."""
-    if isinstance(value, dict):
-        return {key: scale_gradients(sub, factor) for key, sub in value.items()}
-    return factor * value
+def parameter_members(model: BasalEstimator | Composite) -> dict:
+    """Each parameter of an estimator, or each node's component of a container, by name."""
+    if isinstance(model, Composite):
+        return {node.name: node.component for node in model.nodes if not node.is_source}
+    return {name: getattr(model, name) for name in model.parameter_names}
 
 
 class Optimizer(ABC):
-    """
-    Abstract base class for all optimizers.
+    """Base class for optimizers; a subclass says how one gradient array becomes a step."""
 
-    Layers with adaptive = False (the clustering layers) are never rescaled or
-    given state by adaptive optimizers (Adam), which apply a plain gradient
-    step at the layer's own learning_rate instead. SGD treats every layer alike.
-    """
-
-    def __init__(self):
-        pass
-
-    @abstractmethod
-    def step(self, layers: list[Layer], gradients: Optional[dict] = None) -> None:
+    def step(self, model: BasalEstimator | Composite, gradients: Optional[dict] = None, only=None) -> None:
         """
-        Take one step of the optimizer function
+        Take one step on a model.
 
         Parameters
         ----------
-        layers : layers (List[Layer]): the ORDERED LIST of model structure
-        gradients : gradients keyed by layer, replacing each layer's own get_gradients()
-
+        model : a layer, or a Network built on BasalEstimator or Composite
+        gradients : a get_gradients() dict, such as one averaged across nodes; the model's own by default
+        only : names (nodes, or parameters) to step; everything else is left alone
         """
-        pass
+        gradients = model.get_gradients() if gradients is None else gradients
+        if only is not None:
+            gradients = {key: value for key, value in gradients.items() if key.removeprefix(GRADIENT_PREFIX) in only}
+        scaled = self.scale(model, gradients)
+        if scaled:
+            model.update_weights(**scaled)
 
+    def scale(self, owner: BasalEstimator | Composite, gradients: dict, path: tuple = ()) -> dict:
+        """
+        The gradient tree with every leaf scaled into a step. An owner that is not training contributes nothing.
 
-    def fixed_step(self, layer: Layer, gradients: dict) -> None:
-        """Plain gradient step at the layer's own learning_rate, for non-adaptive layers under adaptive optimizers."""
-        layer.update_weights(
-            **{key: scale_gradients(sub, layer.learning_rate) for key, sub in gradients.items()}
-        )
+        Parameters
+        ----------
+        owner : the estimator or container the gradients belong to
+        gradients : its `gradient_<name>` dict
+        path : gradient names leading to owner, the key for optimizer state
+        """
+        if not getattr(owner, "training", True):
+            return {}
+        members = parameter_members(owner)
+        unexpected = set(gradients) - {f"{GRADIENT_PREFIX}{name}" for name in members}
+        if unexpected:
+            raise ValueError(f"{owner.__class__.__name__} has no gradients named {sorted(unexpected)}")
 
-    def get_state(self, layers: list[Layer]) -> dict:
-        """Optimizer state with layers replaced by their position in layers, so it can cross processes."""
+        scaled = {}
+        for name, member in members.items():
+            key = f"{GRADIENT_PREFIX}{name}"
+            gradient = gradients.get(key)
+            if gradient is None:
+                continue
+            if isinstance(member, (BasalEstimator, Composite)):
+                nested = self.scale(member, gradient, path + (key,))
+                if nested:
+                    scaled[key] = nested
+            else:
+                scaled[key] = self.scale_leaf(owner, gradient, path + (key,))
+        return scaled
+
+    @abstractmethod
+    def scale_leaf(self, owner: BasalEstimator, gradient: NDArray, path: tuple) -> NDArray:
+        """Turn one gradient array into the step to subtract."""
+
+    def get_state(self) -> dict:
+        """Optimizer state as plain values keyed by gradient-name paths, so it can cross processes."""
         return {}
 
-    def set_state(self, state: dict, layers: list[Layer]) -> None:
-        """Restore the output of get_state against the same layer ordering."""
+    def set_state(self, state: dict) -> None:
+        """Restore the output of get_state()."""
 
-    def zero_gradients(self, layers: list[Layer]):
-        """
-        We'll have to set all of our gradients to zero
-        Useful if gradients are accumulated.
-        """
-        for layer in layers:
-            layer.zero_gradients()
+    def zero_gradients(self, model: BasalEstimator | Composite) -> None:
+        """Reset the model's gradients, useful when they are accumulated."""
+        model.zero_gradients()
 
 
 class SGD(Optimizer):
-    """
-    STOCHASTIC GRADIENT DESCENT - as vanilla as we can get
-    """
+    """Stochastic gradient descent: every leaf steps at the same learning rate."""
+
     def __init__(self, learning_rate: float = 0.001, clip_gradients: bool = False):
         """
-
         Parameters
         ----------
-        learning_rate : our learning rate, or alpha
+        learning_rate : step size, or alpha
+        clip_gradients : accepted for clipping, not applied yet
         """
         super().__init__()
         self.learning_rate = learning_rate
         self.max_norm = 1.0
-        self.do_clipping = clip_gradients  # TODO: fix this
+        self.do_clipping = clip_gradients
 
-    def step(self, layers: list[Layer], gradients: Optional[dict] = None) -> None:
-
-        for layer in layers:
-            if layer.training != True:
-                continue
-
-            delta_grads = layer.get_gradients() if gradients is None else gradients.get(layer)
-            if not delta_grads:
-                continue
-
-            layer.update_weights(
-                **{key: scale_gradients(sub, self.learning_rate) for key, sub in delta_grads.items()}
-            )
+    def scale_leaf(self, owner: BasalEstimator, gradient: NDArray, path: tuple) -> NDArray:
+        return self.learning_rate * gradient
 
 
 class Adam(Optimizer):
     """
-    Momentum estimates are kept per (layer, parameter name), since a layer can
-    expose several independently-shaped parameters -- FullyConnectedLayer's
-    weights and bias, for instance, need separate moments.
+    Adaptive moments, kept per gradient path, so a layer's weights and bias each have their own.
+    An estimator that is not adaptive steps at its own learning_rate instead and keeps no state.
     """
 
     def __init__(
@@ -110,71 +135,37 @@ class Adam(Optimizer):
         self.ridge_decay = ridge_momentum
         self.eps = eps
         self.timestep = 0
-        self._momenta: dict = {}
-        self._ridges: dict = {}
+        self.momenta: dict[tuple, NDArray] = {}
+        self.ridges: dict[tuple, NDArray] = {}
 
-    def get_state(self, layers: list[Layer]) -> dict:
-        positions = {layer: position for position, layer in enumerate(layers)}
+    def step(self, model: BasalEstimator | Composite, gradients: Optional[dict] = None, only=None) -> None:
+        self.timestep += 1
+        super().step(model, gradients, only)
+
+    def scale_leaf(self, owner: BasalEstimator, gradient: NDArray, path: tuple) -> NDArray:
+        if not owner.adaptive:
+            return owner.learning_rate * gradient
+
+        if path not in self.momenta:
+            self.momenta[path] = np.zeros_like(gradient)
+            self.ridges[path] = np.zeros_like(np.abs(gradient))
+        momentum = self.momentum_decay * self.momenta[path] + (1 - self.momentum_decay) * gradient
+        ridge = self.ridge_decay * self.ridges[path] + (1 - self.ridge_decay) * np.abs(gradient) ** 2
+        self.momenta[path] = momentum
+        self.ridges[path] = ridge
+
+        momentum_hat = momentum / (1 - self.momentum_decay ** self.timestep)
+        ridge_hat = ridge / (1 - self.ridge_decay ** self.timestep)
+        return self.learning_rate * momentum_hat / (np.sqrt(ridge_hat) + self.eps)
+
+    def get_state(self) -> dict:
         return {
             "timestep": self.timestep,
-            "momenta": {(positions[path[0]], *path[1:]): value for path, value in self._momenta.items()},
-            "ridges": {(positions[path[0]], *path[1:]): value for path, value in self._ridges.items()},
+            "momenta": {path: value.copy() for path, value in self.momenta.items()},
+            "ridges": {path: value.copy() for path, value in self.ridges.items()},
         }
 
-    def set_state(self, state: dict, layers: list[Layer]) -> None:
+    def set_state(self, state: dict) -> None:
         self.timestep = state["timestep"]
-        self._momenta = {(layers[key[0]], *key[1:]): value.copy() for key, value in state["momenta"].items()}
-        self._ridges = {(layers[key[0]], *key[1:]): value.copy() for key, value in state["ridges"].items()}
-
-    def update(self,
-               value,
-               path: tuple,
-               momentum_update: float,
-               ridge_update: float):
-        # careful -- recursive
-        if isinstance(value, dict):
-            return {
-                key: self.update(sub, path + (key,), momentum_update, ridge_update)
-                for key, sub in value.items()
-            }
-        if value is None:
-            return None
-
-        if path not in self._momenta:
-            self._momenta[path] = np.zeros_like(value)
-            self._ridges[path] = np.zeros_like(value)
-        m = self._momenta[path]
-        v = self._ridges[path]
-
-        m = self.momentum_decay * m + (1 - self.momentum_decay) * value
-        v = self.ridge_decay * v + (1 - self.ridge_decay) * value ** 2
-        self._momenta[path] = m
-        self._ridges[path] = v
-
-        m_hat = m / momentum_update
-        v_hat = v / ridge_update
-        return self.learning_rate * m_hat / (np.sqrt(v_hat) + self.eps)
-
-    def step(self, layers: list[Layer], gradients: Optional[dict] = None) -> None:
-        self.timestep += 1
-        momentum_update = 1 - self.momentum_decay ** self.timestep
-        ridge_update = 1 - self.ridge_decay ** self.timestep
-
-        for layer in layers:
-            if layer.training != True:
-                continue
-            else:
-                delta_grads = layer.get_gradients() if gradients is None else gradients.get(layer)
-                if not delta_grads:
-                    continue
-                if not layer.adaptive:
-                    self.fixed_step(layer, delta_grads)
-                    continue
-
-                layer.update_weights(**{key: self.update(sub, (layer, key), momentum_update, ridge_update)
-                                        for key, sub in delta_grads.items()
-                                        }
-                                     )
-
-
-# Scaled Conjugate Gradient
+        self.momenta = {path: value.copy() for path, value in state["momenta"].items()}
+        self.ridges = {path: value.copy() for path, value in state["ridges"].items()}

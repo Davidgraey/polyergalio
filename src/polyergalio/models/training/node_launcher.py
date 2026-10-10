@@ -15,9 +15,9 @@ from polyergalio.models.training.orchestration import Task
 from polyergalio.models.training.transport import receive_frame, receive_message, send_frame, send_message, sign
 from polyergalio.models.constants import ClassificationTask
 from polyergalio.models.model_loss import (
-    CosineLoss, CrossEntropyLoss, DifferenceLoss, Loss, MAELoss, MSELoss, RMSELoss, SSELoss,
+    CosineLoss, CrossEntropyLoss, DifferenceLoss, Loss, MAELoss, MSELoss, RMSELoss, SparseCrossEntropyLoss, SSELoss,
 )
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network
 from polyergalio.models.optimizers import Adam, Optimizer, SGD
 
 log = logging.getLogger(__name__)
@@ -25,7 +25,9 @@ log = logging.getLogger(__name__)
 OPTIMIZERS = {"SGD": SGD, "Adam": Adam}
 LOSSES = {
     loss.__name__: loss
-    for loss in (CosineLoss, CrossEntropyLoss, DifferenceLoss, MAELoss, MSELoss, RMSELoss, SSELoss)
+    for loss in (
+        CosineLoss, CrossEntropyLoss, DifferenceLoss, MAELoss, MSELoss, RMSELoss, SparseCrossEntropyLoss, SSELoss
+    )
 }
 
 
@@ -67,7 +69,7 @@ class NodeLauncher:
             "apply_gradients": self.apply_gradients,
         }
         self.active: Optional[asyncio.StreamWriter] = None
-        self.model: Optional[NeuralNetwork] = None
+        self.model: Optional[Network] = None
         self.optimizer: Optional[Optimizer] = None
         self.loss_fn: Optional[Loss] = None
 
@@ -81,14 +83,14 @@ class NodeLauncher:
 
     def initialize_training(self, payload: dict) -> dict:
         """Keep the serialized model, optimizer and loss described by the payload for the run."""
-        self.model = NeuralNetwork.deserialize(payload["model"]).train()
+        self.model = Network.deserialize(payload["model"]).train()
         self.optimizer = OPTIMIZERS[payload["optimizer"]["name"]](**payload["optimizer"].get("params", {}))
         loss_params = dict(payload["loss"].get("params", {}))
         if "task" in loss_params:
             loss_params["task"] = ClassificationTask[loss_params["task"]]
         self.loss_fn = LOSSES[payload["loss"]["name"]](**loss_params)
         if "optimizer_state" in payload:
-            self.optimizer.set_state(payload["optimizer_state"], self.model.layers)
+            self.optimizer.set_state(payload["optimizer_state"])
         return {"completed": True}
 
     def export_model(self, payload) -> dict:
@@ -97,7 +99,7 @@ class NodeLauncher:
 
     def export_state(self, payload) -> dict:
         """Model and optimizer state, for resynchronizing a node that dropped out."""
-        return {"model": self.model.serialize(), "optimizer_state": self.optimizer.get_state(self.model.layers)}
+        return {"model": self.model.serialize(), "optimizer_state": self.optimizer.get_state()}
 
     def step(self, payload: dict) -> dict:
         """Forward and backward on one shard; the local gradients and loss."""
@@ -111,7 +113,7 @@ class NodeLauncher:
 
     def apply_gradients(self, payload: dict) -> dict:
         """Update the local model with gradients pooled across nodes."""
-        self.model.update_weights(payload, self.optimizer)
+        self.optimizer.step(self.model, payload)
         return {"completed": True}
 
     async def serve(self) -> None:

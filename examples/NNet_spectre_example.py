@@ -29,7 +29,7 @@ from polyergalio.generators.data_generators import token_accuracy
 from polyergalio.models.constants import ClassificationTask
 from polyergalio.models.embedding.embedding import TextEmbedding
 from polyergalio.models.embedding.positional import RopeEmbedding
-from polyergalio.models.layers.basal_layers import (
+from polyergalio.models.layers.basic_layers import (
     DropoutLayer,
     FullyConnectedLayer,
     RMSNormLayer,
@@ -41,7 +41,7 @@ from polyergalio.models.layers.spectre_layers import (
     SpectreDecoderAttention,
 )
 from polyergalio.models.model_loss import CrossEntropyLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network
 from polyergalio.models.optimizers import Adam
 
 TARGET_VOCAB_SIZE = 150
@@ -96,10 +96,8 @@ def generate_corpus(rng: np.random.Generator) -> tuple[list[str], list[str]]:
 def fit_text_tokenizer(corpus: list[str]) -> SentencePieceTokenizer:
     """Fit a SentencePiece tokenizer on the corpus and load it."""
     with tempfile.TemporaryDirectory() as workdir:
-        corpus_path = Path(workdir) / "corpus.txt"
-        corpus_path.write_text("\n".join(corpus))
         model_path = fit_tokenizer(
-            corpus_paths=[str(corpus_path)],
+            corpus,
             model_prefix=str(Path(workdir) / "spectre_tokenizer"),
             vocab_size=TARGET_VOCAB_SIZE,
             hard_vocab_limit=False,
@@ -112,7 +110,7 @@ def sample_texts(rng: np.random.Generator, texts: list[str]) -> list[str]:
 
 
 # -------------    networks    ------------------------------------------------
-def build_encoder(vocab_size: int, padding_idx: int) -> NeuralNetwork:
+def build_encoder(vocab_size: int, padding_idx: int) -> Network:
     """
     TextEmbedding -> RoPE -> Spectre block -> [pooled, MLM head].
 
@@ -123,9 +121,9 @@ def build_encoder(vocab_size: int, padding_idx: int) -> NeuralNetwork:
 
     Returns
     -------
-    NeuralNetwork whose output is the MLM head, (masked positions, vocab_size)
+    Network whose output is the MLM head, (masked positions, vocab_size)
     """
-    net = NeuralNetwork(name="spectre_encoder", input_shape=(SEQUENCE_LENGTH,))
+    net = Network(name="spectre_encoder", input_shape=(SEQUENCE_LENGTH,))
     embedding = net.connect(
         TextEmbedding(vocab_size, HIDDEN_DIM, padding_idx=padding_idx),
         net.input,
@@ -169,7 +167,7 @@ def build_encoder(vocab_size: int, padding_idx: int) -> NeuralNetwork:
 ENCODER_CHAIN = ("positional_emb", "prenorm", "attention", "ffn_1", "ffn_2", "postnorm", "dropout")
 
 
-def build_seq2seq(encoder: NeuralNetwork, vocab_size: int) -> NeuralNetwork:
+def build_seq2seq(encoder: Network, vocab_size: int) -> Network:
     """
     The trained encoder's layers plus a causal decoder, in one graph.
 
@@ -185,9 +183,9 @@ def build_seq2seq(encoder: NeuralNetwork, vocab_size: int) -> NeuralNetwork:
 
     Returns
     -------
-    NeuralNetwork whose output is (batch, sequence, vocab_size) logits
+    Network whose output is (batch, sequence, vocab_size) logits
     """
-    net = NeuralNetwork(name="spectre_seq2seq", input_shape=(SEQUENCE_LENGTH,))
+    net = Network(name="spectre_seq2seq", input_shape=(SEQUENCE_LENGTH,))
     embedding = net.connect(encoder.node("embedding").layer, net.input, name="embedding")
 
     stream = embedding
@@ -231,7 +229,7 @@ def build_seq2seq(encoder: NeuralNetwork, vocab_size: int) -> NeuralNetwork:
 
 # -------------    stage 1: encoder MLM    ------------------------------------
 def mlm_accuracy(
-    net: NeuralNetwork, processor: TextProcessor, texts: list[str]
+    net: Network, processor: TextProcessor, texts: list[str]
 ) -> float:
     """Accuracy at masked positions of a cloze batch, with the network in eval mode."""
     batch = processor.distort_batch(texts, "cloze")
@@ -243,7 +241,7 @@ def mlm_accuracy(
 
 
 def train_mlm(
-    net: NeuralNetwork,
+    net: Network,
     processor: TextProcessor,
     texts: list[str],
     held_out: list[str],
@@ -265,7 +263,7 @@ def train_mlm(
         )
         loss = loss_fn(logits, np.eye(vocab_size)[labels])
         net.backward(loss_fn.backward())
-        optimizer.step(net.layers)
+        optimizer.step(net)
         if step % LOG_EVERY == 0:
             print(f"mlm step {step:4d}  loss {loss:.4f}")
     print(f"masked-token accuracy after training:  {mlm_accuracy(net, processor, held_out[:BATCH_SIZE]):.3f}")
@@ -279,7 +277,7 @@ def encode_batch(processor: TextProcessor, texts: list[str]) -> tuple[np.ndarray
 
 
 def decoder_accuracy(
-    net: NeuralNetwork, processor: TextProcessor, texts: list[str]
+    net: Network, processor: TextProcessor, texts: list[str]
 ) -> float:
     """Teacher-forced next-token accuracy over real positions, in eval mode."""
     ids, attention_mask = encode_batch(processor, texts)
@@ -289,7 +287,7 @@ def decoder_accuracy(
 
 
 def train_decoder(
-    net: NeuralNetwork,
+    net: Network,
     processor: TextProcessor,
     texts: list[str],
     held_out: list[str],
@@ -311,14 +309,14 @@ def train_decoder(
         logits = net.forward(ids, mask=attention_mask)
         loss = loss_fn(logits, np.eye(vocab_size)[ids], attention_mask)
         net.backward(loss_fn.backward())
-        optimizer.step(net.layers)
+        optimizer.step(net)
         if step % LOG_EVERY == 0:
             print(f"decoder step {step:4d}  loss {loss:.4f}")
     print(f"decoder accuracy after training (held out):  {decoder_accuracy(net, processor, held_out[:BATCH_SIZE]):.3f}")
 
 
 # -------------    stage 3: generation    -------------------------------------
-def decoder_layers(net: NeuralNetwork) -> dict:
+def decoder_layers(net: Network) -> dict:
     """The layers generation drives by hand, by node name."""
     names = (
         "embedding", "shift_right", "latent_projection", "decoder_prenorm",
@@ -360,7 +358,7 @@ def teacher_forced_logits(layers: dict, latent: np.ndarray, tokens: np.ndarray) 
     conditioned = shifted + latent
     mask = (tokens != 0).astype(float)
     mixed = layers["decoder_attention"].forward(
-        layers["decoder_prenorm"].forward(conditioned), mask=mask, training_now=False
+        layers["decoder_prenorm"].forward(conditioned), mask=mask
     )
     hidden = layers["decoder_ffn_2"].forward(layers["decoder_ffn_1"].forward(mixed))
     hidden = layers["decoder_postnorm"].forward(hidden) + conditioned
@@ -378,8 +376,8 @@ def sample_tokens(logits: np.ndarray, temperature: float, rng: np.random.Generat
 
 
 def generate(
-    encoder: NeuralNetwork,
-    seq2seq: NeuralNetwork,
+    encoder: Network,
+    seq2seq: Network,
     processor: TextProcessor,
     texts: list[str],
     temperature: float = 0.0,

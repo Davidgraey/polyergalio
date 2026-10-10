@@ -36,8 +36,9 @@ class GPLSOM(PLSOM):
     https://arxiv.org/pdf/0705.0199    (PLSOM)
     """
 
-    _structural_state_keys = PLSOM._structural_state_keys + (
-        "network_shape", "height", "width", "n_neurons", "grid_distances",
+    state_names = (
+        "network_shape", "height", "width", "n_neurons",
+        "growth_threshold", "last_structural_epoch", "structure_trace",
     )
 
     def __init__(
@@ -116,6 +117,11 @@ class GPLSOM(PLSOM):
 
     # -------------    the grow / prune decision    --------------------
     # ------------------------------------------------------------------
+    def set_state(self, state: dict) -> None:
+        """Restore the saved map, then rebuild the lattice distances for its shape."""
+        super().set_state(state)
+        self.grid_distances = self.build_grid()
+
     def after_epoch(self, step: int) -> None:
         """
         At most one structural change per epoch, growth taking precedence,

@@ -1,31 +1,17 @@
 """
 Utility functions for polyergalio package --- helpers, etc.
 """
+from __future__ import annotations
 
 import time
-import numpy as np
-from numpy.typing import NDArray
-from typing import Optional, Callable, Iterable
 from datetime import datetime, timedelta
 from functools import lru_cache, wraps
+from typing import Optional, Callable, Iterable
 
+import numpy as np
+from numpy.typing import NDArray
 
-def standardize_data(design_matrix: NDArray, axis=0):
-    """
-    zero tge mean and variance = 1 along axis
-    Parameters
-    ----------
-    design_matrix :
-    axis :
-
-    Returns
-    -------
-
-    """
-    array_mean = np.mean(design_matrix, axis=axis)
-    array_std = np.std(design_matrix, axis=axis)
-
-    return (design_matrix - array_mean) / array_std
+from polyergalio.models.constants import EPSILON
 
 
 # -------------- Decorators  --------------
@@ -160,3 +146,138 @@ def flatten_containers(container: Iterable):
             flattened.append(item)
 
     return flattened
+
+
+# -------------- Model Base Class  --------------
+def count_elements(value) -> int:
+    """Total number of array elements and scalars nested in a dict, list or tuple."""
+    if value is None:
+        return 0
+    if isinstance(value, dict):
+        return sum(count_elements(member) for member in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(count_elements(member) for member in value)
+    return int(np.size(value))
+
+
+def shape_conflict(produced: tuple, expected: tuple) -> Optional[str]:
+    """
+    Compare two declared shapes, right-aligned, and describe the first axis where they disagree.
+
+    Shapes are in trailing-axis form, so they are matched from the last axis backwards and only the overlap is
+    checked. None on either side is a wildcard.
+
+    Returns
+    -------
+    a description of the offending axis, or None when the two are compatible
+    """
+    if (produced is None) or (expected is None):
+        return None
+
+    for offset, (made, wanted) in enumerate(zip(reversed(produced), reversed(expected)), start=1):
+        if (made is None) or (wanted is None):
+            continue
+        if made != wanted:
+            return f"{produced} cannot feed {expected}, axis -{offset} is {made} against {wanted}"
+    return None
+
+
+# --------------- Standardization / Normalize ---------------
+def standardize_data(design_matrix: NDArray, axis=0):
+    """
+    zero tge mean and variance = 1 along axis
+    Parameters
+    ----------
+    design_matrix :
+    axis :
+
+    Returns
+    -------
+
+    """
+    array_mean = np.mean(design_matrix, axis=axis)
+    array_std = np.std(design_matrix, axis=axis)
+
+    return (design_matrix - array_mean) / array_std
+
+
+def update_running_standardize(model, new_data_mean, new_data_std, new_data_count) -> None:
+    """
+    proportionally update the running mean and standard deviation for standardization processes
+    Parameters
+    ----------
+    new_data_mean : mean of the new observations or samples under considerations
+    new_data_std : standard deviation of the new observations or samples under considerations
+    new_data_count : the number of new samples (for proportionally weighting)
+
+    Returns
+    -------
+    No returns - we update the model params with the updated mean, STD DEV and num_seen_samples
+    """
+    full_count = model.num_seen_samples + new_data_count
+    full_mean = (model.num_seen_samples  * model.x_means + new_data_count * new_data_mean) / full_count
+    var1 = model.x_stds ** 2
+    var2 = new_data_std ** 2
+
+    # error sum of squares
+    sum_square_errors = var1 * (model.num_seen_samples  - 1) + var2 * (new_data_count - 1)
+    # total group sum of squares
+    sum_squares = (model.x_means - full_mean) ** 2 * model.num_seen_samples  + (new_data_mean - full_mean) ** 2 * new_data_count
+    full_var = (sum_square_errors + sum_squares) / (full_count - 1)
+    full_std = np.sqrt(full_var)
+
+    model.x_means = full_mean
+    model.x_stds = full_std
+    model.num_seen_samples = full_count
+
+def standardize(model, data_array: NDArray) -> NDArray:
+    """
+    Standardize our data array
+    Parameters
+    ----------
+    data_array : numpy array of x-variable
+
+    Returns
+    -------
+    the mean and standard deviation of the data array
+    """
+    if model.x_means is None or data_array.shape[-1] != model.x_means.shape[0]:
+        log.error("initialize process hasn't been done yet!")
+
+    return (data_array - model.x_means) / (model.x_stds + EPSILON)
+
+def unstandardize(model, data_array: NDArray) -> NDArray:
+    """
+    unstandardize the data -> convert back into unit space
+    Parameters
+    ----------
+    data_array : numpy array of x-variable
+
+    Returns
+    -------
+    the data, transformed back into the original unit space
+    """
+    assert data_array.shape[-1] == model.x_means.shape[0]
+
+    return data_array * (model.x_stds + EPSILON) + model.x_means
+
+def init_standardize(model, x_data: NDArray) -> None:
+    """
+    initalize the standardize variables for tracking, or update them if
+    we're adjusting an already fitted model
+    Parameters
+    ----------
+    x_data : NDArray
+    """
+    if (model.x_means is None) or (model.num_seen_samples == 0):
+        # set up the initial values for the new incoming data
+        model.num_seen_samples = x_data.shape[0]
+        model.x_means = np.mean(x_data, axis=0)
+        model.x_stds = np.std(x_data, axis=0)
+    else:
+        # update the running standardization parameters with proportional weighting
+        model.update_running_standardize(
+            new_data_mean=np.mean(x_data, axis=0),
+            new_data_std=np.std(x_data, axis=0),
+            new_data_count=x_data.shape[0])
+    pass

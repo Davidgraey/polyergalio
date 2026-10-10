@@ -13,9 +13,7 @@ from polyergalio.encoders.encoders import Processor
 
 
 class NuemricNormalizeProcessor(Processor):
-    _structural_state_keys = Processor._structural_state_keys + (
-        "fitted_min", "fitted_max", "seen_samples", "bounds",
-    )
+    state_names = ("fitted_min", "fitted_max", "seen_samples", "bounds")
 
     def __init__(
         self,
@@ -82,7 +80,7 @@ class NuemricNormalizeProcessor(Processor):
             self.fitted_min = float(min(self.fitted_min, np.nanmin(_v)))
             self.fitted_max = float(max(self.fitted_max, np.nanmax(_v)))
         self.seen_samples += len(_v)
-        self._fitted = True
+        self.fitted = True
         return True
 
     def encode(self, values):
@@ -141,9 +139,7 @@ class NuemricNormalizeProcessor(Processor):
 
 
 class NuemricStandardizeProcessor(Processor):
-    _structural_state_keys = Processor._structural_state_keys + (
-        "mean", "standard_deviation", "seen_samples", "bounds",
-    )
+    state_names = ("mean", "standard_deviation", "seen_samples", "bounds")
 
     def __init__(
         self,
@@ -183,7 +179,7 @@ class NuemricStandardizeProcessor(Processor):
         self.mean = float(np.nanmean(values))
         self.standard_deviation = float(np.nanstd(values))
         self.seen_samples += len(values)
-        self._fitted = True
+        self.fitted = True
         return True
 
     def encode(self, values):

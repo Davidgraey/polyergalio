@@ -4,8 +4,8 @@ Token embeddings: a trainable lookup table from token id to vector.
 from typing import Optional
 
 import numpy as np
-from polyergalio.models.constants import ANY_SHAPE, GLOBAL_DTYPE
-from polyergalio.models.layers.basal_layers import Layer
+from polyergalio.models.constants import ANY_SHAPE
+from polyergalio.models.layers.basic_layers import RNG, Layer
 from polyergalio.models.weight_initialization import get_weight_init
 from numpy.typing import NDArray
 
@@ -21,6 +21,8 @@ class TextEmbedding(Layer):
     Input shape: (...) integer token ids
     Output shape: (..., embedding_dim)
     """
+    parameter_names = ("weights",)
+    cache_names = ("token_ids", "output")
 
     def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: Optional[int] = None, special_tokens: Optional[dict] = None,
                  initialization: str = "truncated_normal", initialization_kwargs: Optional[dict] = None):
@@ -46,13 +48,11 @@ class TextEmbedding(Layer):
         self.declare_shapes(inputs=(ANY_SHAPE,), outputs=((embedding_dim,),))
 
         initializer = get_weight_init(initialization, **self.initialization_kwargs)
-        self.weights = initializer(self.RNG, ni=num_embeddings, no=embedding_dim)
+        self.weights = initializer(RNG, ni=num_embeddings, no=embedding_dim)
 
         if padding_idx is not None:
             self.weights[padding_idx] = 0.0
 
-        self.token_ids = None
-        self.output = None
         self.zero_gradients()
 
     def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
@@ -99,33 +99,7 @@ class TextEmbedding(Layer):
         )
         if self.padding_idx is not None:
             self.gradient_weights[self.padding_idx] = 0.0
-        return np.zeros(self.token_ids.shape, dtype=GLOBAL_DTYPE)
-
-    def update_weights(self, gradient_weights: NDArray) -> None:
-        self.weights -= gradient_weights
-
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"weights": self.weights}
-        return self.weights
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is not None:
-            self.weights = np.array(weights["weights"], dtype=GLOBAL_DTYPE)
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {"gradient_weights": self.gradient_weights}
-
-    def zero_gradients(self) -> None:
-        self.gradient_weights = np.zeros_like(self.weights)
-
-    def purge(self) -> None:
-        self.token_ids = None
-        self.output = None
-
-    @property
-    def num_parameters(self) -> int:
-        return self.weights.size
+        return np.zeros(self.token_ids.shape)
 
     def __str__(self):
         padding = "" if self.padding_idx is None else f", padding_idx {self.padding_idx}"

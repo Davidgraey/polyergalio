@@ -339,7 +339,7 @@ class AudioProcessor(Processor):
     def fit(self, values: NDArray) -> "AudioProcessor":
         """record the observed range, which inverse() needs to undo scaling"""
         self.obs_min_max = (float(np.min(values)), float(np.max(values)))
-        self._fitted = True
+        self.fitted = True
         return self
 
     def encode(self, values: NDArray) -> dict[str,NDArray]:

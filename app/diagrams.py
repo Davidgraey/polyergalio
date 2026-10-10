@@ -1,4 +1,4 @@
-"""Box-and-arrow diagrams for models that are not NeuralNetwork graphs."""
+"""Box-and-arrow diagrams for models that are not Network graphs."""
 
 import textwrap
 

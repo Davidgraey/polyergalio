@@ -1,10 +1,11 @@
 # up-import our layers
-from polyergalio.models.layers.basal_layers import (
+from polyergalio.models.layers.basic_layers import (
     DropoutLayer,
     FullyConnectedLayer,
     Layer,
     NormalizeLayer,
     RMSNormLayer,
+    StandardizeLayer,
 )
 from polyergalio.models.layers.clustering_layers import (
     CentroidLayer,
@@ -12,7 +13,6 @@ from polyergalio.models.layers.clustering_layers import (
     GPLSOMLayer,
     PLSOMLayer,
 )
-from polyergalio.models.layers.decision_layers import DecisionHead
 from polyergalio.models.layers.fft_layers import (
     FourierAttention,
     FourierLayer,
@@ -26,6 +26,7 @@ from polyergalio.models.layers.hyena_layers import (
 )
 from polyergalio.models.layers.mixture_layers import (
     MixtureOfExperts,
+    SimpleMixtureOfExperts,
     VotingBase,
     VotingGate,
     VotingWeight,
@@ -38,5 +39,16 @@ from polyergalio.models.layers.spectre_layers import (
     PersistentMemory,
     SpectreAttention,
     SpectreDecoderAttention,
+)
+from polyergalio.models.layers.operator_layers import (
+    LatentStack,
+    LatentSum,
+    LatentProduct,
+    LatentDifference,
+    MaskGather,
+    ShiftRight,
+    SplitLayer,
+    BroadcastOperator,
+
 )
 from polyergalio.models.layers.wavelet_layers import WaveletRefinementModule

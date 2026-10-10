@@ -14,10 +14,10 @@ Run: python NNet_moe_routing_example.py
 import numpy as np
 from polyergalio.generators.data_generators import RandomDatasetGenerator, to_onehot
 from polyergalio.models.constants import ClassificationTask
-from polyergalio.models.layers.basal_layers import FullyConnectedLayer
+from polyergalio.models.layers.basic_layers import FullyConnectedLayer
 from polyergalio.models.layers.mixture_layers import MixtureOfExperts
 from polyergalio.models.model_loss import CrossEntropyLoss
-from polyergalio.models.neural_network import NeuralNetwork
+from polyergalio.models.network import Network
 from polyergalio.models.optimizers import SGD
 
 NUM_SAMPLES = 1200
@@ -27,13 +27,12 @@ HIDDEN_DIM = 32
 NUM_SHARED_EXPERTS = 1
 NUM_ROUTED_EXPERTS = 6
 TOP_K = 2
-BIAS_UPDATE_SPEED = 1e-3
 LEARNING_RATE = 0.05
 TRAIN_STEPS = 400
 BIAS_LOG_EVERY = 10
 
 
-def build_network(num_features: int, num_classes: int) -> NeuralNetwork:
+def build_network(num_features: int, num_classes: int) -> Network:
     """
     FullyConnectedLayer encoder -> MixtureOfExperts -> FullyConnectedLayer classifier.
 
@@ -44,9 +43,9 @@ def build_network(num_features: int, num_classes: int) -> NeuralNetwork:
 
     Returns
     -------
-    NeuralNetwork mapping features to class logits
+    Network mapping features to class logits
     """
-    net = NeuralNetwork(name="moe_routing", input_shape=(num_features,))
+    net = Network(name="moe_routing", input_shape=(num_features,))
     encoded = net.connect(
         FullyConnectedLayer(num_features, HIDDEN_DIM, activation_type="relu"),
         net.input,
@@ -60,7 +59,6 @@ def build_network(num_features: int, num_classes: int) -> NeuralNetwork:
             num_shared_experts=NUM_SHARED_EXPERTS,
             num_routed_experts=NUM_ROUTED_EXPERTS,
             top_k=TOP_K,
-            bias_update_speed=BIAS_UPDATE_SPEED,
         ),
         encoded,
         name="moe",
@@ -106,7 +104,7 @@ def main():
         logits = net.forward(x)
         loss = loss_fn(logits, targets)
         net.backward(loss_fn.backward())
-        optimizer.step(net.layers)
+        optimizer.step(net)
         if step % BIAS_LOG_EVERY == 0:
             bias_history.append(moe.gate.expert_bias.copy())
         if step % 50 == 0:

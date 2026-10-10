@@ -1,3 +1,28 @@
+0.1.7
+=====================
+- Tweaks to Nodes and connections to support a "multiple output" layer.
+- Continued refinement to modules and code organization.
+- Added a "recast" behavior -- allows us to downcast array precision (eg float64 -> float32). May need refinement...
+- TESTS are still broken - I'm not fixing these until I get to a more stable build
+- ** AI usage ** - generated docstrings for the new sections of network.py and the new Node type.
+
+0.1.6
+=====================
+Breaking Change - reworked the basal types used. Previously, we have a Model, Layer and other mix-ins that was just
+getting out of hand. We reworked these to have a clearer hierarchy, and to make the subtypes interchangable with minimal
+effort.
+|--->Serializable
+|-------> Composite
+|-----------> Network
+|-----------> Feature Pipeline
+|-----------> CompositeNode (NOT SUBCLASSES)
+|
+|-------> BasalEstimator
+|-----------> Layer
+|-----------> Processor (feature processing)
+|-----------> FittedModel
+
+
 0.1.5
 =====================
 Added a distributed training process - polyergalio.models.training/

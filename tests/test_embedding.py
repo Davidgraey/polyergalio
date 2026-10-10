@@ -4,6 +4,7 @@ Embeddings: token lookup tables and positional encodings.
 
 import numpy as np
 import pytest
+
 from conftest import GRADIENT_TOLERANCE, input_gradient_error, numeric_gradient, relative_error
 from polyergalio.models.embedding.embedding import TextEmbedding
 from polyergalio.models.embedding.positional import RopeEmbedding, SinusoidEmbedding

@@ -10,14 +10,14 @@ An order-N Hyena operator blends convolutions with element-wise gating
 
 Filters are causal and evaluated through the FFT, zero padded to 2L.
 """
+from __future__ import annotations
 
 from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
 
-from polyergalio.models.constants import GLOBAL_DTYPE
-from polyergalio.models.layers.basal_layers import FullyConnectedLayer, Layer
+from polyergalio.models.layers.basic_layers import RNG, FullyConnectedLayer, Layer
 from polyergalio.models.weight_initialization import get_weight_init
 
 
@@ -31,10 +31,10 @@ def positional_features(sequence_length: int, num_bands: int) -> NDArray:
     (sequence_length, 2 * num_bands + 1): [t, Re rho_0 .. Re rho_K-1, Im rho_0 .. Im rho_K-1],
     rho_k(t) = exp(i 2 pi k t / L), t normalised to [0, 1] in the first column
     """
-    steps = np.arange(sequence_length, dtype=GLOBAL_DTYPE)
+    steps = np.arange(sequence_length)
     angles = 2 * np.pi * np.outer(steps, np.arange(num_bands)) / sequence_length
     time = np.linspace(0.0, 1.0, sequence_length)[:, None]
-    return np.concatenate([time, np.cos(angles), np.sin(angles)], axis=1).astype(GLOBAL_DTYPE)
+    return np.concatenate([time, np.cos(angles), np.sin(angles)], axis=1)
 
 
 def exponential_window(sequence_length: int,
@@ -58,7 +58,7 @@ def exponential_window(sequence_length: int,
     """
     time = np.linspace(0.0, 1.0, sequence_length)[:, None]
     rates = np.abs(np.linspace(np.log(decay_target) / fast_decay, np.log(decay_target) / slow_decay, channels))
-    return (np.exp(-time * rates[None]) + window_shift).astype(GLOBAL_DTYPE)
+    return np.exp(-time * rates[None]) + window_shift
 
 
 # -------------    causal FFT convolution    -----------------------
@@ -74,7 +74,7 @@ def causal_convolution(signal: NDArray, filters: NDArray) -> NDArray:
     length = signal.shape[1]
     padded = 2 * length
     spectrum = np.fft.rfft(signal, n=padded, axis=1) * np.fft.rfft(filters, n=padded, axis=0)[None]
-    return np.fft.irfft(spectrum, n=padded, axis=1)[:, :length].astype(GLOBAL_DTYPE)
+    return np.fft.irfft(spectrum, n=padded, axis=1)[:, :length]
 
 
 def causal_convolution_backward(
@@ -96,7 +96,7 @@ def causal_convolution_backward(
 
     signal_gradient = np.fft.irfft(gradient_transform * np.conj(filter_transform), n=padded, axis=1)[:, :length]
     filter_gradient = np.fft.irfft(gradient_transform * np.conj(signal_transform), n=padded, axis=1)[:, :length]
-    return signal_gradient.astype(GLOBAL_DTYPE), filter_gradient.sum(axis=0).astype(GLOBAL_DTYPE)
+    return signal_gradient, filter_gradient.sum(axis=0)
 
 
 def delay(array: NDArray, steps: int) -> NDArray:
@@ -129,6 +129,8 @@ class ShortConvolution(Layer):
     """
 
     preserves_shape = True
+    parameter_names = ("weights", "bias")
+    cache_names = ("input",)
 
     def __init__(self, channels: int, kernel_size: int = 3, initialization: str = "lecun"):
         """
@@ -145,10 +147,8 @@ class ShortConvolution(Layer):
         self.initialization = initialization
         self.declare_shapes(inputs=((channels,),), outputs=((channels,),))
 
-        self.weights = get_weight_init(initialization)(self.RNG, ni=kernel_size, no=channels)
-        self.bias = np.zeros(channels, dtype=GLOBAL_DTYPE)
-
-        self.purge()
+        self.weights = get_weight_init(initialization)(RNG, ni=kernel_size, no=channels)
+        self.bias = np.zeros(channels)
         self.zero_gradients()
 
     def forward(self, input_data: NDArray, mask: Optional[NDArray] = None) -> NDArray:
@@ -164,35 +164,6 @@ class ShortConvolution(Layer):
         )
         self.gradient_bias = incoming_gradient.sum(axis=(0, 1))
         return sum(self.weights[lag] * advance(incoming_gradient, lag) for lag in range(self.kernel_size))
-
-    def get_weights(self, for_serialize: bool = False):
-        if for_serialize:
-            return {"weights": self.weights, "bias": self.bias}
-        return self.weights, self.bias
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        self.weights = np.asarray(weights["weights"], dtype=GLOBAL_DTYPE)
-        self.bias = np.asarray(weights["bias"], dtype=GLOBAL_DTYPE)
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {"gradient_weights": self.gradient_weights, "gradient_bias": self.gradient_bias}
-
-    def update_weights(self, gradient_weights: NDArray, gradient_bias: NDArray) -> None:
-        self.weights -= gradient_weights
-        self.bias -= gradient_bias
-
-    def zero_gradients(self) -> None:
-        self.gradient_weights = np.zeros_like(self.weights)
-        self.gradient_bias = np.zeros_like(self.bias)
-
-    def purge(self) -> None:
-        self.input = None
-
-    @property
-    def num_parameters(self) -> int:
-        return self.weights.size + self.bias.size
 
     def __str__(self):
         return f"ShortConvolution, {self.channels} channels, kernel {self.kernel_size}"
@@ -226,6 +197,8 @@ class HyenaFilter(Layer):
     """
 
     preserves_shape = False
+    parameter_names = ("weights_1", "bias_1", "weights_2", "bias_2", "weights_3", "skip")
+    cache_names = ("hidden_pre_1", "hidden_1", "hidden_pre_2", "hidden_2", "filters")
 
     def __init__(
         self,
@@ -277,19 +250,13 @@ class HyenaFilter(Layer):
 
         features = self.positions.shape[1]
         initializer = get_weight_init(initialization)
-        self.weights_1 = sine_frequency * initializer(self.RNG, ni=features, no=filter_features)
-        self.bias_1 = np.zeros(filter_features, dtype=GLOBAL_DTYPE)
-        self.weights_2 = sine_frequency * initializer(self.RNG, ni=filter_features, no=filter_features)
-        self.bias_2 = np.zeros(filter_features, dtype=GLOBAL_DTYPE)
-        self.weights_3 = initializer(self.RNG, ni=filter_features, no=order * channels)
-        self.skip = np.zeros((order, channels), dtype=GLOBAL_DTYPE)
-
-        self.purge()
+        self.weights_1 = sine_frequency * initializer(RNG, ni=features, no=filter_features)
+        self.bias_1 = np.zeros(filter_features)
+        self.weights_2 = sine_frequency * initializer(RNG, ni=filter_features, no=filter_features)
+        self.bias_2 = np.zeros(filter_features)
+        self.weights_3 = initializer(RNG, ni=filter_features, no=order * channels)
+        self.skip = np.zeros((order, channels))
         self.zero_gradients()
-
-    @property
-    def parameter_names(self) -> tuple[str, ...]:
-        return ("weights_1", "bias_1", "weights_2", "bias_2", "weights_3", "skip")
 
     def forward(self) -> NDArray:
         self.hidden_pre_1 = self.positions @ self.weights_1 + self.bias_1
@@ -318,41 +285,6 @@ class HyenaFilter(Layer):
         pre_1_gradient = (pre_2_gradient @ self.weights_2.T) * np.cos(self.hidden_pre_1)
         self.gradient_weights_1 = self.positions.T @ pre_1_gradient
         self.gradient_bias_1 = pre_1_gradient.sum(axis=0)
-
-
-    def get_weights(self, for_serialize: bool = False):
-        weights = {name: getattr(self, name) for name in self.parameter_names}
-        return weights if for_serialize else tuple(weights.values())
-
-    def set_weights(self, weights: dict) -> None:
-        if not weights:
-            return
-        for name in self.parameter_names:
-            if name in weights:
-                setattr(self, name, np.asarray(weights[name], dtype=GLOBAL_DTYPE))
-
-    def get_gradients(self) -> dict[str, NDArray]:
-        return {f"gradient_{name}": getattr(self, f"gradient_{name}") for name in self.parameter_names}
-
-    def update_weights(self, **gradients: NDArray) -> None:
-        for name in self.parameter_names:
-            if f"gradient_{name}" in gradients:
-                setattr(self, name, getattr(self, name) - gradients[f"gradient_{name}"])
-
-    def zero_gradients(self) -> None:
-        for name in self.parameter_names:
-            setattr(self, f"gradient_{name}", np.zeros_like(getattr(self, name)))
-
-    def purge(self) -> None:
-        self.hidden_pre_1 = None
-        self.hidden_1 = None
-        self.hidden_pre_2 = None
-        self.hidden_2 = None
-        self.filters = None
-
-    @property
-    def num_parameters(self) -> int:
-        return sum(getattr(self, name).size for name in self.parameter_names)
 
     def __str__(self):
         return (
@@ -385,6 +317,8 @@ class HyenaOperator(Layer):
 
     registry_name = "HyenaOperator"
     preserves_shape = True
+    parameter_names = ("input_projection", "short_convolution", "hyena_filter", "output_projection")
+    cache_names = ("input", "mask", "gates", "filters", "states", "convolved", "output")
 
     def __init__(
         self,
@@ -441,18 +375,7 @@ class HyenaOperator(Layer):
         self.output_projection = FullyConnectedLayer(
             hidden_dim, hidden_dim, "linear", initialization_override=initialization
         )
-
-        self.purge()
         self.zero_gradients()
-
-    def owned_layers(self) -> dict[str, Layer]:
-        """sublayers by the key their weights and gradients are stored under"""
-        return {
-            "input_projection": self.input_projection,
-            "short_convolution": self.short_convolution,
-            "hyena_filter": self.hyena_filter,
-            "output_projection": self.output_projection,
-        }
 
     def forward(
         self,
@@ -476,9 +399,7 @@ class HyenaOperator(Layer):
         assert input_data.shape[2] == self.hidden_dim
 
         self.input = input_data
-        self.mask = (
-            mask.astype(GLOBAL_DTYPE) if mask is not None else np.ones(input_data.shape[:2], dtype=GLOBAL_DTYPE)
-        )
+        self.mask = mask if mask is not None else np.ones(input_data.shape[:2])
 
         projected = self.input_projection.forward(input_data) * self.mask[..., None]
         mixed = self.short_convolution.forward(projected)
@@ -513,44 +434,6 @@ class HyenaOperator(Layer):
         mixed_gradient = np.concatenate(gate_gradients + [value_gradient], axis=-1)
         projected_gradient = self.short_convolution.backward(mixed_gradient) * self.mask[..., None]
         return self.input_projection.backward(projected_gradient)
-
-    def get_weights(self, for_serialize: bool = False) -> tuple | dict:
-        weights = {name: layer.get_weights(for_serialize=for_serialize) for name, layer in self.owned_layers().items()}
-        return weights if for_serialize else tuple(weights.values())
-
-    def set_weights(self, weights: dict) -> None:
-        if weights is None:
-            return
-        for name, layer in self.owned_layers().items():
-            if name in weights:
-                layer.set_weights(weights[name])
-
-    def get_gradients(self) -> dict[str, dict]:
-        return {name: layer.get_gradients() for name, layer in self.owned_layers().items()}
-
-    def update_weights(self, **gradients: dict) -> None:
-        for name, layer in self.owned_layers().items():
-            if gradients.get(name):
-                layer.update_weights(**gradients[name])
-
-    def zero_gradients(self) -> None:
-        for layer in self.owned_layers().values():
-            layer.zero_gradients()
-
-    def purge(self) -> None:
-        self.input = None
-        self.mask = None
-        self.gates = None
-        self.filters = None
-        self.states = None
-        self.convolved = None
-        self.output = None
-        for layer in self.owned_layers().values():
-            layer.purge()
-
-    @property
-    def num_parameters(self) -> int:
-        return sum(layer.num_parameters for layer in self.owned_layers().values())
 
     def __str__(self):
         return f"Hyena operator, order {self.order}, sequence {self.sequence_length}, hidden {self.hidden_dim}"

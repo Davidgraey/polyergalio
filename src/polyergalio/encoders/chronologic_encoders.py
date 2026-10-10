@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-from polyergalio.encoders.encoder_constants import DELTA_LOOKUP, Period
+from polyergalio.encoders.constants import DELTA_LOOKUP, Period
 from polyergalio.encoders.encoder_utils import (
     DISPATCHER,
     INVERT_DISPATCHER,
@@ -54,7 +54,7 @@ class TimeCycleProcessor(Processor):
         -------
         True if fitting was successful
         """
-        self._fitted = True
+        self.fitted = True
         return True
 
     def encode(self, values: pd.Series):
@@ -100,7 +100,7 @@ class TimeCycleProcessor(Processor):
 
 
 class TimeAbsoluteProcessor(Processor):
-    _structural_state_keys = Processor._structural_state_keys + ("fitted_min", "fitted_max")
+    state_names = ("fitted_min", "fitted_max")
 
     def __init__(
         self,
@@ -154,7 +154,7 @@ class TimeAbsoluteProcessor(Processor):
         values, valid_idx = self.get_localized_deltas(target_values, anchor_values, timezone_values)
         self.fitted_min = np.nanmin(values[valid_idx])
         self.fitted_max = np.nanmax(values[valid_idx])
-        self._fitted = True
+        self.fitted = True
         return True
 
     def encode(self,
