@@ -1,6 +1,5 @@
 """
-The NeuralNetwork graph container (DAG): wiring checks, gradient flow through
-fan-out and merges, and end-to-end training.
+The Network graph container (DAG): wiring checks, gradient flow through fan-out and merges, and end-to-end training.
 """
 
 import inspect

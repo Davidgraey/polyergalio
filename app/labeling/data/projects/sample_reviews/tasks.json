@@ -1,0 +1,90 @@
+[
+  {
+    "archived": false,
+    "id": "sentiment",
+    "label_col": "",
+    "label_definitions": {
+      "negative": "The customer is dissatisfied, complaining, or describing a failure.",
+      "neutral": "Factual or balanced, with no clear satisfaction or dissatisfaction.",
+      "positive": "The customer is satisfied, pleased, or recommending."
+    },
+    "labels": [
+      "negative",
+      "neutral",
+      "positive"
+    ],
+    "multi_label": false,
+    "n_candidates": 4,
+    "name": "Sentiment",
+    "pred_col": "",
+    "rubric": "Judge the customer's overall feeling about the whole review, not any single sentence. If feelings are mixed, choose the one that dominates. A polite closing ('thanks') does not make an otherwise negative review positive.",
+    "type": "classification"
+  },
+  {
+    "archived": false,
+    "id": "ner",
+    "label_col": "",
+    "label_definitions": {
+      "LOC": "A named place: city, country, address, or region.",
+      "O": "Not part of any named entity.",
+      "ORG": "A named company, team, or institution.",
+      "PER": "A named person (first name, surname, or full name).",
+      "PRODUCT": "A named product, model, or service."
+    },
+    "labels": [
+      "O",
+      "PER",
+      "ORG",
+      "LOC",
+      "PRODUCT"
+    ],
+    "multi_label": false,
+    "n_candidates": 4,
+    "name": "Named entities",
+    "pred_col": "",
+    "rubric": "Tag every token. Use 'O' for anything that is not a named entity. Tag each token of a multi-word name (e.g. both words of a company name). Do not tag generic nouns.",
+    "type": "token"
+  },
+  {
+    "archived": false,
+    "id": "aspects",
+    "label_col": "",
+    "label_definitions": {
+      "DELIVERY": "Shipping speed, packaging condition, courier, or arrival problems.",
+      "PRICE": "Cost, value for money, discounts, fees, or refunds.",
+      "QUALITY": "How well the product is made or works.",
+      "SUPPORT": "Interaction with customer service or help channels."
+    },
+    "labels": [
+      "DELIVERY",
+      "PRICE",
+      "QUALITY",
+      "SUPPORT"
+    ],
+    "multi_label": false,
+    "n_candidates": 4,
+    "name": "Aspect spans",
+    "pred_col": "",
+    "rubric": "Select the shortest phrase that expresses an opinion or fact about an aspect. Spans may overlap when one phrase covers two aspects. If the text mentions none, save with no spans.",
+    "type": "span"
+  },
+  {
+    "archived": false,
+    "id": "similarity",
+    "label_col": "",
+    "label_definitions": {
+      "dissimilar": "Describes a different issue or topic from the anchor.",
+      "similar": "Describes the same underlying issue or topic as the anchor."
+    },
+    "labels": [
+      "similar",
+      "dissimilar"
+    ],
+    "multi_label": false,
+    "n_candidates": 4,
+    "name": "Similar to anchor",
+    "pred_col": "",
+    "rubric": "Compare each candidate with the anchor sample above. Decide on the underlying issue, not on shared words or tone.",
+    "type": "contrastive"
+  }
+]

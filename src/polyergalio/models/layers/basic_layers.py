@@ -103,9 +103,10 @@ class FullyConnectedLayer(Layer):
         """
         activation = activations.activation_dictionary[forced_activation or self.activation_type]
         self.in_shape = incoming_x.shape
-        assert self.in_shape[-1] == self.weights.shape[0], (
-            f"weights and xs don't match -- x:{incoming_x.shape} weights: {self.weights.shape}"
-        )
+        if not self.training:
+            return activation(
+                incoming_x.reshape(-1, self.in_shape[-1]) @ self.weights + self.bias
+            ).reshape(*self.in_shape[:-1], -1)
         self.input = incoming_x.reshape(-1, self.in_shape[-1])
         self.z = self.input @ self.weights + self.bias
         self.output = activation(self.z)
@@ -182,9 +183,8 @@ class DropoutLayer(Layer):
         the input with elements dropped in training mode, unchanged in inference
         """
         if not self.training:
-            self.mask = None
-            self.output = incoming_x
-            return self.output
+            # pass through -- no modification
+            return incoming_x
 
         self.mask = RNG.binomial(1, self.keep_prob, size=incoming_x.shape)
         if self.use_rescale:
@@ -243,6 +243,12 @@ class NormalizeLayer(Layer):
         input_reshaped = incoming_x.reshape(-1, self.in_shape[-1])
 
         mean = np.mean(input_reshaped, axis=-1, keepdims=True)
+
+        if not self.training:
+            centered = (input_reshaped - mean) / np.sqrt(np.var(input_reshaped, axis=-1, keepdims=True) + self.eps)
+            if self.shift_scale:
+                return (self.scale_gamma * centered + self.shift_beta).reshape(self.in_shape)
+
         self.std = np.sqrt(np.var(input_reshaped, axis=-1, keepdims=True) + self.eps)
         self.x_norm = (input_reshaped - mean) / self.std
 
@@ -307,6 +313,12 @@ class RMSNormLayer(Layer):
         """
         in_shape = incoming_x.shape
         input_reshaped = incoming_x.reshape(-1, in_shape[-1])
+        if not self.training:
+            return (self.scale_gamma
+                    * (input_reshaped
+                       / (np.sqrt(np.mean(input_reshaped ** 2, axis=-1, keepdims=True) + self.padding_epsilon))
+                       )).reshape(in_shape)
+
         self.rms = np.sqrt(np.mean(input_reshaped ** 2, axis=-1, keepdims=True) + self.padding_epsilon)
         self.x_norm = input_reshaped / self.rms
         return (self.x_norm * self.scale_gamma).reshape(in_shape)

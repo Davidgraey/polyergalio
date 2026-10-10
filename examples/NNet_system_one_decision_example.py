@@ -26,6 +26,7 @@ from polyergalio.models.heads import (
     calibrated_probabilities,
     decision_confidence,
     decision_correct,
+    decision_type_ids,
     decode_decisions,
     fit_temperatures,
     masked_softmax,
@@ -83,6 +84,12 @@ def row_correctness(logits, y, kwargs: dict):
     return decision_correct(decisions, y, kwargs["decisiontypes"])
 
 
+def predicted_options(decisions, decisiontypes) -> np.ndarray:
+    """(batch,) option index each decoded decision resolves to: P(true) past 0.5 for binary, the rounded level otherwise."""
+    binary = decision_type_ids(decisiontypes) == DECISION_TYPES.BINARY.value
+    return np.where(binary, (decisions >= 0.5).astype(int), np.rint(decisions).astype(int))
+
+
 def accuracy(logits, y, kwargs: dict) -> float:
     """Fraction of rows decoded correctly against the generator's answers."""
     return float(row_correctness(logits, y, kwargs).mean())
@@ -126,8 +133,8 @@ def evaluate(net: Network, x, y, kwargs: dict, temperatures: dict, threshold: fl
 
     Returns
     -------
-    per-row arrays (decisions, correct, confidence, act, escalated) and the
-    answer NLL before and after calibration
+    per-row arrays (probabilities, decisions, predicted, correct, confidence, act, escalated)
+    and the answer NLL before and after calibration
     """
     net.eval()
     head = net.node("decision_head").layer
@@ -137,7 +144,9 @@ def evaluate(net: Network, x, y, kwargs: dict, temperatures: dict, threshold: fl
     probabilities = calibrated_probabilities(logits, token_mask, decisiontypes, temperatures)
     decisions = decode_decisions(probabilities, decisiontypes)
     return dict(
+        probabilities=probabilities,
         decisions=decisions,
+        predicted=predicted_options(decisions, decisiontypes),
         correct=decision_correct(decisions, y, decisiontypes),
         confidence=decision_confidence(probabilities, token_mask),
         act=head.act_probabilities,
@@ -155,6 +164,20 @@ def print_evaluation(results: dict, temperatures: dict) -> None:
     print(f"accuracy {correct.mean():.3f}  mean confidence {results['confidence'].mean():.3f}  mean P(act) {results['act'].mean():.3f}")
     print(f"escalated to system two: {escalated.mean():.3f} of rows")
     print(f"accuracy kept {rate(correct, ~escalated):.3f}  escalated {rate(correct, escalated):.3f}")
+
+
+def print_predictions(results: dict, y, kwargs: dict, count: int = 8) -> None:
+    """Print the head's calibrated option probabilities, prediction and escalation for the first rows."""
+    names = {member.value: member.name.lower() for member in DECISION_TYPES}
+    print(f"\nfirst {count} test rows (answer -> predicted, calibrated option probabilities)")
+    for row in range(min(count, len(y))):
+        options = kwargs["token_mask"][row].astype(bool)
+        probabilities = " ".join(f"{p:.2f}" for p in results["probabilities"][row][options])
+        print(
+            f"  {names[int(kwargs['decisiontypes'][row])]:6s} {y[row]} -> {results['predicted'][row]}  "
+            f"[{probabilities}]  confidence {results['confidence'][row]:.2f}  P(act) {results['act'][row]:.2f}  "
+            f"{'escalated' if results['escalated'][row] else 'kept'}"
+        )
 
 
 def main():
@@ -205,7 +228,9 @@ def main():
 
     temperatures = fit_calibration(net, *calibration_set)
     print("\n--- test rows ---")
-    print_evaluation(evaluate(net, x_test, y_test, test_kwargs, temperatures), temperatures)
+    results = evaluate(net, x_test, y_test, test_kwargs, temperatures)
+    print_evaluation(results, temperatures)
+    print_predictions(results, y_test, test_kwargs)
 
 
 if __name__ == "__main__":

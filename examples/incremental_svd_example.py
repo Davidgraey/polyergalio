@@ -17,6 +17,7 @@ them. Parts 1 and 2 use data normalized up front, part 3 puts a StandardizeLayer
    target depends on every feature, so the narrow output costs accuracy). Then a serialize / deserialize round trip.
 4. Output forms and freezing: the orthogonalized, whitened and projection outputs; eigenvector_change shrinking as
    batches arrive; freeze() so extra epochs over the same rows leave the factors and counts alone.
+5. Shapes: the shape of every array a merge and a forward pass handle, for a full-width layer and a reduced one.
 
 Run: python incremental_svd_example.py
 """
@@ -46,10 +47,25 @@ EXTRA_EPOCHS = 3
 NOISE = 0.1
 
 
-def make_data(rng: np.random.Generator) -> np.ndarray:
+def make_data(rng: np.random.Generator, num_samples: int = NUM_SAMPLES, num_features: int = NUM_FEATURES) -> np.ndarray:
     """Correlated features with a large offset."""
-    mixing = rng.normal(size=(NUM_FEATURES, NUM_FEATURES))
-    return rng.normal(size=(NUM_SAMPLES, NUM_FEATURES)) @ mixing + 5 * rng.normal(size=NUM_FEATURES)
+    mixing = rng.normal(size=(num_features, num_features))
+    return rng.normal(size=(num_samples, num_features)) @ mixing + 5 * rng.normal(size=num_features)
+
+
+def make_drift_data(
+    rng: np.random.Generator, num_samples: int = NUM_SAMPLES, num_features: int = NUM_FEATURES
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns
+    -------
+    rows whose covariance changes halfway, and the second half alone
+    """
+    halves = [
+        rng.normal(size=(num_samples // 2, num_features)) @ rng.normal(size=(num_features, num_features))
+        for _ in range(2)
+    ]
+    return np.vstack(halves), halves[1]
 
 
 def one_shot(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -85,12 +101,8 @@ def compare_batch_sizes(x: np.ndarray) -> None:
 
 
 def compare_decay(rng: np.random.Generator) -> None:
-    halves = [
-        rng.normal(size=(NUM_SAMPLES // 2, NUM_FEATURES)) @ rng.normal(size=(NUM_FEATURES, NUM_FEATURES))
-        for _ in range(2)
-    ]
-    x = np.vstack(halves)
-    recent_top = np.linalg.eigh(halves[1].T @ halves[1])[1][:, -1]
+    x, recent = make_drift_data(rng)
+    recent_top = np.linalg.eigh(recent.T @ recent)[1][:, -1]
     print("covariance changes halfway; |cos| of the top eigenvector with the recent half's")
     for rate in DECAY_RATES:
         layer = stream(IncrementalSVDLayer(NUM_FEATURES, decay_rate=rate), x, DRIFT_BATCH, DRIFT_BATCH)
@@ -177,6 +189,44 @@ def freeze_when_settled(x: np.ndarray) -> None:
     print(f"  singular values unchanged: {np.array_equal(layer.singular_values, values)}\n")
 
 
+def layer_shapes(layer: IncrementalSVDLayer, batch_rows: int) -> list[tuple[str, tuple, str]]:
+    """
+    Shapes of the arrays a merge and a forward pass handle, from the layer's current factors.
+
+    Returns
+    -------
+    (name, shape, meaning) for the batch, factors, merge core, transform, output and statistics
+    """
+    features, rank = layer.input_dimension, layer.singular_values.size
+    return [
+        ("batch x", (batch_rows, features), "rows in"),
+        ("eigenvectors V", tuple(layer.eigenvectors.shape), "right singular vectors held"),
+        ("singular values S", tuple(layer.singular_values.shape), "one per component held"),
+        ("merge core", (rank + min(features, batch_rows), rank + batch_rows), "diag(S), V'x over 0, R: SVD'd to merge a batch"),
+        ("transform", (features, layer.output_dimension), "map from rows to the output form"),
+        ("output z", (batch_rows, layer.output_dimension), "transformed rows, standardized"),
+        ("means, stds", tuple(layer.x_means.shape), "moving statistics of each output column"),
+    ]
+
+
+def print_shapes(layer: IncrementalSVDLayer, batch_rows: int) -> None:
+    print(f"{layer}")
+    for name, shape, meaning in layer_shapes(layer, batch_rows):
+        print(f"  {name:>18} {str(shape):>12}  {meaning}")
+
+
+def show_shapes(x: np.ndarray) -> None:
+    print("shapes after streaming 100-row batches")
+    full = stream(IncrementalSVDLayer(NUM_FEATURES), x, BATCH_SIZE, BATCH_SIZE)
+    print_shapes(full, BATCH_SIZE)
+    reduced = stream(
+        IncrementalSVDLayer(NUM_FEATURES, num_components=REDUCED_DIMENSION, output_dimension=REDUCED_DIMENSION, output_form="whitened"),
+        x, BATCH_SIZE, BATCH_SIZE,
+    )
+    print_shapes(reduced, BATCH_SIZE)
+    print()
+
+
 def main():
     rng = np.random.default_rng(0)
     x = make_data(rng)
@@ -185,6 +235,7 @@ def main():
     compare_networks(x, rng)
     compare_forms(standardize_data(x))
     freeze_when_settled(standardize_data(x))
+    show_shapes(standardize_data(x))
 
 
 if __name__ == "__main__":

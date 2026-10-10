@@ -1,0 +1,7 @@
+{
+  "created": "2026-10-10T00:47:20.202+00:00",
+  "dataset": "sample_reviews.jsonl",
+  "model_version": 0,
+  "n_samples": 12,
+  "sha256": "0f3284cba1af7ebe64106948640f8c8a27f1a5c78c3f3edf591c21d2f09c54e2"
+}

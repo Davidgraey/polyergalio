@@ -82,7 +82,8 @@ class IncrementalSVDLayer(Layer):
         if self.output_dimension < input_dimension and self.output_dimension > self.num_components:
             raise ValueError(f"output_dimension {output_dimension} needs num_components of at least as many")
 
-        if output_form == "orthogonalized" and output_dimension != input_dimension:
+        output_form = DecompositionForm(output_form)
+        if output_form is DecompositionForm.ORTHO and output_dimension != input_dimension:
             raise ValueError("output_form 'orthogonalized' needs output_dimension equal to input_dimension")
 
         self.output_form = output_form
@@ -205,9 +206,10 @@ class IncrementalSVDLayer(Layer):
         -------
         (..., output_dimension) rows in the chosen output_form, standardized with the moving statistics
         """
-        training_now = self.training & self.frozen
+        training_now = self.training if training_now is None else training_now
+        training_now = training_now and not self.frozen
 
-        self.num_samples = x_data.shape[:-1]
+        self.lead_shape = x_data.shape[:-1]
         flat = x_data.reshape(-1, self.input_dimension)
 
         if training_now:
@@ -230,7 +232,7 @@ class IncrementalSVDLayer(Layer):
 
         if self.standardize:
             projected = standardize(self, projected)
-        return projected.reshape(*self.num_samples, -1)
+        return projected.reshape(*self.lead_shape, -1)
 
     def backward(self, incoming_grad: NDArray = None) -> NDArray:
         """
@@ -247,7 +249,7 @@ class IncrementalSVDLayer(Layer):
         grad = np.asarray(incoming_grad).reshape(-1, self.output_dimension)
         if self.standardize:
             grad = grad / (self.x_stds + EPSILON)
-        return (grad @ self.transform.T).reshape(*self.num_samples, self.input_dimension)
+        return (grad @ self.transform.T).reshape(*self.lead_shape, self.input_dimension)
 
     def inverse(self, output: NDArray) -> NDArray:
         """

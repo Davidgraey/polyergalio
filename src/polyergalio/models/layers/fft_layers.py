@@ -67,6 +67,8 @@ class FrequencyFFT(Layer):
         )
 
         input_reshaped = incoming_x.reshape(-1, self.in_shape[-1])
+        if not self.training:
+            return hartley(self.window_kernel * input_reshaped, axis=-1).reshape(self.in_shape)
         self.output = hartley(self.window_kernel * input_reshaped, axis=-1)
         return self.output.reshape(self.in_shape)
 
@@ -106,6 +108,8 @@ class FourierLayer(HartleyLayer):
         mask : unused; the transform is linear and the sequence is already zero-padded upstream, so a padded
             position contributes nothing to any output frequency. Kept for pass-through compatibility with the graph.
         """
+        if not self.training:
+            return self.transform(incoming_x)
         self.output = self.transform(incoming_x)
         return self.output
 
@@ -128,6 +132,9 @@ class InverseFourierLayer(HartleyLayer):
         """
         shape = incoming_x.shape
         self.scale = shape[-2] * shape[-1] if self.use_2d else shape[-1]
+        if not self.training:
+            return self.transform(incoming_x) / self.scale
+
         self.output = self.transform(incoming_x) / self.scale
         return self.output
 
@@ -169,8 +176,12 @@ class FourierAttention(Layer):
                 f"leaking between samples. Got shape {x_data.shape}; pass "
                 "(batch, sequence, hidden) or use use_2d=False."
             )
-        self.training_now = self.training if training_now is None else training_now
+
         fft_x = self.norm_a(self.fftlayer(x_data) + x_data)
+
+        if not self.training:
+            return self.norm_b(self.fc(fft_x) + fft_x)
+
         self.output = self.norm_b(self.fc(fft_x) + fft_x)
         return self.output
 

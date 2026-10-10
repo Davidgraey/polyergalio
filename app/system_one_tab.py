@@ -10,6 +10,7 @@ from NNet_system_one_decision_example import (
     evaluate,
     fit_calibration,
     print_evaluation,
+    print_predictions,
     row_correctness,
     split_rows,
 )
@@ -49,6 +50,62 @@ def generate_frame(samples: int, choices: int, levels: int, types: list, seed: i
     frame["answer"] = y
     frame["type"] = [TYPE_NAMES[int(t)] for t in meta["decisiontypes"]]
     return frame, meta
+
+
+def prediction_frame(results: dict, y, kwargs: dict, first_row: int) -> pd.DataFrame:
+    """One row per test row: answer, the head's prediction, calibrated option probabilities, confidence, P(act), escalation."""
+    token_mask = kwargs["token_mask"].astype(bool)
+    probabilities = np.where(token_mask, results["probabilities"], np.nan)
+    frame = pd.DataFrame(
+        {
+            "row": first_row + np.arange(len(y)),
+            "type": [TYPE_NAMES[int(value)] for value in kwargs["decisiontypes"]],
+            "options": token_mask.sum(axis=1),
+            "answer": y,
+            "predicted": results["predicted"],
+            "correct": results["correct"].astype(bool),
+            "confidence": results["confidence"],
+            "P(act)": results["act"],
+            "escalated": results["escalated"].astype(bool),
+        }
+    )
+    for option in range(probabilities.shape[1]):
+        frame[f"p{option}"] = probabilities[:, option]
+    return frame
+
+
+def plot_predictions(results: dict, y, kwargs: dict, rows: int = 40) -> None:
+    """Calibrated option probabilities for the first test rows with the answer marked, and the confusion matrix."""
+    token_mask = kwargs["token_mask"].astype(bool)
+    shown = min(rows, len(y))
+    probabilities = np.ma.masked_array(results["probabilities"][:shown], mask=~token_mask[:shown])
+    num_options = token_mask.shape[1]
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5), gridspec_kw={"width_ratios": [1.2, 1]})
+    image = axes[0].imshow(probabilities, aspect="auto", cmap="viridis", vmin=0, vmax=1)
+    axes[0].scatter(y[:shown], np.arange(shown), marker="o", facecolors="none", edgecolors="white", s=60, label="answer")
+    wrong = ~results["correct"][:shown].astype(bool)
+    axes[0].scatter(results["predicted"][:shown][wrong], np.arange(shown)[wrong], marker="x", color="red", s=40, label="wrong prediction")
+    axes[0].set_xticks(range(num_options))
+    axes[0].set_yticks(range(shown))
+    axes[0].set_yticklabels([TYPE_NAMES[int(kind)] for kind in kwargs["decisiontypes"][:shown]], fontsize=6)
+    axes[0].set_xlabel("Option")
+    axes[0].set_title(f"Calibrated probabilities, first {shown} test rows")
+    axes[0].legend(loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=2, fontsize=7)
+    fig.colorbar(image, ax=axes[0], fraction=0.04)
+
+    confusion = np.zeros((num_options, num_options), dtype=int)
+    np.add.at(confusion, (y, np.clip(results["predicted"], 0, num_options - 1)), 1)
+    axes[1].imshow(confusion, cmap="Blues")
+    for answer in range(num_options):
+        for predicted in range(num_options):
+            axes[1].text(predicted, answer, confusion[answer, predicted], ha="center", va="center", fontsize=8)
+    axes[1].set_xticks(range(num_options))
+    axes[1].set_yticks(range(num_options))
+    axes[1].set_xlabel("Predicted option")
+    axes[1].set_ylabel("Answer")
+    axes[1].set_title("Predictions on all test rows")
+    fig.tight_layout()
 
 
 def train(x, y, meta, hidden: int, head_hidden: int, heads: int, learning_rate: float, steps: int, threshold: float) -> None:
@@ -110,6 +167,9 @@ def train(x, y, meta, hidden: int, head_hidden: int, heads: int, learning_rate: 
             ]
         ),
     )
+    first_row = len(x_train) + len(calibration_set[0])
+    print_predictions(results, y_test, test_kwargs)
+    emit_table("Test-row predictions", prediction_frame(results, y_test, test_kwargs, first_row))
     emit_table("Temperatures by bucket", pd.DataFrame({"bucket": list(temperatures), "temperature": list(temperatures.values())}))
 
     after = float(results["correct"].mean())
@@ -131,6 +191,7 @@ def train(x, y, meta, hidden: int, head_hidden: int, heads: int, learning_rate: 
     axes[2].set_xlabel("P(act)")
     axes[2].legend()
     fig.tight_layout()
+    plot_predictions(results, y_test, test_kwargs)
     flush_figures()
 
 
