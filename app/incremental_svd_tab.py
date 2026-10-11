@@ -8,7 +8,7 @@ from common import edit_table, emit_table, flush_figures, run_panel, show_diagra
 from incremental_svd_example import layer_shapes, make_data, make_drift_data, one_shot, print_shapes
 from polyergalio.models.layers import FullyConnectedLayer, StandardizeLayer
 from polyergalio.models.network import Network
-from polyergalio.transforms.decompositions import IncrementalSVDLayer
+from polyergalio.models.layers.decomposition_layer import IncrementalSVDLayer
 from polyergalio.utilities import standardize_data
 from polyergalio.visuals.nnet_visuals import plot_network
 

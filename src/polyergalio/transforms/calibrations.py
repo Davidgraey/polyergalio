@@ -1,11 +1,12 @@
-import matplotlib.pyplot as plt
+from enum import Enum
+from typing import Optional
+
 import numpy as np
 from numpy.typing import NDArray
-from typing import Optional
+
 from polyergalio.base_model import BasalEstimator
 from polyergalio.models.activations import sigmoid
 from polyergalio.models.constants import EPSILON
-from enum import Enum
 
 
 class CalibrationType(Enum):
@@ -20,8 +21,10 @@ class ProbCalibration(BasalEstimator):
     logist into a calibrated probability space
 
     Platt Scaling fits a sigmoid: P(y=1|f) = 1 / (1 + exp(A*f + B))
-    Isotonic Regression (PAVA) fits a non-decreasing step function.
-    Temperature Scaling divides logits by learned T: P = sigmoid(f/T) or softmax(f/T)
+    Isotonic Regression (PAVA) fits a non-decreasing step function
+    Spline -
+
+    TODO: Temperature Scaling divides logits by learned T: P = sigmoid(f/T) or softmax(f/T)
     """
 
     state_names = ("fitted",)
@@ -96,8 +99,7 @@ class ProbCalibration(BasalEstimator):
 
         Returns
         -------
-        calibrated : ndarray of shape (n_samples, num_classes)
-            Calibrated probabilities .
+        calibrated : adusted / calibrated values
         """
         if not self.fitted:
             raise RuntimeError("Model has not been fitted. Call fit() first.")
@@ -138,24 +140,22 @@ class ProbCalibration(BasalEstimator):
                    tolerance: float = 1e-10,
                    ) -> "ProbCalibration":
         """
-        Platt scaling via Gauss-Newtonian (L-Sum-of-Squares) / line search
+        Platt scaling via Gauss-Newtonian (Weighted Least-Sum-of-Squares) via line search
 
-        Minimizes the negative log-likelihood:
-        derived from label smoothing (Platt's original formulation).
+        Minimizes the negative log-likelihood: derived from label smoothing (Platt's original formulation).
 
         sigmoid(A*s +B)
 
         Parameters
         ----------
-        logits -
+        logits
         labels
         max_iter
         tolerance
 
         Returns
         -------
-        A, B : float
-            Fitted sigmoid parameters.
+        A, B : Fitted sigmoid parameters.
         """
         num_samples = len(logits)
 
@@ -177,9 +177,7 @@ class ProbCalibration(BasalEstimator):
             prob_scores = self._platt_forward(logits)
             residual = prob_scores - targets
 
-            # gradient of the NLL. d/dA is the residual weighted by the score,
-            # d/dB is the plain residual sum, both reduced over samples only so
-            # every column keeps its own parameters.
+            # gradient of the NLL. d/dA is the residual weighted by the score, d/dB is the plain residual sum
             grad_a = np.sum(residual * logits, axis=0)
             grad_b = np.sum(residual, axis=0)
 
@@ -193,9 +191,7 @@ class ProbCalibration(BasalEstimator):
             if np.any(np.abs(determinate) < EPSILON):
                 break
 
-            # Newton direction, solving H @ delta = -grad for the 2x2 system.
-            # Both components read the original gradient, so neither may be
-            # written until the pair has been computed.
+            # Newton direction, solving H @ delta = -grad for the 2x2 system
             delta_a = -(_h22 * grad_a - _h12 * grad_b) / determinate
             delta_b = -(_h11 * grad_b - _h12 * grad_a) / determinate
 
@@ -203,9 +199,7 @@ class ProbCalibration(BasalEstimator):
             base_intercept = self.platt_intercept
             old_nll = self._nll(logits, targets, base_coef, base_intercept)
 
-            # backtracking line search. Each trial starts from the base point
-            # rather than the previous trial, so halving shortens the step
-            # instead of compounding it.
+            # backtracking line search- Each trial starts from the base point
             step = 1.0
             accepted = False
             for _ in range(10):
@@ -248,26 +242,23 @@ class ProbCalibration(BasalEstimator):
         """
         Pool Adjacent Violators Algorithm.
 
-        Finds the isotonic (non-decreasing) regression of y that minimizes
-        the weighted least squares: sum w_i * (y_i - y_hat_i)^2
-        subject to y_hat being non-decreasing.
+        Finds the isotonic regression of y that minimizes the weighted least squares.
+        *** Isotonic -- remember that y_hat must be non-decreasing ***
 
         Parameters
         ----------
-        y : ndarray, shape (n,)
-            Input values.
+        y : input values
 
         Returns
         -------
-        result : ndarray, shape (n,)
-            Isotonic (non-decreasing) fitted values.
+        result : Non-decreasing fitted values.
         """
         n = len(y)
         if n <= 1:
             return y.copy()
 
         # each block: [value_sum, weight, start_index, end_index]
-        result = y.astype(np.float64).copy()
+        result = y.copy()
 
         all_blocks = []
 
@@ -303,18 +294,17 @@ class ProbCalibration(BasalEstimator):
     def _fit_isotonic(self,
                       logits: NDArray,
                       labels: NDArray,
-                      ) -> "ProbCalibration":
+                      ) -> ProbCalibration:
         """
-        Fit isotonic regression using the Pool Adjacent Violators Algorithm (PAVA).
+        Fit isotonic regression using the Pool Adjacent Violators Algorithm (PAVA)
 
-        Produces a non-decreasing mapping from scores to calibrated probabilities.
-        Collapses each constant-value PAVA block into a single knot at the block's
-        centroid score, enabling smooth linear interpolation between steps.
+        Produces a non-decreasing mapping from scores to calibrated probabilities. Collapses each constant-value
+        PAVA block into a single point at the block's centroid score, enabling smooth linear interpolation between steps
 
         Parameters
         ----------
-        logits : ndarray, shape (n_samples,) or (n_samples, 1)
-        labels : ndarray, shape (n_samples,) or (n_samples, 1) with values in {0, 1}
+        logits :
+        labels : values values in {0, 1}
 
         Returns
         -------
@@ -358,17 +348,16 @@ class ProbCalibration(BasalEstimator):
         """
         Apply isotonic calibration via linear interpolation.
 
-        For each input score, linearly interpolate between the fitted
-        (isotonic_scores -> isotonic_values) knot pairs.
+        For each input score, linearly interpolate between the fitted (isotonic_scores -> isotonic_values) knot pairs
         Scores outside the fitted range are clamped to boundary values.
 
         Parameters
         ----------
-        y_score : ndarray of shape (n_samples,) or (n_samples, 1)
+        y_score : initial uncalibrated values
 
         Returns
         -------
-        calibrated : ndarray, same shape as y_score
+        calibrated : adusted / calibrated values
         """
         original_shape = y_score.shape
         scores_flat = y_score.ravel()
@@ -387,9 +376,9 @@ class ProbCalibration(BasalEstimator):
     def _fit_monotone_spline(self,
                              scores: NDArray,
                              labels: NDArray
-                             ) -> "ProbCalibration":
+                             ) -> ProbCalibration:
         """
-        Fit a monotone cubic Hermite spline (Fritsch-Carlson method).
+        Fit a monotonic, cubic Hermite spline (Fritsch-Carlson)
 
         Steps:
           1. Apply PAVA to get monotone (score, probability) pairs.
@@ -438,59 +427,56 @@ class ProbCalibration(BasalEstimator):
 
         Returns
         -------
-        d : ndarray, shape (n,) - derivatives at each knot
+        derivatives : the derivatives at each knot of the spline
         """
-        n = len(x)
-        d = np.zeros(n)
+        num_samples = len(x)
+        derivatives = np.zeros(num_samples)
 
-        if n < 2:
-            return d
+        if num_samples < 2:
+            return derivatives
 
-        # Compute secants (slopes between adjacent points)
-        # h[k] = x[k+1] - x[k], shape (n-1,)
+        # Compute secant segments (slopes between adjacent points)
         h = np.diff(x)
-        # delta[k] = (y[k+1] - y[k]) / h[k], shape (n-1,)
         delta = np.diff(y) / h
 
-        if n == 2:
-            d[0] = delta[0]
-            d[1] = delta[0]
-            return d
+        if num_samples == 2:
+            derivatives[0] = delta[0]
+            derivatives[1] = delta[0]
+            return derivatives
 
         # interior points: initialize with harmonic mean of adjacent secants
-        # (three-point formula for initial derivatives)
-        for k in range(1, n - 1):
+        for k in range(1, num_samples - 1):
             if delta[k - 1] * delta[k] <= 0:
-                # Sign change or zero => flat spot, set derivative to 0
-                d[k] = 0.0
+                # if we have a flat or negative, set 0 deriv
+                derivatives[k] = 0.0
             else:
-                # Harmonic mean weighted by interval lengths
+                # harmonic mean gets weighted by interval lengths
                 w1 = 2.0 * h[k] + h[k - 1]
                 w2 = h[k] + 2.0 * h[k - 1]
-                d[k] = (w1 + w2) / (w1 / delta[k - 1] + w2 / delta[k])
+                derivatives[k] = (w1 + w2) / (w1 / delta[k - 1] + w2 / delta[k])
 
-        # Endpoint derivatives: one-sided shape-preserving
-        d[0] = _edge_derivative(h[0], h[1], delta[0], delta[1])
-        d[-1] = _edge_derivative(h[-1], h[-2], delta[-1], delta[-2])
+        # endpoint derivatives-- indices [0, 1] and [-2, -1]
+        derivatives[0] = _edge_derivative(h[0], h[1], delta[0], delta[1])
+        derivatives[-1] = _edge_derivative(h[-1], h[-2], delta[-1], delta[-2])
 
-        # Fritsch-Carlson monotonicity correction
-        for k in range(n - 1):
+        # Fritsch-Carlson correction
+        for k in range(num_samples - 1):
             if abs(delta[k]) < 1e-30:
-                # Flat segment: both endpoint derivatives must be zero
-                d[k] = 0.0
-                d[k + 1] = 0.0
+                # Flat segment
+                derivatives[k] = 0.0
+                derivatives[k + 1] = 0.0
             else:
-                alpha = d[k] / delta[k]
-                beta = d[k + 1] / delta[k]
+                alpha = derivatives[k] / delta[k]
+                beta = derivatives[k + 1] / delta[k]
 
-                #If violated, scale down to the boundary of the monotonic region
+                # scale violations down to the boundary of the monotonic region
                 tau = alpha ** 2 + beta ** 2
                 if tau > 3.0:
                     s = 3.0 / np.sqrt(tau)
-                    d[k] = s * alpha * delta[k]
-                    d[k + 1] = s * beta * delta[k]
+                    derivatives[k] = s * alpha * delta[k]
+                    derivatives[k + 1] = s * beta * delta[k]
 
-        return d
+        return derivatives
 
     def _predict_spline(self, y_score: NDArray) -> NDArray:
         """
@@ -510,10 +496,9 @@ class ProbCalibration(BasalEstimator):
         original_shape = y_score.shape
         scores_flat = y_score.ravel()
 
-        # a single knot leaves no interval to interpolate over, so the fitted
-        # value is constant everywhere
+        # a single knot leaves no interval to interpolate over, so the fitted values are constant
         if len(self.spline_x) < 2:
-            return np.full(original_shape, self.spline_y[0], dtype=np.float64)
+            return np.full(original_shape, self.spline_y[0])
 
         s = np.clip(scores_flat, self.spline_x[0], self.spline_x[-1])
 
@@ -521,11 +506,11 @@ class ProbCalibration(BasalEstimator):
         k = np.searchsorted(self.spline_x, s, side="right") - 1
         k = np.clip(k, 0, len(self.spline_x) - 2)
 
-        # local coordinates within each interval
+        # local coordinates within each interval segment
         h = self.spline_x[k + 1] - self.spline_x[k]
-        t = (s - self.spline_x[k]) / h  # t in [0, 1]
+        t = (s - self.spline_x[k]) / h
 
-        # hermite basis functions (vectorized)
+        # hermite basis functions (vectorized) (2x2 matrix)
         h00 = (1.0 + 2.0 * t) * (1.0 - t) ** 2
         h10 = t * (1.0 - t) ** 2
         h01 = t ** 2 * (3.0 - 2.0 * t)
@@ -547,10 +532,10 @@ def _edge_derivative(h0: float, h1: float, delta0: float, delta1: float) -> floa
     Non-centered three-point derivative for endpoint, shape-preserving.
     """
     d = ((2.0 * h0 + h1) * delta0 - h0 * delta1) / (h0 + h1)
-    # If sign differs from adjacent secant, set to zero
+    # if the sign differs from adjacent secant, set to zero
     if d * delta0 < 0:
         d = 0.0
-    # If sign of adjacent secants differ and magnitude is too large, clamp
+    # if the sign of adjacent secants differ and magnitude is too large, clamp
     elif delta0 * delta1 < 0 and abs(d) > 3.0 * abs(delta0):
         d = 3.0 * delta0
     return d

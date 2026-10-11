@@ -34,6 +34,43 @@ For local development:
 ```bash
 pip install -e ".[test]"
 ```
+---
+## Layout / Inheritance
+|--> Serializable
+|-------> Composite Base Class
+|--------------> Network
+|--------------> Feature Pipeline
+|--------------> CompositeNode (NOT SUBCLASSES)
+|
+|-------> BasalEstimator
+|--------------> Layer
+|--------------> Processor (feature processing)
+|--------------> FittedModel
+|--------------> 
+|--> 
+
+### Encoders
+
+### Generators
+
+### Models
+
+## Transforms
+
+Post hoc Probability Calibrations
+- PAVA (Pooled Adjacent Violators Algorithm) step function powers our methods 
+- Platt Scaling - Least sum of weighted squares / Newtonian grid search with label smoothing
+- Isotonic Regression - PAVA  fits a non-decreasing step function.
+- Spline - Fit a monotonic, Cubic Hermite Spline
+  - Apply PAVA to get monotone (score, probability) pairs 
+  - Deduplicate tied scores 
+  - calc derivatives at each knot that guarantee monotonicity
+
+
+## Visuals 
+
+
+
 
 ---
 ## Implemented Methods
