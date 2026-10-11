@@ -30,7 +30,7 @@ from polyergalio.models.layers import FullyConnectedLayer, StandardizeLayer
 from polyergalio.models.model_loss import MSELoss
 from polyergalio.models.network import Network
 from polyergalio.models.optimizers import SGD
-from polyergalio.transforms.decompositions import IncrementalSVDLayer
+from polyergalio.models.layers.decomposition_layer import IncrementalSVDLayer
 from polyergalio.utilities import standardize_data
 
 NUM_SAMPLES = 3000

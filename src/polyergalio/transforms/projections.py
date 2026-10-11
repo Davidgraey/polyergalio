@@ -71,9 +71,7 @@ def pca(
     """
     org_shape = data.shape
 
-    # a zero-variance feature has no scale to divide by. Flooring the deviation
-    # leaves that feature at zero rather than propagating NaN into the
-    # covariance, where it would surface as a non-convergence error from eigh.
+    # a zero-variance feature has no scale to divide by -- so we have to pad/clip floor
     deviation = np.std(data, axis=0)
     standardized_data = (data - np.mean(data, axis=0)) / np.maximum(
         deviation, EPSILON
