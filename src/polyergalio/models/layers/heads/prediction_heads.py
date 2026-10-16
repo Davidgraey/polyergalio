@@ -11,21 +11,21 @@ from polyergalio.models.constants import (
     EPSILON,
     MASKED_LOGIT,
 )
-from polyergalio.models.heads.decision_utilities import decision_type_ids
 from polyergalio.models.layers.basic_layers import (
     RNG,
     FullyConnectedLayer,
     Layer,
     NormalizeLayer,
 )
+from polyergalio.models.layers.heads.decision_utilities import decision_type_ids
 from polyergalio.models.layers.mixture_layers import MixtureOfExperts
 from polyergalio.models.weight_initialization import get_weight_init
 
 
 class LowRankBottleNeck(Layer):
     """
-    reduction in parameters as a linear bottleneck for high-dimensional output (MLM)
-        1200 -> 200 -> 70000
+    reduction in parameters as a linear bottleneck for high-dimensional output - like Masked Language Modeling task
+        with high vocab
     """
     parameter_names = ("fc_down_projection", "fc_up_projection")
 
@@ -100,18 +100,21 @@ class DecisionHead(Layer):
         [CLS] <type> <instructions> [SEP]
         [MARK] <option1> [MARK] <option2> ... [SEP] <state> [SEP]
 
-    the head mean-pools the encoder's hidden state across each option's own
-    span -- from its [MARK] to the next control token -- adds a learned
-    embedding of the question type, and scores every option with one shared
-    scorer. Pooling the whole span, not just the [MARK] position, keeps a
-    long option's tokens from being squeezed through a single position.
+    the head mean-pools the encoder's hidden state across each option's own span
+        from its [MARK] to the next control token
+
+    adds a learned embedding of the question / task type scores every option with one shared scorer
+
+    Pooling the whole span, not just the [MARK] position, keeps a long option's tokens from being squeezed through a
+        single position.
+
     A softmax over the valid options answers all three types:
         CHOICE: argmax between the valid options
         SCORE: expected level over the ordered levels,
         BINARY: P(true) with options fixed as [false, true].
 
-    a second output head reads [CLS] into two act logits [defer, act], trained to
-    predict whether the answer will be right: the escalation signal
+    a second output head reads [CLS] into two act logits [defer, act], trained to predict whether the answer will be
+        correct: this is the 'escalation' signal
 
     Input shape: (batch, sequence, hidden_dim)
     Output shape: (batch, options) logits, MASKED_LOGIT on padded slots
@@ -145,9 +148,8 @@ class DecisionHead(Layer):
         hidden_dimension : width of the option scorer's hidden layer
         num_types : number of question types, see DECISION_TYPES
         activation_type : activation for the trunk experts
-        act_weight : scale on the acttion loss gradient -- start small and grow over time.
-        type_initialization : WEIGHT_INIT_DISPATCHER name for the question-type embedding
-        type_initialization_kwargs : keyword arguments bound to that initializer
+        act_weight : scale on the acttion loss gradient -- start small and grow over time
+        type_initialization, type_initialization_kwargs : keyword arguments bound to initializer
         moe_shared_experts, moe_routed_experts, moe_top_k, moe_routed_scaling, moe_num_groups, moe_top_groups :
             see MixtureOfExperts
         """
@@ -269,8 +271,8 @@ class DecisionHead(Layer):
 
     def score_act(self, correct: NDArray) -> float:
         """
-        Cross-entropy of the act branch against per-row correctness. Caches its
-        gradient so the next backward pass trains the act branch.
+        Cross-entropy of the act branch against per-row correctness. Caches its gradient so the next backward pass
+            can train the act branch.
 
         Parameters
         ----------

@@ -759,6 +759,7 @@ class PoolingLayer(Layer):
     """
 
     preserves_shape = False
+    consumes_mask = True
     cache_names = ("input", "weights", "counts")
 
     def __init__(self):
@@ -769,6 +770,7 @@ class PoolingLayer(Layer):
         """
         mask : (batch, sequence), 1 for a real position and 0 for padding
         """
+        num_samples, sequence, hidden = incoming_x.shape
         self.input = incoming_x
         if mask is None:
             self.weights = None

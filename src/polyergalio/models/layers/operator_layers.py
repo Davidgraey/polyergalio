@@ -11,6 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from polyergalio.models.constants import ANY_SHAPE
+from polyergalio.models.embedding.positional import SinusoidEmbedding
 from polyergalio.models.layers.basic_layers import Layer
 
 
@@ -174,6 +175,71 @@ class LatentDifference(BroadcastOperator):
         return incoming_grad, -incoming_grad
 
 
+class LatentExpand(Layer):
+    """
+    Broadcast a pooled latent over sequence_length positions and add its SinusoidEmbedding.
+
+    Input shape: (batch, 1, hidden_dimension)
+    Output shape: (batch, sequence_length, hidden_dimension)
+
+    restores_mask: the layer receives the padding mask even after a pooling layer consumed it, zeroes the padded
+    positions, and passes the mask on to the layers after it.
+    """
+    restores_mask = True
+    cache_names = ("token_mask",)
+
+    def __init__(self, sequence_length: int, hidden_dimension: int, base_freq: int = 10000):
+        """
+        Parameters
+        ----------
+        sequence_length : positions in the output
+        hidden_dimension : channel width of the latent, must be even
+        base_freq : wavelength base of the SinusoidEmbedding
+        """
+        super().__init__()
+        assert hidden_dimension % 2 == 0, f"hidden_dimension must be even, got {hidden_dimension}"
+        self.sequence_length: int = sequence_length
+        self.hidden_dimension: int = hidden_dimension
+        self.base_freq = base_freq
+        self.position = SinusoidEmbedding(sequence_length, hidden_dimension, base_freq)
+        self.declare_shapes(
+            inputs=((1, hidden_dimension),), outputs=((sequence_length, hidden_dimension),)
+        )
+
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
+        """
+        Parameters
+        ----------
+        incoming_x : (batch, 1, hidden_dimension)
+        mask : (batch, sequence_length), 1 for a real position and 0 for padding
+        """
+        assert incoming_x.ndim == 3 and incoming_x.shape[1:] == (1, self.hidden_dimension), (
+            f"expected (batch, 1, {self.hidden_dimension}), got {incoming_x.shape}"
+        )
+        tiled = np.repeat(incoming_x, self.sequence_length, axis=1)
+        output = self.position(tiled)
+        self.token_mask = None
+
+        if mask is not None:
+            assert mask.shape == output.shape[:2], (
+                f"mask shape {mask.shape} must match the output's (batch, sequence) axes {output.shape[:2]}"
+            )
+            self.token_mask = mask[..., None].astype(output.dtype)
+            output = output * self.token_mask
+        return output
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        if self.token_mask is not None:
+            incoming_grad = incoming_grad * self.token_mask
+        return self.position.backward(incoming_grad).sum(axis=1, keepdims=True)
+
+    def __str__(self):
+        return f"LatentExpand of one latent over {self.sequence_length} positions, {self.hidden_dimension} wide"
+
+    def __repr__(self):
+        return self.__str__()
+
+
 class SplitLayer(Layer):
     """
     Divides one axis into consecutive slices of slice_size indices, zero-padding the end so they are all equal.
@@ -261,7 +327,7 @@ class SplitLayer(Layer):
         return joined[tuple(keep)]
 
     def __str__(self):
-        return f"Split of the {self.axis} axis into slices of {self.slice_size}"
+        return f"Split of the {self.target_axis} axis into slices of {self.slice_size}"
 
     def __repr__(self):
         return self.__str__()

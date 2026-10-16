@@ -11,7 +11,7 @@ from numpy.typing import NDArray
 from polyergalio.models.activations import sigmoid, softmax
 from polyergalio.models.constants import ClassificationTask
 from polyergalio.models.constants import DECISION_TYPES, EPSILON
-from polyergalio.models.heads.decision_utilities import decision_type_ids, masked_softmax
+from polyergalio.models.layers.heads.decision_utilities import decision_type_ids, masked_softmax
 
 loss_dictionary, derivative_dictionary = {}, {}
 

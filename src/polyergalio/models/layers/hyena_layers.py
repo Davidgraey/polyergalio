@@ -1,17 +1,19 @@
 """
 Hyena hierarchy, https://arxiv.org/abs/2302.10866
 
-Hyena shows great potential for long and extra long sequences 10K - 64K in the paper
+Hyena for long and extra long sequences 10K - 64K in the paper
 An order-N Hyena operator blends convolutions with element-wise gating
 
     x_1, ..., x_N, v = Projection(u)
     h_1, ..., h_N = HyenaFilter(L)
-    z_1 = v,  z_{n+1} = x_n * (h_n conv z_n),  y = z_{N+1}
 
-Filters are causal and evaluated through the FFT, zero padded to 2L.
+    z_1 = v
+    z_{n+1} = x_n * (h_n conv z_n)
+
+    y = z_{N+1}
+
+Filters are causal and evaluated through the FFT, zero padded to 2L
 """
-from __future__ import annotations
-
 from typing import Optional
 
 import numpy as np

@@ -18,6 +18,8 @@ import moe_routing_tab
 import orchestration_tab
 import relative_weights_tab
 import scg_regression_tab
+import spectre_latent_tab
+import spectre_pooled_tab
 import spectre_tab
 import streamlit as st
 import system_one_tab
@@ -36,6 +38,8 @@ CATEGORIES = {
     "Neural networks": {
         "System one decision": system_one_tab.render,
         "Spectre encoder-decoder": spectre_tab.render,
+        "Spectre vs LatentSpectre": spectre_latent_tab.render,
+        "Spectre pooled attention": spectre_pooled_tab.render,
         "MoE routing": moe_routing_tab.render,
         "Clustering layers": clustering_layers_tab.render,
         "Incremental SVD": incremental_svd_tab.render,

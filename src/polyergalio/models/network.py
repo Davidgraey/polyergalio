@@ -824,7 +824,9 @@ class Network(Composite):
 
         kwargs : offered to every node, and picked up only by the layers
             that declare a matching optional parameter -- mask, forced_activation,
-            or anything a layer adds later. A layer that doesn't declare the
+            or anything a layer adds later. The mask stops at a layer with consumes_mask
+            (a pooling layer) and is not offered downstream of it, until a layer with
+            restores_mask (an expanding layer) brings the sequence axis back. A layer that doesn't declare the
             name never receives it, so unused kwargs are silently ignored.
             Mode is not a kwarg: layers read their own `training`, set by train() / eval().
         """
@@ -835,6 +837,7 @@ class Network(Composite):
             elif x_data.dtype.kind == "c":
                 x_data = x_data.astype(self.complex_data_type, copy=False)
         values = {self._input: x_data}
+        masked = {self._input: True}
 
         for node in self._nodes:
             if node.is_source or not self.is_wired(node):
@@ -842,10 +845,13 @@ class Network(Composite):
             if any(source not in values for source in node.sources):
                 continue
             arguments = [source.read(values, node, position) for position, source in enumerate(node.sources)]
+            masked[node] = all(masked[source] for source in node.sources)
+            keeps_mask = masked[node] or node.layer.restores_mask
+            offered = kwargs if keeps_mask else {key: value for key, value in kwargs.items() if key != "mask"}
             passthrough = (
-                kwargs
+                offered
                 if node.accepts_any_kwarg
-                else {key: value for key, value in kwargs.items() if key in node.forward_kwargs}
+                else {key: value for key, value in offered.items() if key in node.forward_kwargs}
             )
             start = time.perf_counter()
             try:
@@ -856,6 +862,7 @@ class Network(Composite):
                     f"{node.name} ({node.layer.__class__.__name__}).forward failed "
                     f"on input shape(s) {shapes}: {error}"
                 ) from error
+            masked[node] = keeps_mask and not node.layer.consumes_mask
             self.record_timing(node.name, "forward", time.perf_counter() - start)
 
         self.activations = {node.name: value for node, value in values.items()}

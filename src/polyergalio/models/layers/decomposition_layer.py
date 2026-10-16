@@ -24,22 +24,20 @@ class IncrementalSVDLayer(Layer):
     """
     Based on "Incremental Singular Value Decomposition for Streaming and Scalable Network Embedding" (2025, Zhang)
 
-    Streams rows into a truncated SVD and emits their moving-standardized orthogonalization, (..., output_dimension).
-    Rows must already be normalized / standardized per feature
+    Streams rows into a truncated SVD and emits their moving-standardized orthogonalization
+    Rows must already be normalized / standardized per feature BEFORE entering this layer
 
-    output_form picks what is emitted, always with the fixed width output_dimension; columns beyond the current rank
+    output_form controls what is emitted, always with the fixed width output_dimension; columns beyond the current rank
     are zeroed out (sparsification) so may impact downstream layers
-
-    - "orthogonalized": the orthogonalized rows sqrt(n) x V S^-1 V', needs output_dimension equal to input_dimension
-    - "whitened": the leading principal scores sqrt(n) x V S^-1, unit variance and uncorrelated
+    - "orthogonalized": the orthogonalized rows sqrt(n) x V S**-1 V', needs output_dimension equal to input_dimension
+    - "whitened": the leading principal scores sqrt(n) x V S**-1, unit variance and uncorrelated
     - "projection": the leading principal scores x V, with variance equal to the eigenvalues
 
-    Each merge sets eigenvector_change, the largest angle in radians between a previously held eigenvector and its
-    update. As the eigenvectors converge towards a shared representation iteratively, the largest angle decreses
+    Each training step sets eigenvector_change, the largest angle in radians between a previously held eigenvector and
+    its update. As the eigenvectors converge towards a shared representation iteratively, the largest angle decreases
 
+    UNIQUE BEHAVIORS:
     freeze() makes training passes behave like eval ones, so repeated epochs do not merge the same rows again.
-
-    backward passes the gradient through the current linear map to the input
 
     Early batches are projected with factors that have seen little data, so will be unstable early.
     Start with a larger batch, or set decay_rate below 1 so the early statistics fade.
@@ -49,7 +47,7 @@ class IncrementalSVDLayer(Layer):
         "singular_values", "eigenvectors", "num_seen_samples", "energy", "eigenvector_change", "frozen",
         "x_means", "x_stds",
     )
-    cache_names = ("transform", "lead_shape")
+    cache_names = ("transform", "leading_dimensions")
 
     def __init__(
         self,
@@ -65,8 +63,8 @@ class IncrementalSVDLayer(Layer):
         Parameters
         ----------
         input_dimension : size of the last axis
-        num_components : rank kept, at most input_dimension; None keeps all, which makes the output exact
-        output_dimension : width of the output, at most num_components below input_dimension; None is input_dimension
+        num_components : rank projections kept, at most input_dimension (identity)
+        output_dimension : width of the output, at most num_components below input_dimension.
         output_form : "orthogonalized", "whitened" or "projection"
         standardize : subtract the moving mean and divide by the moving std of the projected rows; they are tracked either way
         decay_rate : in (0, 1]; weight on previously seen data at each batch, in the factors and in the statistics
@@ -195,21 +193,19 @@ class IncrementalSVDLayer(Layer):
         super().set_state(state)
         self.transform = None
 
-    def forward(self, x_data: NDArray, training_now: Optional[bool] = None) -> NDArray:
+    def forward(self, x_data: NDArray) -> NDArray:
         """
         Parameters
         ----------
-        x_data : (..., input_dimension)
-        training_now : whether the batch updates the factors and statistics, unless frozen; None follows train() / eval()
+        x_data : incoming data
 
         Returns
         -------
-        (..., output_dimension) rows in the chosen output_form, standardized with the moving statistics
+        Transformed, standardized rows in the chosen output_form - check these for further
         """
-        training_now = self.training if training_now is None else training_now
-        training_now = training_now and not self.frozen
+        training_now = self.training and not self.frozen
 
-        self.lead_shape = x_data.shape[:-1]
+        self.leading_dimensions = x_data.shape[:-1]
         flat = x_data.reshape(-1, self.input_dimension)
 
         if training_now:
@@ -217,7 +213,7 @@ class IncrementalSVDLayer(Layer):
             self.transform = self.transform_matrix(self.num_seen_samples + len(flat))
 
         elif self.num_seen_samples == 0:
-            raise ValueError("nothing has been merged yet; run a training pass first")
+            raise ValueError("nothing has been merged yet-train first")
 
         elif self.transform is None:
             self.transform = self.transform_matrix()
@@ -232,24 +228,24 @@ class IncrementalSVDLayer(Layer):
 
         if self.standardize:
             projected = standardize(self, projected)
-        return projected.reshape(*self.lead_shape, -1)
+        return projected.reshape(*self.leading_dimensions, -1)
 
     def backward(self, incoming_grad: NDArray = None) -> NDArray:
         """
-        The factors and statistics are held fixed, so the layer is the linear map `transform` and a fixed scale.
+        The factors and statistics are held fixed, so the layer is the linear map & scale
 
         Parameters
         ----------
-        incoming_grad : (..., output_dimension) gradient with respect to the output, or None for nothing downstream
+        incoming_grad : gradient with respect to the output
 
         Returns
         -------
-        (..., input_dimension) gradient with respect to the input
+        backprop'd gradient with respect to the input
         """
         grad = np.asarray(incoming_grad).reshape(-1, self.output_dimension)
         if self.standardize:
             grad = grad / (self.x_stds + EPSILON)
-        return (grad @ self.transform.T).reshape(*self.lead_shape, self.input_dimension)
+        return (grad @ self.transform.T).reshape(*self.leading_dimensions, self.input_dimension)
 
     def inverse(self, output: NDArray) -> NDArray:
         """

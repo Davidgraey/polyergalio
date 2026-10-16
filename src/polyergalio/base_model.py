@@ -277,6 +277,8 @@ class BasalEstimator(Serializable, ABC):
     """
     adaptive: bool = True
     preserves_shape: bool = False
+    consumes_mask: bool = False
+    restores_mask: bool = False
     multi_output: bool = False
     training: bool = True
     parameter_names: tuple[str, ...] = ()

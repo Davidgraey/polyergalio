@@ -1,15 +1,23 @@
-from __future__ import annotations
+"""
+SPECTRE mixing layer, https://arxiv.org/abs/2502.18394
 
+Includes non-causal (bi-directional encoder) and causal (decoder) modules, together with optional persistnet memory AND
+the paper's suggested wavelet refinement last step
+"""
 from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
 
-import polyergalio.models.activations as activations
-from polyergalio.models.activations import mod_relu, mod_relu_derivative
-from polyergalio.models.layers.basic_layers import RNG, Layer
+from polyergalio.models.layers.attention_heads import (
+    HeadGate,
+    HeadProjection,
+    align_gate,
+    merge_heads,
+    split_heads,
+)
+from polyergalio.models.layers.basic_layers import Layer, PersistentMemory
 from polyergalio.models.layers.wavelet_layers import WaveletRefinementModule
-from polyergalio.models.weight_initialization import get_weight_init
 
 # LayerNorm epsilon for the pooled query within the Head
 DESCRIPTOR_EPS = 1e-8
@@ -34,390 +42,6 @@ def irfft_adjoint(grad_time: NDArray,
     out[tuple(interior)] *= 2
 
     return out
-
-
-# -------------head layout funcs----------------------------------
-def split_heads(array: NDArray, num_heads: int) -> NDArray:
-    """(..., hidden) -> (..., num_heads, head_dim), any number of leading axes"""
-    return array.reshape(*array.shape[:-1], num_heads, array.shape[-1] // num_heads)
-
-
-def merge_heads(array: NDArray) -> NDArray:
-    """(..., num_heads, head_dim) -> (..., hidden), any number of leading axes"""
-    return array.reshape(*array.shape[:-2], array.shape[-2] * array.shape[-1])
-
-
-def align_gate(gate: NDArray) -> NDArray:
-    """(batch, num_heads, frequency) -> (batch, frequency, num_heads, 1), broadcasting over split_heads"""
-    return np.transpose(gate, (0, 2, 1))[..., None]
-
-
-def shift_frequencies(array: NDArray, offset: int) -> NDArray:
-    """shift along the last (frequency) axis, zero filled rather than circular"""
-    out = np.zeros_like(array)
-    if offset > 0:
-        out[..., offset:] = array[..., :-offset]
-    elif offset < 0:
-        out[..., :offset] = array[..., -offset:]
-    else:
-        out[...] = array
-    return out
-
-
-class DenseHead(Layer):
-    """
-    Batched per-head dense layer: FullyConnectedLayer with a head axis. Each head owns an independent
-    (ni, no) map over its own slice of the input, so heads never mix:
-
-        y_h = activation(x_h W_h + b_h)
-
-    Input shape: (..., num_heads * ni)
-    Output shape: (..., num_heads * no)
-    """
-    parameter_names = ("weights", "bias")
-    cache_names = ("input", "z", "output")
-
-    def __init__(
-        self,
-        num_heads: int,
-        input_dimension: int,
-        output_dimension: int,
-        activation_type: str = "linear",
-        initialization: Optional[str] = None,
-        initialization_kwargs: Optional[dict] = None,
-    ):
-        """
-        Parameters
-        ----------
-        num_heads : independent maps, one per head
-        input_dimension, output_dimension : input and output width of each head
-        activation_type : activation applied per head, e.g. softmax normalises within a head
-        initialization : any WEIGHT_INIT_DISPATCHER name, the activation's rule if None
-        initialization_kwargs : keyword arguments bound to the initializer
-        """
-        super().__init__()
-        self.num_heads = num_heads
-        self.input_dimension = input_dimension
-        self.output_dimension = output_dimension
-
-        self.activation_type = activation_type
-        self.initialization = initialization
-        self.initialization_kwargs = dict(initialization_kwargs or {})
-        self.activation_function = activations.activation_dictionary[activation_type]
-        self.activation_derivative = activations.derivative_dictionary[activation_type]
-        self.declare_shapes(inputs=((num_heads * input_dimension,),), outputs=((num_heads * output_dimension,),))
-
-        initializer = get_weight_init(initialization or activation_type, **self.initialization_kwargs)
-        self.weights = np.stack([initializer(RNG, ni=input_dimension, no=output_dimension) for _ in range(num_heads)])
-        self.bias = np.zeros((num_heads, output_dimension))
-        self.zero_gradients()
-
-    def pre_activation(self, input_data: NDArray) -> NDArray:
-        """(..., num_heads * ni) -> (..., num_heads, no), before the activation"""
-        return np.einsum("...hi,hio->...ho", split_heads(input_data, self.num_heads), self.weights) + self.bias
-
-    def project(self, input_data: NDArray) -> NDArray:
-        """the full map without caching, for decoding"""
-        return merge_heads(self.activation_function(self.pre_activation(input_data)))
-
-    def forward(self, input_data: NDArray) -> NDArray:
-        self.input = input_data
-        self.z = self.pre_activation(input_data)
-        self.output = self.activation_function(self.z)
-        return merge_heads(self.output)
-
-    def backward(self, incoming_gradient: NDArray) -> NDArray:
-        delta = self.activation_derivative(self.output, self.z, split_heads(incoming_gradient, self.num_heads))
-        flat_input = split_heads(self.input, self.num_heads).reshape(-1, self.num_heads, self.input_dimension)
-        flat_delta = delta.reshape(-1, self.num_heads, self.output_dimension)
-
-        self.gradient_weights = np.einsum("nhi,nho->hio", flat_input, flat_delta, optimize=True)
-        self.gradient_bias = flat_delta.sum(axis=0)
-        return merge_heads(np.einsum("...ho,hio->...hi", delta, self.weights, optimize=True))
-
-    def __str__(self):
-        return f"DenseHead, {self.num_heads} heads of {self.input_dimension} -> {self.output_dimension}, {self.activation_type}"
-
-    def __repr__(self):
-        return self.__str__()
-
-
-class HeadProjection(DenseHead):
-    """
-    Independent (head_dim, head_dim) linear map per head, a block-diagonal projection of the hidden
-    axis: SPECTRE's per-head W(q) and W(v). A linear, square DenseHead.
-
-    Input shape: (..., num_heads * head_dim)
-    Output shape: (..., num_heads * head_dim)
-    """
-
-    preserves_shape = True
-
-    def __init__(
-        self,
-        num_heads: int,
-        head_dimension: int,
-        initialization: str = "lecun",
-        initialization_kwargs: Optional[dict] = None,
-    ):
-        """
-        Parameters
-        ----------
-        num_heads : independent maps, one per head
-        head_dimension : width of each head's slice of the hidden axis
-        initialization : any WEIGHT_INIT_DISPATCHER name, drawn independently per head
-        initialization_kwargs : keyword arguments bound to the initializer
-        """
-        super().__init__(
-            num_heads,
-            head_dimension,
-            head_dimension,
-            activation_type="linear",
-            initialization=initialization,
-            initialization_kwargs=initialization_kwargs,
-        )
-        self.head_dimension = head_dimension
-        self.hidden_dimension = num_heads * head_dimension
-
-    def __str__(self):
-        return f"HeadProjection, {self.num_heads} heads of {self.head_dimension} -> {self.head_dimension}"
-
-
-class HeadGate(Layer):
-    """
-    SPECTRE's per-head spectral gate, from pooled query to activated gate. Each head layer-normalises
-    its own pooled query over head_dim, maps it through its own two-layer MLP to one complex value per
-    frequency, optionally mixes neighbouring frequencies with a Toeplitz band, then applies modReLU:
-
-        raw_h = W2_h relu(W1_h LN_h(mean_q_h) + b1_h) + b2_h,  split into real | imaginary halves
-        gate_h = modReLU(raw_h + band_h * raw_h, activation_bias_h)
-
-    The MLP is two DenseHead layers, hidden_layer (W1, b1, relu) and output_layer (W2, b2, linear).
-    Heads share nothing, so a head's filter depends only on its own queries.
-
-    Starts at the identity: b2 puts every gate at 1 + 0j after modReLU, and W2 is shrunk so content
-    moves the gate gradually. A random gate starts each frequency at an arbitrary magnitude and,
-    being bilinear with the values, diverges under plain SGD within a few steps.
-
-    Input shape: (batch, num_heads * head_dim) pooled query
-    Output shape: (batch, num_heads, num_frequencies) complex gate
-    """
-    cache_names = ("std", "x_norm", "normed", "gate_raw", "gate_pre_activation", "gate")
-
-    def __init__(
-        self,
-        num_heads: int,
-        head_dimension: int,
-        num_frequencies: int,
-        gate_dimension: int,
-        modrelu_bias: float = -0.1,
-        band_radius: int = 0,
-        weight_scale: float = 0.1,
-        hidden_initialization: str = "relu",
-        output_initialization: str = "lecun",
-    ):
-        """
-        Parameters
-        ----------
-        num_heads, head_dimension : head layout of the pooled query
-        num_frequencies : gate entries per head
-        gate_dimension : width of each head's hidden layer
-        modrelu_bias : starting modReLU bias, learned per head and frequency
-        band_radius : radius r of the Toeplitz band update, 2r+1 complex taps per head; 0 disables it
-        weight_scale : shrink on W2 at initialisation
-        hidden_initialization : WEIGHT_INIT_DISPATCHER name for W1
-        output_initialization : WEIGHT_INIT_DISPATCHER name for W2, before weight_scale
-        """
-        assert band_radius >= 0, (
-            f"band_radius must be zero or positive, got {band_radius}. A "
-            "negative radius produces no taps and silently disables the gate."
-        )
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dimension = head_dimension
-        self.num_frequencies = num_frequencies
-        self.gate_dimension = gate_dimension
-
-        self.DESCRIPTOR_EPS = DESCRIPTOR_EPS
-
-        self.modrelu_bias = modrelu_bias
-        self.band_radius = band_radius
-        self.weight_scale = weight_scale
-
-        self.hidden_initialization = hidden_initialization
-        self.output_initialization = output_initialization
-        self.declare_shapes(
-            inputs=((num_heads * head_dimension,),), outputs=((num_heads, num_frequencies),)
-        )
-
-        self.activation_bias = np.full((num_heads, num_frequencies), modrelu_bias)
-
-        # building parameters --------
-        self.gamma = np.ones((num_heads, head_dimension))
-        self.beta = np.zeros((num_heads, head_dimension))
-        self.hidden_layer = DenseHead(
-            num_heads, head_dimension, gate_dimension, activation_type="relu", initialization=hidden_initialization
-        )
-        self.output_layer = DenseHead(
-            num_heads, gate_dimension, 2 * num_frequencies, activation_type="linear", initialization=output_initialization
-        )
-        self.output_layer.weights *= weight_scale
-        self.output_layer.bias[:, :num_frequencies] = 1.0 - self.activation_bias
-
-        self.band_offsets = tuple(range(-band_radius, band_radius + 1))
-        # every tap acts on all num_frequencies bins at once, so its gradient grows with sequence
-        # length; scaling taps by 1/sqrt(num_frequencies) keeps their step size length-independent
-        self.band_scale = 1.0 / np.sqrt(num_frequencies)
-        names = ("gamma", "beta", "activation_bias", "hidden_layer", "output_layer")
-        if band_radius:
-            self.band_taps = np.zeros((num_heads, len(self.band_offsets)), dtype=complex)
-            names += ("band_taps",)
-        self.parameter_names = names
-        self.zero_gradients()
-
-    def band_update(self, gate: NDArray) -> NDArray:
-        """gate plus its band-tap mix of neighbouring frequencies"""
-        banded = np.zeros_like(gate)
-        for index, offset in enumerate(self.band_offsets):
-            banded += self.band_scale * self.band_taps[:, index, None] * shift_frequencies(gate, offset)
-        return gate + banded
-
-    def forward(self, pooled_query: NDArray) -> NDArray:
-        """
-        Parameters
-        ----------
-        pooled_query : (batch, hidden) mean query, heads laid out along the hidden axis
-
-        Returns
-        -------
-        (batch, num_heads, num_frequencies) activated complex gate
-        """
-        heads = split_heads(pooled_query, self.num_heads)
-        centred = heads - heads.mean(axis=-1, keepdims=True)
-        self.std = np.sqrt(np.mean(centred ** 2, axis=-1, keepdims=True) + self.DESCRIPTOR_EPS)
-        self.x_norm = centred / self.std
-        self.normed = self.gamma * self.x_norm + self.beta
-
-        hidden = self.hidden_layer.forward(merge_heads(self.normed))
-        projection = split_heads(self.output_layer.forward(hidden), self.num_heads)
-
-        real, imaginary = np.split(projection, 2, axis=-1)
-        self.gate_raw = real + 1j * imaginary
-        self.gate_pre_activation = self.band_update(self.gate_raw) if self.band_radius else self.gate_raw
-        self.gate = mod_relu(self.gate_pre_activation, self.activation_bias)
-        return self.gate
-
-    @property
-    def descriptor(self) -> NDArray:
-        """(batch, hidden) per-head normalised pooled query, the conditioning the WRM reads"""
-        return merge_heads(self.normed)
-
-    def backward(self, gate_gradient: NDArray, descriptor_gradient: Optional[NDArray] = None) -> NDArray:
-        """
-        Parameters
-        ----------
-        gate_gradient : (batch, num_heads, num_frequencies) complex, dL/dRe + i dL/dIm
-        descriptor_gradient : (batch, hidden) gradient reaching the descriptor from elsewhere (the WRM)
-
-        Returns
-        -------
-        (batch, hidden) gradient on the pooled query
-        """
-        self.gradient_activation_bias, raw_gradient = mod_relu_derivative(
-            z=self.gate_pre_activation, beta=self.activation_bias, dout=gate_gradient
-        )
-        if self.band_radius:
-            self.gradient_band_taps = np.stack(
-                [
-                    self.band_scale * np.sum(raw_gradient * np.conj(shift_frequencies(self.gate_raw, offset)), axis=(0, 2))
-                    for offset in self.band_offsets
-                ],
-                axis=-1,
-            )
-            banded_gradient = raw_gradient.copy()
-            for index, offset in enumerate(self.band_offsets):
-                banded_gradient += (
-                    self.band_scale * np.conj(self.band_taps[:, index, None]) * shift_frequencies(raw_gradient, -offset)
-                )
-            raw_gradient = banded_gradient
-
-        projection_gradient = np.concatenate([raw_gradient.real, raw_gradient.imag], axis=-1)
-        hidden_gradient = self.output_layer.backward(merge_heads(projection_gradient))
-        normed_gradient = split_heads(self.hidden_layer.backward(hidden_gradient), self.num_heads)
-
-        if descriptor_gradient is not None:
-            normed_gradient = normed_gradient + split_heads(descriptor_gradient, self.num_heads)
-        self.gradient_gamma = np.sum(normed_gradient * self.x_norm, axis=0)
-        self.gradient_beta = normed_gradient.sum(axis=0)
-
-        x_gradient = normed_gradient * self.gamma
-        heads_gradient = (
-            x_gradient
-            - x_gradient.mean(axis=-1, keepdims=True)
-            - self.x_norm * np.mean(x_gradient * self.x_norm, axis=-1, keepdims=True)
-        ) / self.std
-        return merge_heads(heads_gradient)
-
-    def __str__(self):
-        band = f", band radius {self.band_radius}" if self.band_radius else ""
-        return (
-            f"HeadGate, {self.num_heads} heads of {self.head_dimension} -> {self.gate_dimension} -> "
-            f"{self.num_frequencies} complex frequencies{band}"
-        )
-
-    def __repr__(self):
-        return self.__str__()
-
-
-class PersistentMemory(Layer):
-    """
-    Learned, fixed-width context that is persisted
-    per SPECTRE's persistent-memory extension
-
-    holds M, shape (memory_tokens, hidden_dim), trained jointly with the model.
-    Memory is "injected" into the data-stream (sequence) itself before attention/fft transforms
-    This is a container layer
-    """
-
-    preserves_shape = False
-    parameter_names = ("memory",)
-
-    def __init__(
-        self,
-        memory_tokens: int,
-        hidden_dimension: int,
-        initialization: str = "truncated_normal",
-        initialization_kwargs: Optional[dict] = None,
-    ):
-        """
-        Parameters
-        ----------
-        memory_tokens : learned slots, zero disables the bank
-        hidden_dimension : channel width of each slot
-        initialization : any WEIGHT_INIT_DISPATCHER name; slots are token-like, so fan-in is not the slot count
-        initialization_kwargs : keyword arguments bound to the initializer
-        """
-        super().__init__()
-        assert memory_tokens >= 0, "memory_tokens must be zero or positive"
-        self.memory_tokens = memory_tokens
-        self.hidden_dimension = hidden_dimension
-        self.initialization = initialization
-        self.initialization_kwargs = dict(initialization_kwargs or {})
-
-        self.declare_shapes(inputs=(), outputs=((self.hidden_dimension,),))
-
-        initializer = get_weight_init(initialization, **self.initialization_kwargs)
-        self.memory = initializer(RNG, ni=memory_tokens, no=hidden_dimension)
-        self.zero_gradients()
-
-    def get_memory(self) -> NDArray:
-        return self.memory
-
-    def forward(self) -> NDArray:
-        return self.get_memory()
-
-    def backward(self, incoming_gradient: NDArray) -> None:
-        self.gradient_memory += incoming_gradient
 
 
 class PrefixFFTCache:
@@ -1122,3 +746,186 @@ class SpectreDecoderAttention(SpectreAttention):
             total_counts = np.maximum(self.cache.length[:, None], 1.0) + self.memory_tokens
             self.chunk_gate = self.gate_from_pooled_sum(self.cache.sum_query, total_counts)
         return self.read_slot(self.chunk_gate, slot)
+
+
+class SpectrePooledAttention(SpectreAttention):
+    """
+    SPECTRE mixing that returns a single summary of the sequence instead of a mixed sequence.
+
+    Mixing is y_h = irfft(gate_h * rfft(v_h)) along the sequence, and the layer returns a masked weighted mean of y
+        over the real positions:
+
+        out[b, h] = sum mask[b, t] * readout[h, t] * y[b, t, h] / n_b
+
+    The mean is taken through the adjoint of the convolution.
+
+    Input shape: (batch, sequence_length, hidden_dimension)
+    Output shape: (batch, 1, hidden_dimension)
+    """
+
+    registry_name = "SPECTREPooledAttention"
+    preserves_shape = False
+    consumes_mask = True
+    cache_names = (
+        "input", "mask", "counts", "total_counts", "combined_length", "seq_mu",
+        "gate", "pool_spectrum", "pool_weights", "value_masked",
+    )
+
+    def __init__(
+        self,
+        sequence_length: int,
+        hidden_dimension: int,
+        num_heads: int = 1,
+        band_radius: int = 0,
+        memory_tokens: int = 0,
+        modrelu_bias: float = -0.1,
+        gate_dimension: Optional[int] = None,
+    ):
+        """
+        Parameters
+        ----------
+        sequence_length : maximum of tokens per sample, the axis the FFT runs across
+        hidden_dimension : trailing dimension of the input
+        num_heads : gates learned in parallel, each over its own slice of the channel axis
+        band_radius : radius of the optional Toeplitz band update on the gate, 0 disables it
+        memory_tokens : size of an optional learned, persistent context bank, 0 disables it
+        modrelu_bias : starting modReLU bias, learned per head and frequency
+        gate_dimension : width of each head's gate hidden layer, head_dim if None
+        """
+        super().__init__(
+            sequence_length=sequence_length,
+            hidden_dimension=hidden_dimension,
+            num_heads=num_heads,
+            band_radius=band_radius,
+            memory_tokens=memory_tokens,
+            causal_decode=False,
+            modrelu_bias=modrelu_bias,
+            use_wrm=False,
+            use_positional_phase=False,
+            gate_dimension=gate_dimension,
+        )
+        self.declare_shapes(
+            inputs=((sequence_length, hidden_dimension),), outputs=((1, hidden_dimension),)
+        )
+        self.readout = np.ones((num_heads, sequence_length))
+        self.parameter_names += ("readout",)
+        self.zero_gradients()
+
+    def forward(self,
+                input_data: NDArray,
+                mask: Optional[NDArray] = None,
+                ) -> NDArray:
+        """
+        Parameters
+        ----------
+        input_data : (batch, sequence_length, hidden_dimension)
+        mask : (batch, sequence_length), 1 for a real token and 0 for padding; padded tokens contribute nothing
+
+        Returns
+        -------
+        (batch, 1, hidden_dimension)
+        """
+        assert input_data.ndim == 3
+        assert input_data.shape[1] == self.sequence_length
+        assert input_data.shape[2] == self.hidden_dimension
+
+        num_samples = input_data.shape[0]
+        memory_tokens = self.memory_tokens
+        self.input = input_data
+        self.mask = (mask if mask is not None else np.ones(input_data.shape[:2])).astype(input_data.dtype)
+        self.counts = np.maximum(self.mask.sum(axis=1, keepdims=True), 1.0)
+        mask_column = self.mask[..., None]
+
+        if memory_tokens:
+            memory = self.memory.get_memory()
+            memory_batch = np.broadcast_to(memory[None, :, :], (num_samples, memory_tokens, self.hidden_dimension))
+            combined = np.concatenate([memory_batch, input_data], axis=1)
+        else:
+            combined = input_data
+        self.combined_length = combined.shape[1]
+
+        query_all = self.query_projection.forward(combined)
+        value_all = self.value_projection.forward(combined)
+
+        self.value_masked = value_all.copy()
+        self.value_masked[:, memory_tokens:] *= mask_column
+
+        # the actual length of the transform -- including the persistent memory
+        self.total_counts = self.counts + memory_tokens
+        seq_sum = (query_all[:, memory_tokens:] * mask_column).sum(axis=1) + query_all[:, :memory_tokens].sum(axis=1)
+        self.seq_mu = seq_sum / self.total_counts
+        self.gate = self.head_gate.forward(self.seq_mu)
+
+        self.pool_weights = self.readout_weights()
+        self.pool_spectrum = irfft_adjoint(self.pool_weights, self.combined_length, axis=1)
+        spectrum = np.conj(align_gate(self.gate)[..., 0]) * self.pool_spectrum
+        position_weights = rfft_adjoint(spectrum, self.combined_length, axis=1)
+
+        values = split_heads(self.value_masked, self.num_heads)
+        pooled = np.einsum("bsh,bshc->bhc", position_weights, values)
+        return merge_heads(pooled)[:, None, :]
+
+    def readout_weights(self) -> NDArray:
+        """(batch, combined_length, heads) readout over the combined sequence, zero on memory slots and padding"""
+        weights = np.zeros((self.mask.shape[0], self.combined_length, self.num_heads), dtype=self.mask.dtype)
+        masked = self.mask[:, :, None] * self.readout.T[None, :, :]
+        weights[:, self.memory_tokens:] = masked / self.counts[..., None]
+        return weights
+
+    def backward(self, incoming_gradient: NDArray) -> NDArray:
+        """
+        Parameters
+        ----------
+        incoming_gradient : (batch, 1, hidden_dimension)
+
+        Returns
+        -------
+        (batch, sequence_length, hidden_dimension)
+        """
+        memory_tokens = self.memory_tokens
+        mask_column = self.mask[..., None]
+
+        pooled_gradient = split_heads(incoming_gradient[:, 0, :], self.num_heads)
+
+        spectrum = np.conj(align_gate(self.gate)[..., 0]) * self.pool_spectrum
+        position_weights = rfft_adjoint(spectrum, self.combined_length, axis=1)
+        values = split_heads(self.value_masked, self.num_heads)
+
+        value_gradient = position_weights[..., None] * pooled_gradient[:, None, :, :]
+        value_gradient[:, memory_tokens:] *= mask_column[..., None]
+        # (batch, seq, head, combined)
+        scalar_gradient = np.einsum("bshc,bhc->bsh", values, pooled_gradient)
+        scalar_spectrum = np.fft.rfft(scalar_gradient, n=self.combined_length, axis=1)
+
+        gate_gradient = np.transpose(self.pool_spectrum * np.conj(scalar_spectrum), (0, 2, 1))
+        pooled_query_gradient = self.head_gate.backward(gate_gradient, None)
+
+        response = np.fft.irfft(
+            np.transpose(self.gate, axes=(0, 2, 1)) * scalar_spectrum,
+            n=self.combined_length,
+            axis=1
+        )
+        readout_signal = response[:, memory_tokens:] * self.mask[..., None] / self.counts[..., None]
+
+        self.gradient_readout = readout_signal.sum(axis=0).T
+
+        per_token = pooled_query_gradient[:, None, :] / self.total_counts[..., None]
+        query_gradient = np.broadcast_to(per_token, (*self.mask.shape[:1], self.combined_length, self.hidden_dimension)).copy()
+        query_gradient[:, memory_tokens:] *= mask_column
+
+        input_gradient = self.query_projection.backward(query_gradient) + self.value_projection.backward(
+            merge_heads(value_gradient)
+        )
+
+        if memory_tokens:
+            self.memory.backward(input_gradient[:, :memory_tokens].sum(axis=0))
+
+        return input_gradient[:, memory_tokens:].real
+
+    def __str__(self):
+        band = f", band radius {self.band_radius}" if self.band_radius else ""
+        memory = f", {self.memory_tokens} memory slots" if self.memory_tokens else ""
+        return (
+            f"SPECTRE pooled mixer, sequence {self.sequence_length}, "
+            f"hidden {self.hidden_dimension}, {self.num_heads} heads{band}{memory}"
+        )

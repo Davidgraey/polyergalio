@@ -14,9 +14,8 @@ class TextEmbedding(Layer):
     """
     trainable vector lookup table, like torch.nn.Embedding.
 
-    Row i of `weights` is the vector for token id i.
-    Forward indexes the table; backward scatters the incoming gradient back onto the rows that were read,
-    summing over repeated tokens.
+    Row i of `weights` is the vector for token id=i
+    Forward indexes the table, backward scatters the gradient back onto the rows that were read
 
     Input shape: (...) integer token ids
     Output shape: (..., embedding_dim)
@@ -24,8 +23,13 @@ class TextEmbedding(Layer):
     parameter_names = ("weights",)
     cache_names = ("token_ids", "output")
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: Optional[int] = None, special_tokens: Optional[dict] = None,
-                 initialization: str = "truncated_normal", initialization_kwargs: Optional[dict] = None):
+    def __init__(self,
+                 num_embeddings: int,
+                 embedding_dim: int,
+                 padding_idx: Optional[int] = None,
+                 special_tokens: Optional[dict] = None,
+                 initialization: str = "truncated_normal",
+                 initialization_kwargs: Optional[dict] = None):
         """
         Parameters
         ----------

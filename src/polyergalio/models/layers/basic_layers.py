@@ -398,3 +398,54 @@ class StandardizeLayer(Layer):
 
     def __repr__(self):
         return self.__str__()
+
+class PersistentMemory(Layer):
+    """
+    Learned, fixed-width context that is persisted
+    per SPECTRE's persistent-memory extension
+
+    holds M, shape (memory_tokens, hidden_dim), trained jointly with the model.
+    Memory is "injected" into the data-stream (sequence) itself before attention/fft transforms
+    This is a container layer
+    """
+
+    preserves_shape = False
+    parameter_names = ("memory",)
+
+    def __init__(
+        self,
+        memory_tokens: int,
+        hidden_dimension: int,
+        initialization: str = "truncated_normal",
+        initialization_kwargs: Optional[dict] = None,
+    ):
+        """
+        Parameters
+        ----------
+        memory_tokens : learned slots, zero disables the bank
+        hidden_dimension : channel width of each slot
+        initialization : any WEIGHT_INIT_DISPATCHER name; slots are token-like, so fan-in is not the slot count
+        initialization_kwargs : keyword arguments bound to the initializer
+        """
+        super().__init__()
+        assert memory_tokens >= 0, "memory_tokens must be zero or positive"
+        self.memory_tokens = memory_tokens
+        self.hidden_dimension = hidden_dimension
+        self.initialization = initialization
+        self.initialization_kwargs = dict(initialization_kwargs or {})
+
+        self.declare_shapes(inputs=(), outputs=((self.hidden_dimension,),))
+
+        initializer = get_weight_init(initialization, **self.initialization_kwargs)
+        self.memory = initializer(RNG, ni=memory_tokens, no=hidden_dimension)
+        self.zero_gradients()
+
+    def get_memory(self) -> NDArray:
+        return self.memory
+
+    def forward(self) -> NDArray:
+        return self.get_memory()
+
+    def backward(self, incoming_gradient: NDArray) -> None:
+        self.gradient_memory += incoming_gradient
+

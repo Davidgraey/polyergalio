@@ -1,3 +1,14 @@
+0.1.8
+=====================
+- TESTS are still broken - I'm not fixing these until I get to a more stable build
+- Added another utility layer to project a mask after downscaling to a latent-space.
+- Split out attention heads to their own module
+- Built out GMVAE in autoencoder_layers.py
+- Added a "pooled Spectre" variant
+- updated base model with quality-of-life serialization / unserialization
+- ** AI usage ** - Extended app/labeling streamlit application with a refactor
+- ** AI usage ** - generated docstrings for the new modules
+
 0.1.7
 =====================
 - Tweaks to Nodes and connections to support a "multiple output" layer.
