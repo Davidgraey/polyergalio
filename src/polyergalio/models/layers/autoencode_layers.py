@@ -19,17 +19,15 @@ class GaussianMixtureLayer(Layer):
     """
     Learned Gaussian mixture noise, added to a latent projection.
 
-    Each latent draws a component (hard in the forward pass, Gumbel-softmax relaxed in the backward pass) and a reparam Gaussian sample from
+    Each latent draws a component (hard in the forward pass, Gumbel-softmax relaxed in the backward pass) and a reparam Gaussian
 
-    logits, means and ln_variances all receive gradient
-
-    The mixture is also the prior. The noise is shrunk by a learned scale, so the noised latent is a narrow copy of
-    the mixture centred on the incoming latent. forward caches divergence, the KL from the prior to that
-    distribution, and backward adds kl_weight times its gradient.
+    This mixture is the gaussian prior. The noise is scaled by a learned param, so the noised latent is a narrow copy of
+    the mixture centred on the incoming latent.
+    forward caches divergence, the KL from the prior to that distribution, and backward adds kl_weight times its gradient.
     """
     parameter_names = ("logits", "means", "log_variances", "log_scale")
     cache_names = ("in_shape", "component_weights", "relaxed_weights", "standard_noise", "component_noise", "token_mask",
-                   "sampled_noise", "noisy_latents", "divergence")
+                   "sampled_noise", "noisy_latents")
 
     def __init__(self,
                  num_components: int,
@@ -56,6 +54,7 @@ class GaussianMixtureLayer(Layer):
         self.mean_scale = mean_scale
         self.kl_weight = kl_weight
         self.noise_scale = noise_scale
+        self.divergence = 0.0
 
         self.logits = np.zeros(num_components)
         self.means = RNG.normal(0.0, mean_scale, size=(num_components, latent_dimension))
@@ -134,24 +133,31 @@ class GaussianMixtureLayer(Layer):
         -------
         the latent state with mixture noise added, same shape as incoming_x
         """
-        self.in_shape = incoming_x.shape
-        assert self.in_shape[-1] == self.latent_dimension, (
-            f"cannot read trailing axis {self.in_shape[-1]} as latent_dimension {self.latent_dimension}"
+        in_shape = incoming_x.shape
+        assert in_shape[-1] == self.latent_dimension, (
+            f"cannot read trailing axis {in_shape[-1]} as latent_dimension {self.latent_dimension}"
         )
         if not self.training:
             return incoming_x + np.exp(self.log_scale) * self.noise
 
+        self.in_shape = in_shape
         latents = incoming_x.reshape(-1, self.latent_dimension)
         if mask is not None:
-            assert mask.shape == self.in_shape[:-1], (
-                f"mask shape {mask.shape} must match incoming_x's leading axes {self.in_shape[:-1]}"
+            assert mask.shape == in_shape[:-1], (
+                f"mask shape {mask.shape} must match incoming_x's leading axes {in_shape[:-1]}"
             )
-        self.token_mask = None if mask is None else mask.reshape(-1, 1)
+        # keep recast
+        self.token_mask = None if mask is None else mask.reshape(-1, 1).astype(latents.dtype, copy=False)
 
-        gumbel = RNG.gumbel(size=(len(latents), self.num_components))
+        # keep recast
+        gumbel = RNG.gumbel(size=(len(latents), self.num_components)).astype(latents.dtype, copy=False)
         self.relaxed_weights = softmax((self.logits + gumbel) / self.temperature)
-        self.component_weights = np.eye(self.num_components)[self.relaxed_weights.argmax(axis=-1)]
-        self.standard_noise = RNG.standard_normal((len(latents), self.num_components, self.latent_dimension))
+        # keep recast
+        self.component_weights = np.eye(self.num_components, dtype=latents.dtype)[self.relaxed_weights.argmax(axis=-1)]
+        # keep recast
+        self.standard_noise = RNG.standard_normal(
+            (len(latents), self.num_components, self.latent_dimension), dtype=latents.dtype
+        )
         self.component_noise = self.means + np.exp(0.5 * self.log_variances) * self.standard_noise
 
         # nk, nkd -> nd
@@ -162,13 +168,14 @@ class GaussianMixtureLayer(Layer):
             noise = noise * self.token_mask
 
         noisy = latents + np.exp(self.log_scale) * noise
-        valid = np.ones((len(latents), 1)) if self.token_mask is None else self.token_mask
+        # keep recast
+        valid = np.ones((len(latents), 1), dtype=latents.dtype) if self.token_mask is None else self.token_mask
         divergence = self.log_density(noise) - self.log_scale.sum() - self.log_density(noisy)
         self.divergence = float((divergence * valid[:, 0]).sum() / max(valid.sum(), 1.0))
         self.sampled_noise = noise
         self.noisy_latents = noisy
 
-        return noisy.reshape(self.in_shape)
+        return noisy.reshape(in_shape)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         """
@@ -181,7 +188,8 @@ class GaussianMixtureLayer(Layer):
         gradient wrt ins, including the divergence's pull on the latents
         """
         delta = incoming_grad.reshape(-1, self.latent_dimension)
-        valid = np.ones(len(delta)) if self.token_mask is None else self.token_mask[:, 0]
+        # keep recast
+        valid = np.ones(len(delta), dtype=delta.dtype) if self.token_mask is None else self.token_mask[:, 0]
         if self.token_mask is not None:
             delta = delta * self.token_mask
 
@@ -221,7 +229,8 @@ class GaussianMixtureLayer(Layer):
         latents drawn from the hard mixture, (num_samples, latent_dimension)
         """
         components = RNG.choice(self.num_components, size=num_samples, p=softmax(self.logits))
-        noise = RNG.standard_normal((num_samples, self.latent_dimension))
+        # keep recast
+        noise = RNG.standard_normal((num_samples, self.latent_dimension), dtype=self.means.dtype)
         return self.means[components] + np.exp(0.5 * self.log_variances[components]) * noise
 
 
@@ -229,11 +238,8 @@ class GMVAELayer(Layer):
     """
     A mixture variational autoencoder
     project down to a latent space, mix in learned / parameterized Gaussian noise, and project back up.
-
-    The noised latent is cached for backprop
     """
     parameter_names = ("down_projection", "mixture", "up_projection")
-    cache_names = ("latent",)
 
     def __init__(self,
                  input_dimension: int,
@@ -294,8 +300,7 @@ class GMVAELayer(Layer):
         -------
         the reconstruction, same shape as incoming_x
         """
-        self.latent = self.mixture(self.down_projection(incoming_x), mask)
-        return self.up_projection(self.latent)
+        return self.up_projection(self.mixture(self.down_projection(incoming_x), mask))
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         return self.down_projection.backward(self.mixture.backward(self.up_projection.backward(incoming_grad)))

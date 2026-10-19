@@ -94,9 +94,9 @@ class VotingBase(Layer):
         -------
         one vote per expert, (num_samples, num_experts)
         """
-        self.in_shape = incoming_x.shape
-        assert self.in_shape[-1] == self.input_shape, (
-            f"cannot read trailing axis {self.in_shape[-1]} as input_shape "
+        in_shape = incoming_x.shape
+        assert in_shape[-1] == self.input_shape, (
+            f"cannot read trailing axis {in_shape[-1]} as input_shape "
             f"{self.input_shape}"
         )
 
@@ -105,17 +105,16 @@ class VotingBase(Layer):
             votes = layer(votes)
 
         if mask is not None:
-            assert mask.shape == self.in_shape[:-1], (
+            assert mask.shape == in_shape[:-1], (
                 f"mask shape {mask.shape} must match incoming_x's leading "
-                f"axes {self.in_shape[:-1]}"
+                f"axes {in_shape[:-1]}"
             )
-        if not self.training:
-            return self.route(votes)
-
-        self.token_mask = None if mask is None else mask.reshape(-1)
-
-        self.output = self.route(votes)
-        return self.output
+        output = self.route(votes)
+        if self.training:
+            self.in_shape = in_shape
+            self.token_mask = None if mask is None else mask.reshape(-1)
+            self.output = output if self.renormalize and self.top_k is not None else None
+        return output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         self.gradient_expert_bias = -self.balance_signal()
@@ -184,7 +183,8 @@ class VotingBase(Layer):
         balancing: +1 for an under-used expert, -1 for an over-used one. Padded rows are left out of the load.
         """
         if self.mask is None:
-            return np.zeros(self.num_experts)
+            # keep recast
+            return np.zeros(self.num_experts, dtype=self.expert_bias.dtype)
 
         if self.token_mask is None:
             load = self.mask.mean(axis=0)
@@ -194,7 +194,8 @@ class VotingBase(Layer):
             load = (self.mask * valid).sum(axis=0) / valid_count
 
         fair_share = self.top_k / self.num_experts
-        return np.sign(fair_share - load)
+        # keep recast
+        return np.sign(fair_share - load).astype(self.expert_bias.dtype)
 
     def route_backward(self, incoming_grad: NDArray) -> NDArray:
         """Gradient through route()."""
@@ -370,7 +371,7 @@ class Expert(Layer):
     Output shape: (..., hidden_dim)
     """
     parameter_names = ("gate_proj", "up_proj", "down_proj")
-    cache_names = ("gated", "up", "output")
+    cache_names = ("gated", "up")
 
     def __init__(self,
                  input_dim: int,
@@ -405,10 +406,11 @@ class Expert(Layer):
 
     def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """mask : unused -- each row is transformed on its own"""
-        self.gated = self.gate_proj(incoming_x)
-        self.up = self.up_proj(incoming_x)
-        self.output = self.down_proj(self.gated * self.up)
-        return self.output
+        gated = self.gate_proj(incoming_x)
+        up = self.up_proj(incoming_x)
+        if self.training:
+            self.gated, self.up = gated, up
+        return self.down_proj(gated * up)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         grad_product = self.down_proj.backward(incoming_grad)
@@ -442,7 +444,7 @@ class MixtureOfExperts(Layer):
 
     Experts are held as attributes shared_1.., routed_1.. and gate, which are the parameter names.
     """
-    cache_names = ("in_shape", "gate_weights", "expert_rows", "expert_outputs", "output")
+    cache_names = ("in_shape", "gate_weights", "expert_rows", "expert_outputs")
 
     def __init__(self,
                  input_dim: int,
@@ -529,33 +531,34 @@ class MixtureOfExperts(Layer):
         -------
         (..., hidden_dim)
         """
-        self.in_shape = hidden_state.shape
+        in_shape = hidden_state.shape
         rows = hidden_state.reshape(-1, self.input_dim)
 
         output = np.zeros((rows.shape[0], self.hidden_dim), dtype=rows.dtype)
         for expert in self.shared_experts:
             output = output + expert(rows)
 
-        self.gate_weights = self.gate(
-            hidden_state, mask=mask
-        )
+        gate_weights = self.gate(hidden_state, mask=mask)
         routed = self.gate.mask
         if mask is not None:
             routed = routed & mask.reshape(-1, 1).astype(bool)
 
-        self.expert_rows, self.expert_outputs = [], []
+        expert_rows, expert_outputs = [], []
         for e, expert in enumerate(self.routed_experts):
             chosen = np.flatnonzero(routed[:, e])
             expert_out = expert(rows[chosen]) if chosen.size else None
 
             if chosen.size:
-                output[chosen] += (self.routed_scaling * self.gate_weights[chosen, e : e + 1] * expert_out)
+                output[chosen] += self.routed_scaling * gate_weights[chosen, e : e + 1] * expert_out
 
-            self.expert_rows.append(chosen)
-            self.expert_outputs.append(expert_out)
+            if self.training:
+                expert_rows.append(chosen)
+                expert_outputs.append(expert_out)
 
-        self.output = output.reshape(self.in_shape[:-1] + (self.hidden_dim,))
-        return self.output
+        if self.training:
+            self.in_shape, self.gate_weights = in_shape, gate_weights
+            self.expert_rows, self.expert_outputs = expert_rows, expert_outputs
+        return output.reshape(in_shape[:-1] + (self.hidden_dim,))
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         grad_rows = incoming_grad.reshape(-1, self.hidden_dim)
@@ -608,7 +611,7 @@ class SimpleMixtureOfExperts(Layer):
     Input shape: (batch, ..., input_dim), axis 0 is the sample, the axes before input_dim are pooled for routing
     Output shape: (batch, ..., hidden_dim)
     """
-    cache_names = ("in_shape", "selected", "expert_samples", "expert_outputs", "output")
+    cache_names = ("in_shape", "expert_samples", "expert_outputs")
 
     def __init__(self,
                  input_dim: int,
@@ -682,14 +685,14 @@ class SimpleMixtureOfExperts(Layer):
         -------
         (batch, ..., hidden_dim)
         """
-        self.in_shape = hidden_state.shape
-        batch = self.in_shape[0]
+        in_shape = hidden_state.shape
+        batch = in_shape[0]
         tokens = hidden_state.reshape(batch, -1, self.input_dim)
 
         token_mask, sample_mask = None, None
         if mask is not None:
-            assert mask.shape == self.in_shape[:-1], (
-                f"mask shape {mask.shape} must match hidden_state's leading axes {self.in_shape[:-1]}"
+            assert mask.shape == in_shape[:-1], (
+                f"mask shape {mask.shape} must match hidden_state's leading axes {in_shape[:-1]}"
             )
             token_mask = mask.reshape(batch, -1)
             sample_mask = token_mask.any(axis=1)
@@ -699,22 +702,24 @@ class SimpleMixtureOfExperts(Layer):
         for expert in self.shared_experts:
             output = output + expert(tokens)
 
-        self.selected = self.gate(pooled, mask=sample_mask).astype(bool)
+        selected = self.gate(pooled, mask=sample_mask).astype(bool)
         if sample_mask is not None:
-            self.selected = self.selected & sample_mask[:, None]
+            selected = selected & sample_mask[:, None]
 
         scale = 1.0 / self.top_k
-        self.expert_samples, self.expert_outputs = [], []
+        expert_samples, expert_outputs = [], []
         for e, expert in enumerate(self.routed_experts):
-            chosen = np.flatnonzero(self.selected[:, e])
+            chosen = np.flatnonzero(selected[:, e])
             expert_out = expert(tokens[chosen]) if chosen.size else None
             if chosen.size:
                 output[chosen] += scale * expert_out
-            self.expert_samples.append(chosen)
-            self.expert_outputs.append(expert_out)
+            if self.training:
+                expert_samples.append(chosen)
+                expert_outputs.append(expert_out)
 
-        self.output = output.reshape(self.in_shape[:-1] + (self.hidden_dim,))
-        return self.output
+        if self.training:
+            self.in_shape, self.expert_samples, self.expert_outputs = in_shape, expert_samples, expert_outputs
+        return output.reshape(in_shape[:-1] + (self.hidden_dim,))
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         batch = self.in_shape[0]
@@ -760,7 +765,7 @@ class PoolingLayer(Layer):
 
     preserves_shape = False
     consumes_mask = True
-    cache_names = ("input", "weights", "counts")
+    cache_names = ("in_shape", "weights", "counts", "output")
 
     def __init__(self):
         super().__init__()
@@ -770,33 +775,29 @@ class PoolingLayer(Layer):
         """
         mask : (batch, sequence), 1 for a real position and 0 for padding
         """
-        num_samples, sequence, hidden = incoming_x.shape
-        self.input = incoming_x
+        weights, counts = None, None
         if mask is None:
-            self.weights = None
-            self.counts = None
-            return incoming_x.mean(axis=1, keepdims=True)
-
-        assert mask.shape == incoming_x.shape[:2], (
-            f"mask shape {mask.shape} must match incoming_x's (batch, "
-            f"sequence) axes {incoming_x.shape[:2]}"
-        )
-        self.weights = mask[..., None].astype(incoming_x.dtype)
-        self.counts = np.maximum(self.weights.sum(axis=1, keepdims=True), 1.0)
-        return (incoming_x * self.weights).sum(axis=1, keepdims=True) / self.counts
+            self.output = incoming_x.mean(axis=1, keepdims=True)
+        else:
+            assert mask.shape == incoming_x.shape[:2], (
+                f"mask shape {mask.shape} must match incoming_x's (batch, "
+                f"sequence) axes {incoming_x.shape[:2]}"
+            )
+            weights = mask[..., None].astype(incoming_x.dtype)
+            counts = np.maximum(weights.sum(axis=1, keepdims=True), 1.0)
+            self.output = (incoming_x * weights).sum(axis=1, keepdims=True) / counts
+        if self.training:
+            self.in_shape, self.weights, self.counts = incoming_x.shape, weights, counts
+        return self.output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
-        if self.input is None:
+        if self.in_shape is None:
             return incoming_grad
 
         if self.counts is None:
-            seq_len = self.input.shape[1]
-            return np.broadcast_to(incoming_grad / seq_len, self.input.shape).copy()
+            return np.broadcast_to(incoming_grad / self.in_shape[1], self.in_shape).copy()
 
-        return (
-            np.broadcast_to(incoming_grad / self.counts, self.input.shape)
-            * self.weights
-        )
+        return np.broadcast_to(incoming_grad / self.counts, self.in_shape) * self.weights
 
     def __str__(self):
         return "Layer of Sequence Mean Pooling (avg over sequence)"

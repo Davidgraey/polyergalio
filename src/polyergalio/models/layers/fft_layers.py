@@ -20,7 +20,7 @@ def hartley_2d(x_array: NDArray, axes: tuple = (-2, -1)) -> NDArray:
 
 
 class FrequencyFFT(Layer):
-    cache_names = ("in_shape", "input", "output")
+    cache_names = ("in_shape",)
 
     def __init__(self, max_sequence_length: int, window_size: int):
         """
@@ -59,18 +59,17 @@ class FrequencyFFT(Layer):
         -------
         the Hartley transform of the windowed data, same width as the window
         """
-        self.in_shape = incoming_x.shape
+        in_shape = incoming_x.shape
 
-        assert self.in_shape[0] <= self.max_sequence_length, f"Shapes don't match in {self}"
-        assert self.in_shape[-1] == self.window_size, (
-            f"last axis must equal window_size {self.window_size}, got {self.in_shape[-1]}"
+        assert in_shape[0] <= self.max_sequence_length, f"Shapes don't match in {self}"
+        assert in_shape[-1] == self.window_size, (
+            f"last axis must equal window_size {self.window_size}, got {in_shape[-1]}"
         )
 
-        input_reshaped = incoming_x.reshape(-1, self.in_shape[-1])
-        if not self.training:
-            return hartley(self.window_kernel * input_reshaped, axis=-1).reshape(self.in_shape)
-        self.output = hartley(self.window_kernel * input_reshaped, axis=-1)
-        return self.output.reshape(self.in_shape)
+        if self.training:
+            self.in_shape = in_shape
+        input_reshaped = incoming_x.reshape(-1, in_shape[-1])
+        return hartley(self.window_kernel * input_reshaped, axis=-1).reshape(in_shape)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         """Hartley is its own adjoint, so the backward pass is the same transform followed by the same window weighting."""
@@ -81,7 +80,6 @@ class FrequencyFFT(Layer):
 class HartleyLayer(Layer, ABC):
     """Shape-preserving Hartley transform over the last axis, or the last two when use_2d."""
     preserves_shape = True
-    cache_names = ("input", "output", "gradient")
 
     def __init__(self, use_2d: bool = True):
         super().__init__()
@@ -108,15 +106,11 @@ class FourierLayer(HartleyLayer):
         mask : unused; the transform is linear and the sequence is already zero-padded upstream, so a padded
             position contributes nothing to any output frequency. Kept for pass-through compatibility with the graph.
         """
-        if not self.training:
-            return self.transform(incoming_x)
-        self.output = self.transform(incoming_x)
-        return self.output
+        return self.transform(incoming_x)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         """Hartley is symmetric, so the adjoint is the same transform."""
-        self.gradient = self.transform(incoming_grad)
-        return self.gradient
+        return self.transform(incoming_grad)
 
 
 class InverseFourierLayer(HartleyLayer):
@@ -131,22 +125,18 @@ class InverseFourierLayer(HartleyLayer):
         mask : unused, same reasoning as FourierLayer.forward.
         """
         shape = incoming_x.shape
-        self.scale = shape[-2] * shape[-1] if self.use_2d else shape[-1]
-        if not self.training:
-            return self.transform(incoming_x) / self.scale
-
-        self.output = self.transform(incoming_x) / self.scale
-        return self.output
+        scale = shape[-2] * shape[-1] if self.use_2d else shape[-1]
+        if self.training:
+            self.scale = scale
+        return self.transform(incoming_x) / scale
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         """Symmetric transform, so the adjoint carries the same 1/N."""
-        self.gradient = self.transform(incoming_grad) / self.scale
-        return self.gradient
+        return self.transform(incoming_grad) / self.scale
 
 
 class FourierAttention(Layer):
     parameter_names = ("norm_a", "fc", "norm_b")
-    cache_names = ("training_now", "output", "gradient")
 
     def __init__(self, ni: int, no: int, use_2d: bool = True):
         super().__init__()
@@ -178,17 +168,11 @@ class FourierAttention(Layer):
             )
 
         fft_x = self.norm_a(self.fftlayer(x_data) + x_data)
-
-        if not self.training:
-            return self.norm_b(self.fc(fft_x) + fft_x)
-
-        self.output = self.norm_b(self.fc(fft_x) + fft_x)
-        return self.output
+        return self.norm_b(self.fc(fft_x) + fft_x)
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         grad = self.norm_b.backward(incoming_gradient)
         grad = self.fc.backward(grad) + grad
         grad = self.norm_a.backward(grad)
         grad = self.fftlayer.backward(grad) + grad
-        self.gradient = grad
         return grad.real

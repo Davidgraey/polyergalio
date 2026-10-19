@@ -379,7 +379,13 @@ class BasalEstimator(Serializable, ABC):
         pass
 
     def purge(self) -> None:
-        """Clear forward-pass caches. Gradients belong to zero_gradients(). Nothing to clear by default."""
+        """Clear forward-pass caches. Gradients are cleared in zero_gradients()"""
+        for name in self.cache_names:
+            setattr(self, name, None)
+        for sublayer in self.sublayers():
+            sublayer.purge()
+            sublayer.zero_gradients()
+        self.zero_gradients()
 
     def get_weights(self) -> dict:
         """Trainable members as {name: value}. A sublayer's value is its own get_weights() dict."""
@@ -424,6 +430,8 @@ class BasalEstimator(Serializable, ABC):
             # ====---- actual direct operation ----====
             member -= gradient
             setattr(self, name, member)
+        # after the updates, purge our cached values
+        self.purge()
 
     def __isub__(self, gradients: dict) -> BasalEstimator:
         """`sublayer -= gradients` applies a get_gradients() dict through update_weights()."""
@@ -439,7 +447,10 @@ class BasalEstimator(Serializable, ABC):
             if isinstance(member, BasalEstimator):
                 member.zero_gradients()
             else:
-                setattr(self, f"gradient_{name}", None if member is None or isinstance(member, (dict, list, tuple)) else np.zeros_like(member))
+                setattr(self,
+                        f"gradient_{name}",
+                        None if ((member is None) or isinstance(member, (dict, list, tuple)))
+                        else np.zeros_like(member))
 
     @property
     def num_parameters(self) -> int:

@@ -123,44 +123,44 @@ def render() -> None:
             "nothing is padded, so it cannot see position; the fixed-length marker task shows this. The next-sentence "
             "task needs SentencePiece."
         )
-        mode = st.radio("Mode", ["Classification", "Profile"], horizontal=True, key="sp_mode")
+        mode = st.radio("Mode", ["Classification", "Profile"], horizontal=True, key="spp_mode")
 
     if mode == "Classification":
         with left:
             st.subheader("Settings")
-            task_name = st.selectbox("Task", TASKS, key="sp_task")
+            task_name = st.selectbox("Task", TASKS, key="spp_task")
             options = models_for(task_name)
             kinds = st.multiselect(
-                "Models", list(options), default=list(options), format_func=options.get, key=f"sp_kinds_{task_name}"
+                "Models", list(options), default=list(options), format_func=options.get, key=f"spp_kinds_{task_name}"
             )
-            length = int(st.number_input("Sequence length", 16, 128, 32, step=8, key="sp_length"))
-            hidden = int(st.number_input("Hidden dim", 4, 128, 32, step=4, key="sp_hidden"))
-            heads = int(st.number_input("Heads", 1, 16, 4, key="sp_heads"))
-            learning_rate = float(st.number_input("Learning rate", 0.0001, 0.1, 0.003, step=0.001, format="%.4f", key="sp_lr"))
-            steps = int(st.number_input("Training steps", 50, 3000, 400, step=50, key="sp_steps"))
-            batch_size = int(st.number_input("Batch size", 8, 128, 32, step=8, key="sp_batch"))
-            seeds = int(st.number_input("Seeds per model", 1, 8, 2, key="sp_seeds"))
-            seed = int(st.number_input("Data seed", 0, 9999, 0, key="sp_seed"))
+            length = int(st.number_input("Sequence length", 16, 128, 32, step=8, key="spp_length"))
+            hidden = int(st.number_input("Hidden dim", 4, 128, 32, step=4, key="spp_hidden"))
+            heads = int(st.number_input("Heads", 1, 16, 4, key="spp_heads"))
+            learning_rate = float(st.number_input("Learning rate", 0.0001, 0.1, 0.003, step=0.001, format="%.4f", key="spp_lr"))
+            steps = int(st.number_input("Training steps", 50, 3000, 400, step=50, key="spp_steps"))
+            batch_size = int(st.number_input("Batch size", 8, 128, 32, step=8, key="spp_batch"))
+            seeds = int(st.number_input("Seeds per model", 1, 8, 2, key="spp_seeds"))
+            seed = int(st.number_input("Data seed", 0, 9999, 0, key="spp_seed"))
         if not kinds or hidden % heads:
             right.warning("Choose at least one model, and a hidden dim divisible by the head count.")
             return
         with right:
             run_panel(
-                "sp_classify", run_classification, task_name, kinds, length, hidden, heads, steps, learning_rate,
+                "spp_classify", run_classification, task_name, kinds, length, hidden, heads, steps, learning_rate,
                 batch_size, seeds, seed,
             )
         return
 
     with left:
         st.subheader("Settings")
-        length = int(st.number_input("Sequence length", 16, 2048, 256, step=16, key="sp_plength"))
-        hidden = int(st.number_input("Hidden dim", 8, 1024, 256, step=8, key="sp_phidden"))
-        heads = int(st.number_input("Heads", 1, 32, 8, key="sp_pheads"))
-        batch = int(st.number_input("Batch size", 1, 32, 2, key="sp_pbatch"))
-        memory_tokens = int(st.number_input("Memory tokens", 0, 256, 0, step=16, key="sp_pmemory"))
+        length = int(st.number_input("Sequence length", 16, 2048, 256, step=16, key="spp_plength"))
+        hidden = int(st.number_input("Hidden dim", 8, 1024, 256, step=8, key="spp_phidden"))
+        heads = int(st.number_input("Heads", 1, 32, 8, key="spp_pheads"))
+        batch = int(st.number_input("Batch size", 1, 32, 2, key="spp_pbatch"))
+        memory_tokens = int(st.number_input("Memory tokens", 0, 256, 0, step=16, key="spp_pmemory"))
     if hidden % heads:
         right.warning("Hidden dim must be divisible by the head count.")
         return
     with right:
         st.caption("Float32 and complex64. Time is the median of three untraced runs; memory comes from the Profiler.")
-        run_panel("sp_profile", run_profile, length, hidden, heads, batch, memory_tokens)
+        run_panel("spp_profile", run_profile, length, hidden, heads, batch, memory_tokens)

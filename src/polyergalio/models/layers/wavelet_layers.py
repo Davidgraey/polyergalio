@@ -21,7 +21,8 @@ class HaarWaveletTransform:
     adjoint, but it's NOT AN EXACT INVERSE!!!
     """
 
-    INV_SQRT2 = 1.0 / np.sqrt(2.0)
+    # keep recast
+    INV_SQRT2 = float(1.0 / np.sqrt(2.0))
 
     def __init__(self, sequence_length: int):
         self.sequence_length = sequence_length
@@ -70,7 +71,8 @@ class HaarWaveletTransform:
 
         batch, sequence, hidden = self.input_shape
 
-        dx = np.zeros((batch, sequence, hidden))
+        # keep recast
+        dx = np.zeros((batch, sequence, hidden), dtype=low.dtype)
 
         for coefficient in range(self.num_coefficients):
             even = self.even_indices[coefficient]
@@ -103,10 +105,7 @@ class WaveletRefinementModule(Layer):
     """
     preserves_shape = True
     parameter_names = ("control_gate", "gate_projection", "gate_output")
-    cache_names = (
-        "v_tilde", "descriptor", "training_now", "run_prob", "run_mask", "gate", "gate_pooled",
-        "low", "high", "gated_low", "gated_high", "refinement", "output",
-    )
+    cache_names = ("descriptor_shape", "run_mask", "gate_pooled", "low", "high")
 
     def __init__(
         self,
@@ -143,7 +142,8 @@ class WaveletRefinementModule(Layer):
         participating sequence position, returning (B, N, D).
         """
         batch = dgate_coeff.shape[0]
-        dgate = np.zeros((batch, self.sequence_length, self.input_dimension))
+        # keep recast
+        dgate = np.zeros((batch, self.sequence_length, self.input_dimension), dtype=dgate_coeff.dtype)
 
         for coefficient in range(self.wavelet.num_coefficients):
             even = self.wavelet.even_indices[coefficient]
@@ -201,35 +201,29 @@ class WaveletRefinementModule(Layer):
             )
 
         self.purge()
-        self.v_tilde = v_tilde
-        self.descriptor = descriptor
-        self.training_now = training_now
 
-        self.run_prob = 1.0 / (1.0 + np.exp(-self.control_gate))
+        run_prob = 1.0 / (1.0 + np.exp(-self.control_gate))
         if training_now:
-            self.run_mask = RNG.random((batch, 1, 1)) < self.run_prob[0, 0]
+            run_mask = RNG.random((batch, 1, 1)) < run_prob[0, 0]
         else:
-            should_run = self.run_prob[0, 0] > self.skip_threshold
-            self.run_mask = np.full((batch, 1, 1), should_run)
+            run_mask = np.full((batch, 1, 1), run_prob[0, 0] > self.skip_threshold)
 
-        if not np.any(self.run_mask):
-            self.output = v_tilde
-            return self.output
+        if self.training:
+            self.descriptor_shape, self.run_mask = descriptor.shape, run_mask
+        if not np.any(run_mask):
+            return v_tilde
 
         gate = self.gate_output(self.gate_projection(descriptor))
         if gate.ndim == 2:
             gate = np.broadcast_to(gate[:, None, :], (batch, sequence, hidden))
 
-        self.gate = gate
-        self.gate_pooled = self._pool_gate(self.gate)
-        self.low, self.high = self.wavelet.analyze(v_tilde)
+        gate_pooled = self._pool_gate(gate)
+        low, high = self.wavelet.analyze(v_tilde)
+        if self.training:
+            self.gate_pooled, self.low, self.high = gate_pooled, low, high
 
-        self.gated_low = self.low * self.gate_pooled
-        self.gated_high = self.high * self.gate_pooled
-        self.refinement = self.wavelet.synthesize(self.gated_low, self.gated_high)
-
-        self.output = v_tilde + self.run_mask * self.refinement
-        return self.output
+        refinement = self.wavelet.synthesize(low * gate_pooled, high * gate_pooled)
+        return v_tilde + run_mask * refinement
 
     def backward(self, incoming_gradient: NDArray) -> tuple[NDArray, NDArray]:
         """
@@ -238,15 +232,12 @@ class WaveletRefinementModule(Layer):
         d_v_tilde : gradient with respect to v_tilde
         d_descriptor : gradient with respect to the descriptor, in its original shape
         """
-        assert self.output is not None, "backward called before forward"
-        assert incoming_gradient.shape == self.output.shape, (
-            f"gradient shape {incoming_gradient.shape} does not match output shape {self.output.shape}"
-        )
+        assert self.run_mask is not None, "backward called before a training forward"
 
         d_v_direct = incoming_gradient
 
         if not np.any(self.run_mask):
-            return d_v_direct, np.zeros_like(self.descriptor)
+            return d_v_direct, np.zeros(self.descriptor_shape, dtype=incoming_gradient.dtype)
 
         d_refinement = incoming_gradient * self.run_mask
         d_gated_low, d_gated_high = self.wavelet.analyze(d_refinement)
@@ -256,7 +247,7 @@ class WaveletRefinementModule(Layer):
         d_gate_pooled = (d_gated_low * self.low) + (d_gated_high * self.high)
 
         d_gate = self._unpool_gate(d_gate_pooled)
-        d_gate_fc = d_gate.sum(axis=1) if self.descriptor.ndim == 2 else d_gate
+        d_gate_fc = d_gate.sum(axis=1) if len(self.descriptor_shape) == 2 else d_gate
 
         d_gate_hidden = self.gate_output.backward(d_gate_fc)
         d_descriptor = self.gate_projection.backward(d_gate_hidden)

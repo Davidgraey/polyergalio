@@ -19,6 +19,7 @@ from typing import Optional
 import numpy as np
 from numpy.typing import NDArray
 
+from polyergalio.base_model import resolve_data_types
 from polyergalio.models.layers.basic_layers import RNG, FullyConnectedLayer, Layer
 from polyergalio.models.weight_initialization import get_weight_init
 
@@ -154,7 +155,8 @@ class ShortConvolution(Layer):
         self.zero_gradients()
 
     def forward(self, input_data: NDArray, mask: Optional[NDArray] = None) -> NDArray:
-        self.input = input_data
+        if self.training:
+            self.input = input_data
         output = np.broadcast_to(self.bias, input_data.shape).copy()
         for lag in range(self.kernel_size):
             output += self.weights[lag] * delay(input_data, lag)
@@ -200,7 +202,7 @@ class HyenaFilter(Layer):
 
     preserves_shape = False
     parameter_names = ("weights_1", "bias_1", "weights_2", "bias_2", "weights_3", "skip")
-    cache_names = ("hidden_pre_1", "hidden_1", "hidden_pre_2", "hidden_2", "filters")
+    cache_names = ("hidden_pre_1", "hidden_1", "hidden_pre_2", "hidden_2")
 
     def __init__(
         self,
@@ -260,15 +262,28 @@ class HyenaFilter(Layer):
         self.skip = np.zeros((order, channels))
         self.zero_gradients()
 
+    def recast(self, data_type=np.float64, complex_data_type=None) -> "HyenaFilter":
+        """Also converts the positional basis and window, which are constants rather than parameters."""
+        super().recast(data_type, complex_data_type)
+        float_type, _ = resolve_data_types(data_type, complex_data_type)
+        # keep recast
+        self.positions = self.positions.astype(float_type)
+        # keep recast
+        self.window = self.window.astype(float_type)
+        return self
+
     def forward(self) -> NDArray:
-        self.hidden_pre_1 = self.positions @ self.weights_1 + self.bias_1
-        self.hidden_1 = np.sin(self.hidden_pre_1)
-        self.hidden_pre_2 = self.hidden_1 @ self.weights_2 + self.bias_2
-        self.hidden_2 = np.sin(self.hidden_pre_2)
-        filters = (self.hidden_2 @ self.weights_3) * self.window
-        self.filters = filters.reshape(self.sequence_length, self.order, self.channels).transpose(1, 0, 2).copy()
-        self.filters[:, 0] += self.skip
-        return self.filters
+        hidden_pre_1 = self.positions @ self.weights_1 + self.bias_1
+        hidden_1 = np.sin(hidden_pre_1)
+        hidden_pre_2 = hidden_1 @ self.weights_2 + self.bias_2
+        hidden_2 = np.sin(hidden_pre_2)
+        if self.training:
+            self.hidden_pre_1, self.hidden_1 = hidden_pre_1, hidden_1
+            self.hidden_pre_2, self.hidden_2 = hidden_pre_2, hidden_2
+        filters = (hidden_2 @ self.weights_3) * self.window
+        filters = filters.reshape(self.sequence_length, self.order, self.channels).transpose(1, 0, 2).copy()
+        filters[:, 0] += self.skip
+        return filters
 
     def backward(self, filter_gradient: NDArray) -> None:
         """
@@ -320,7 +335,7 @@ class HyenaOperator(Layer):
     registry_name = "HyenaOperator"
     preserves_shape = True
     parameter_names = ("input_projection", "short_convolution", "hyena_filter", "output_projection")
-    cache_names = ("input", "mask", "gates", "filters", "states", "convolved", "output")
+    cache_names = ("mask", "gates", "filters", "states", "convolved")
 
     def __init__(
         self,
@@ -400,25 +415,27 @@ class HyenaOperator(Layer):
         assert input_data.shape[1] == self.sequence_length
         assert input_data.shape[2] == self.hidden_dim
 
-        self.input = input_data
-        self.mask = mask if mask is not None else np.ones(input_data.shape[:2])
+        # keep recast
+        mask = mask if mask is not None else np.ones(input_data.shape[:2], dtype=input_data.dtype)
 
-        projected = self.input_projection.forward(input_data) * self.mask[..., None]
+        projected = self.input_projection.forward(input_data) * mask[..., None]
         mixed = self.short_convolution.forward(projected)
-        *self.gates, value = np.split(mixed, self.order + 1, axis=-1)
-        self.filters = self.hyena_filter.forward()
+        *gates, value = np.split(mixed, self.order + 1, axis=-1)
+        filters = self.hyena_filter.forward()
 
-        state = value * self.mask[..., None]
-        self.states = [state]
-        self.convolved = []
-        for gate, filters in zip(self.gates, self.filters):
-            convolved = causal_convolution(state, filters)
-            state = gate * convolved
-            self.convolved.append(convolved)
-            self.states.append(state)
+        state = value * mask[..., None]
+        states, convolved = [], []
+        for gate, order_filters in zip(gates, filters):
+            if self.training:
+                states.append(state)
+            product = causal_convolution(state, order_filters)
+            state = gate * product
+            if self.training:
+                convolved.append(product)
 
-        self.output = self.output_projection.forward(state)
-        return self.output
+        if self.training:
+            self.mask, self.gates, self.filters, self.states, self.convolved = mask, gates, filters, states, convolved
+        return self.output_projection.forward(state)
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         state_gradient = self.output_projection.backward(incoming_gradient)

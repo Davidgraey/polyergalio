@@ -410,7 +410,7 @@ def generate(
     encoder.eval()
     seq2seq.eval()
     encoder.forward(ids, mask=attention_mask, target_mask=attention_mask)
-    latent = layers["latent_projection"].forward(encoder.activations["pooled"])
+    latent = layers["latent_projection"].forward(encoder.node("pooled").layer.output)
 
     start = layers["shift_right"].start_token[0, 0]
     step_input = np.broadcast_to(start, (batch, HIDDEN_DIM)) + latent[:, 0]

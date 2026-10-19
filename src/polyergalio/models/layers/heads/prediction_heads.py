@@ -120,10 +120,7 @@ class DecisionHead(Layer):
     Output shape: (batch, options) logits, MASKED_LOGIT on padded slots
     """
     parameter_names = ("type_embedding", "embedding_norm", "trunk_a", "trunk_norm", "scorer", "act_head")
-    cache_names = (
-        "hidden_shape", "marker_pos", "marker_end", "span_mask", "span_lengths",
-        "token_mask", "decisiontype", "act_logits", "act_gradient", "output",
-    )
+    cache_names = ("span_mask", "span_lengths", "token_mask", "decisiontype", "act_logits", "act_gradient")
     TEMPERATURE_GRID = np.exp(np.linspace(np.log(0.05), np.log(10.0), 81))
 
     def __init__(self,
@@ -230,38 +227,40 @@ class DecisionHead(Layer):
                 "DecisionHead needs marker_end, the exclusive end of each option's span"
             )
         batch, sequence_length = hidden_state.shape[:2]
-        self.hidden_shape = hidden_state.shape
-        self.marker_pos = np.asarray(marker_pos, dtype=int)
-        self.marker_end = np.asarray(marker_end, dtype=int)
-        self.token_mask = (np.ones(self.marker_pos.shape, dtype=bool)
-                           if token_mask is None
-                           else np.asarray(token_mask, dtype=bool)
-                           )
-        self.decisiontype = (np.full(batch, DECISION_TYPES.CHOICE.value)
-                             if decisiontypes is None
-                             else decision_type_ids(decisiontypes)
-                             )
+        marker_pos = np.asarray(marker_pos, dtype=int)
+        marker_end = np.asarray(marker_end, dtype=int)
+        token_mask = (np.ones(marker_pos.shape, dtype=bool)
+                      if token_mask is None
+                      else np.asarray(token_mask, dtype=bool)
+                      )
+        decisiontype = (np.full(batch, DECISION_TYPES.CHOICE.value)
+                        if decisiontypes is None
+                        else decision_type_ids(decisiontypes)
+                        )
 
         positions = np.arange(sequence_length)
-        self.span_mask = (
-            (positions[None, None, :] >= self.marker_pos[..., None])
-            & (positions[None, None, :] < self.marker_end[..., None])
-            & self.token_mask[..., None]
+        span_mask = (
+            (positions[None, None, :] >= marker_pos[..., None])
+            & (positions[None, None, :] < marker_end[..., None])
+            & token_mask[..., None]
         )
-        self.span_lengths = np.maximum(self.span_mask.sum(axis=-1, keepdims=True), 1)
-        span_weights = self.span_mask / self.span_lengths
+        span_lengths = np.maximum(span_mask.sum(axis=-1, keepdims=True), 1)
+        # keep recast
+        span_weights = (span_mask / span_lengths).astype(hidden_state.dtype)
 
-        type_vector = self.type_embedding[self.decisiontype]
+        type_vector = self.type_embedding[decisiontype]
         markers = np.einsum("bot,bth->boh", span_weights, hidden_state)
-        xs = self.trunk_a(self.embedding_norm(markers)+ type_vector[:, None, :], mask=self.token_mask)
-        xs = self.trunk_norm(xs, mask=self.token_mask)
+        xs = self.trunk_a(self.embedding_norm(markers)+ type_vector[:, None, :], mask=token_mask)
+        xs = self.trunk_norm(xs, mask=token_mask)
 
         scores = self.scorer(xs)[..., 0]
 
         self.act_logits = self.act_head(hidden_state[:, 0] + type_vector)
         self.act_gradient = None
-        self.output = np.where(self.token_mask, scores, MASKED_LOGIT)
-        return self.output
+        if self.training:
+            self.span_mask, self.span_lengths = span_mask, span_lengths
+            self.token_mask, self.decisiontype = token_mask, decisiontype
+        return np.where(token_mask, scores, MASKED_LOGIT)
 
     @property
     def act_probabilities(self) -> NDArray:
@@ -299,7 +298,8 @@ class DecisionHead(Layer):
         grad_typed = grad_trunk * self.token_mask[..., None]
         grad_markers = self.embedding_norm.backward(grad_typed) * self.token_mask[..., None]
 
-        span_weights = self.span_mask / self.span_lengths
+        # keep recast
+        span_weights = (self.span_mask / self.span_lengths).astype(grad_markers.dtype)
         grad_hidden = np.einsum("bot,boh->bth", span_weights, grad_markers)
         grad_type = np.sum(grad_typed, axis=1)
 

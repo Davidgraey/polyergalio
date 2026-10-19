@@ -116,6 +116,8 @@ def main():
     print(f"accuracy before training: {before:.3f}")
     print(f"accuracy after training:  {after:.3f}")
 
+    net.train()
+    net.forward(x)
     load = moe.gate.mask.mean(axis=0)
     fair_share = TOP_K / NUM_ROUTED_EXPERTS
     print(f"expert load (fair share {fair_share:.3f}):")

@@ -21,7 +21,7 @@ class TextEmbedding(Layer):
     Output shape: (..., embedding_dim)
     """
     parameter_names = ("weights",)
-    cache_names = ("token_ids", "output")
+    cache_names = ("token_ids",)
 
     def __init__(self,
                  num_embeddings: int,
@@ -85,9 +85,9 @@ class TextEmbedding(Layer):
                 f"token ids must fall in [0, {self.num_embeddings}), "
                 f"got range [{token_ids.min()}, {token_ids.max()}]"
             )
-        self.token_ids = token_ids
-        self.output = self.weights[token_ids]
-        return self.output
+        if self.training:
+            self.token_ids = token_ids
+        return self.weights[token_ids]
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         """

@@ -21,8 +21,6 @@ class PositionalLayer(Layer):
 
     The table is rebuilt from the constructor arguments, so it is neither a parameter nor state.
     """
-    cache_names = ("output",)
-
     def __init__(self, sequence_length: int, embedding_dimension: int, base_freq: int = 10000):
         """
         Parameters
@@ -84,10 +82,10 @@ class RopeEmbedding(PositionalLayer):
         even = input_data[..., 0::2]
         odd = input_data[..., 1::2]
 
-        self.output = np.zeros_like(input_data)
-        self.output[..., 0::2] = even * cosine - odd * sine
-        self.output[..., 1::2] = even * sine + odd * cosine
-        return self.output
+        output = np.zeros_like(input_data)
+        output[..., 0::2] = even * cosine - odd * sine
+        output[..., 1::2] = even * sine + odd * cosine
+        return output
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         """The transpose of a rotation is the inverse rotation: the same angles in the opposite direction."""
@@ -140,8 +138,7 @@ class SinusoidEmbedding(PositionalLayer):
         the input with the position table added
         """
         sequence = self.check_input(input_data)
-        self.output = input_data + self.pos_table[:sequence]
-        return self.output
+        return input_data + self.pos_table[:sequence]
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         """Adding a constant has an identity Jacobian, so the gradient passes through."""

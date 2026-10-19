@@ -9,6 +9,7 @@ from typing import Optional
 import numpy as np
 from numpy.typing import NDArray
 
+from polyergalio.base_model import resolve_data_types
 from polyergalio.models.layers.attention_heads import (
     HeadGate,
     HeadProjection,
@@ -58,7 +59,9 @@ class PrefixFFTCache:
         hidden_dimension: int,
         batch_size: int,
         memory_tokens: int = 0,
+        data_type=np.float64,
     ):
+        float_type, complex_type = resolve_data_types(data_type)
         self.sequence_length = int(sequence_length)
         self.memory_tokens = int(memory_tokens)
         self.max_sequence = self.memory_tokens + self.sequence_length
@@ -67,22 +70,30 @@ class PrefixFFTCache:
         self.n_freq = self.max_sequence // 2 + 1
 
         # constructing sublayers and parameters
-        self.prefix_fft = np.zeros((self.batch_size, self.n_freq, self.hidden_dimension), dtype=complex)
-        self.value_buffer = np.zeros((self.batch_size, self.max_sequence, self.hidden_dimension))
-        self.query_buffer = np.zeros((self.batch_size, self.max_sequence, self.hidden_dimension))
+        # keep recast
+        self.prefix_fft = np.zeros((self.batch_size, self.n_freq, self.hidden_dimension), dtype=complex_type)
+        # keep recast
+        self.value_buffer = np.zeros((self.batch_size, self.max_sequence, self.hidden_dimension), dtype=float_type)
+        # keep recast
+        self.query_buffer = np.zeros((self.batch_size, self.max_sequence, self.hidden_dimension), dtype=float_type)
         self.mask_buffer = np.zeros((self.batch_size, self.max_sequence), dtype=bool)
-        self.sum_query = np.zeros((self.batch_size, self.hidden_dimension))
+        # keep recast
+        self.sum_query = np.zeros((self.batch_size, self.hidden_dimension), dtype=float_type)
 
         # absolute step counter for the *sliding* part alone. memory slots are written once (in prefill / set_memory)
         # and not counted
         self.position = 0
-        self.length = np.zeros(self.batch_size)
-        self.memory_values = np.zeros((self.memory_tokens, self.hidden_dimension))
-        self.memory_query_sum = np.zeros(self.hidden_dimension)
+        # keep recast
+        self.length = np.zeros(self.batch_size, dtype=float_type)
+        # keep recast
+        self.memory_values = np.zeros((self.memory_tokens, self.hidden_dimension), dtype=float_type)
+        # keep recast
+        self.memory_query_sum = np.zeros(self.hidden_dimension, dtype=float_type)
 
         k = np.arange(self.n_freq)
         t = np.arange(self.max_sequence)
-        self._twiddle = np.exp(-2j * np.pi * np.outer(t, k) / self.max_sequence)
+        # keep recast
+        self._twiddle = np.exp(-2j * np.pi * np.outer(t, k) / self.max_sequence).astype(complex_type)
 
     def reset(self):
         """clear the sliding window, keeping the persistent memory set by set_memory"""
@@ -138,7 +149,8 @@ class PrefixFFTCache:
             raise ValueError(f"cache batch_size={self.batch_size}, got {batch}")
 
         if mask is None:
-            mask = np.ones((batch, length))
+            # keep recast
+            mask = np.ones((batch, length), dtype=value.dtype)
 
         self.reset()
 
@@ -155,7 +167,7 @@ class PrefixFFTCache:
         )
 
         self.sum_query[...] = self.memory_query_sum[None] + query_valid.sum(axis=1)
-        self.length[...] = mask.sum(axis=1).astype(np.int32)
+        self.length[...] = mask.sum(axis=1)
         self.position = length
 
     # DECODE STEPS ------------------
@@ -206,7 +218,7 @@ class PrefixFFTCache:
 
         self.position += 1
         self.length = np.minimum(
-            self.length + valid.astype(np.int64), self.sequence_length
+            self.length + valid, self.sequence_length
         )
 
         return slot
@@ -280,10 +292,7 @@ class SpectreAttention(Layer):
 
     registry_name = "SPECTREAttention"
     preserves_shape = True
-    cache_names = (
-        "input", "mask", "counts", "total_counts", "combined_length", "seq_mu",
-        "gate", "descriptor", "value_transform", "output",
-    )
+    cache_names = ("mask", "total_counts", "combined_length", "gate", "value_transform")
 
     def __init__(
         self,
@@ -388,9 +397,10 @@ class SpectreAttention(Layer):
 
         batch = input_data.shape[0]
 
-        self.mask = mask if mask is not None else np.ones(input_data.shape[:2])
-        self.counts = np.maximum(self.mask.sum(axis=1, keepdims=True), 1.0)
-        mask_column = self.mask[..., None]
+        # keep recast
+        mask = mask if mask is not None else np.ones(input_data.shape[:2], dtype=input_data.dtype)
+        counts = np.maximum(mask.sum(axis=1, keepdims=True), 1.0)
+        mask_column = mask[..., None]
 
         if self.memory_tokens:
             memory = self.memory.get_memory()
@@ -400,7 +410,7 @@ class SpectreAttention(Layer):
             combined = np.concatenate([memory_batch, input_data], axis=1)
         else:
             combined = input_data
-        self.combined_length = combined.shape[1]
+        combined_length = combined.shape[1]
 
         query_all = self.query_projection.forward(combined)
         value_all = self.value_projection.forward(combined)
@@ -410,22 +420,23 @@ class SpectreAttention(Layer):
         value_masked = value_all.copy()
         value_masked[:, memory_tokens:] *= mask_column
 
-        self.total_counts = self.counts + memory_tokens
+        total_counts = counts + memory_tokens
         seq_sum = (query_forward * mask_column).sum(axis=1) + query_all[:, :memory_tokens].sum(axis=1)
-        self.seq_mu = seq_sum / self.total_counts
 
-        self.gate = self.head_gate.forward(self.seq_mu)
-        self.descriptor = self.head_gate.descriptor
+        gate = self.head_gate.forward(seq_sum / total_counts, keep_descriptor=self.use_wrm)
+        descriptor = self.head_gate.descriptor if self.use_wrm else None
 
-        # the full combined sequence gets a single transform into frequency space
-        self.value_transform = np.fft.rfft(value_masked, n=self.combined_length, axis=1)
-        values_gated = split_heads(self.value_transform, self.num_heads) * align_gate(self.gate)
-        output_all = np.fft.irfft(merge_heads(values_gated), n=self.combined_length, axis=1)
-        self.output = output_all[:, memory_tokens:]
+        value_transform = np.fft.rfft(value_masked, n=combined_length, axis=1)
+        values_gated = split_heads(value_transform, self.num_heads) * align_gate(gate)
+        output_all = np.fft.irfft(merge_heads(values_gated), n=combined_length, axis=1)
+        output = output_all[:, memory_tokens:]
 
+        if self.training:
+            self.mask, self.total_counts, self.combined_length = mask, total_counts, combined_length
+            self.gate, self.value_transform = gate, value_transform
         if self.use_wrm:
-            self.output = self.wrm.forward(self.output, self.descriptor, training_now=training_now)
-        return self.output
+            output = self.wrm.forward(output, descriptor, training_now=training_now)
+        return output
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         mask_column = self.mask[..., None]
@@ -508,7 +519,7 @@ class SpectreDecoderAttention(SpectreAttention):
     """
 
     registry_name = "SPECTREDecoderAttention"
-    cache_names = ("anchors", "chunk_counts", "filter_transforms")
+    cache_names = ("mask", "combined_length", "value_transform", "anchors", "chunk_counts", "filter_transforms")
 
     def __init__(
         self,
@@ -575,45 +586,51 @@ class SpectreDecoderAttention(SpectreAttention):
         assert length == self.sequence_length and input_data.shape[2] == self.hidden_dimension
         memory_tokens = self.memory_tokens
 
-        self.mask = mask if mask is not None else np.ones((batch, length))
-        mask_column = self.mask[..., None]
+        # keep recast
+        mask = mask if mask is not None else np.ones((batch, length), dtype=input_data.dtype)
+        mask_column = mask[..., None]
 
         if memory_tokens:
             memory = np.broadcast_to(self.memory.get_memory()[None], (batch, memory_tokens, self.hidden_dimension))
             combined = np.concatenate([memory, input_data], axis=1)
         else:
             combined = input_data
-        self.combined_length = combined.shape[1]
+        combined_length = combined.shape[1]
 
         query_all = self.query_projection.forward(combined)
         values = self.value_projection.forward(combined)
         values[:, memory_tokens:] *= mask_column
 
-        self.anchors = np.arange(0, length, self.chunk_size)
-        prefix_queries = np.cumsum(query_all[:, memory_tokens:] * mask_column, axis=1)[:, self.anchors]
-        prefix_counts = np.cumsum(self.mask, axis=1)[:, self.anchors]
-        self.chunk_counts = (np.maximum(prefix_counts, 1.0) + memory_tokens)[..., None]
+        anchors = np.arange(0, length, self.chunk_size)
+        prefix_queries = np.cumsum(query_all[:, memory_tokens:] * mask_column, axis=1)[:, anchors]
+        prefix_counts = np.cumsum(mask, axis=1)[:, anchors]
+        chunk_counts = (np.maximum(prefix_counts, 1.0) + memory_tokens)[..., None]
         memory_query_sum = query_all[:, :memory_tokens].sum(axis=1, keepdims=True)
-        pooled = (prefix_queries + memory_query_sum) / self.chunk_counts
+        pooled = (prefix_queries + memory_query_sum) / chunk_counts
 
-        num_chunks = self.anchors.size
-        self.gate = self.head_gate.forward(pooled.reshape(batch * num_chunks, self.hidden_dimension))
+        num_chunks = anchors.size
+        gate = self.head_gate.forward(pooled.reshape(batch * num_chunks, self.hidden_dimension), keep_descriptor=False)
 
-        padded_length = 2 * self.combined_length
-        self.value_transform = np.fft.rfft(values, n=padded_length, axis=1)
-        value_heads = split_heads(self.value_transform, self.num_heads)
-        chunk_gates = self.gate.reshape(batch, num_chunks, self.num_heads, self.num_frequencies)
-        self.filter_transforms = []
-        self.output = np.zeros_like(input_data)
-        for chunk, anchor in enumerate(self.anchors):
+        padded_length = 2 * combined_length
+        value_transform = np.fft.rfft(values, n=padded_length, axis=1)
+        value_heads = split_heads(value_transform, self.num_heads)
+        chunk_gates = gate.reshape(batch, num_chunks, self.num_heads, self.num_frequencies)
+        filter_transforms = []
+        output = np.zeros_like(input_data)
+        for chunk, anchor in enumerate(anchors):
             rows = slice(anchor, min(anchor + self.chunk_size, length))
-            filters = np.fft.irfft(chunk_gates[:, chunk], n=self.combined_length, axis=-1)
+            filters = np.fft.irfft(chunk_gates[:, chunk], n=combined_length, axis=-1)
             filter_transform = np.fft.rfft(filters, n=padded_length, axis=-1)
-            self.filter_transforms.append(filter_transform)
+            if self.training:
+                filter_transforms.append(filter_transform)
             mixed = value_heads * align_gate(filter_transform)
             convolved = np.fft.irfft(merge_heads(mixed), n=padded_length, axis=1)
-            self.output[:, rows] = convolved[:, memory_tokens + rows.start: memory_tokens + rows.stop]
-        return self.output
+            output[:, rows] = convolved[:, memory_tokens + rows.start: memory_tokens + rows.stop]
+
+        if self.training:
+            self.mask, self.combined_length, self.value_transform = mask, combined_length, value_transform
+            self.anchors, self.chunk_counts, self.filter_transforms = anchors, chunk_counts, filter_transforms
+        return output
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         batch, length, _ = incoming_gradient.shape
@@ -623,12 +640,14 @@ class SpectreDecoderAttention(SpectreAttention):
         value_heads = split_heads(self.value_transform, self.num_heads)
 
         value_transform_gradient = np.zeros_like(self.value_transform)
+        # keep recast
         gate_gradient = np.zeros(
-            (batch, self.anchors.size, self.num_heads, self.num_frequencies), dtype=complex
+            (batch, self.anchors.size, self.num_heads, self.num_frequencies), dtype=self.value_transform.dtype
         )
         for chunk, anchor in enumerate(self.anchors):
             rows = slice(anchor, min(anchor + self.chunk_size, length))
-            convolved_gradient = np.zeros((batch, padded_length, self.hidden_dimension))
+            # keep recast
+            convolved_gradient = np.zeros((batch, padded_length, self.hidden_dimension), dtype=incoming_gradient.dtype)
             convolved_gradient[:, memory_tokens + rows.start: memory_tokens + rows.stop] = incoming_gradient[:, rows]
             mixed_gradient = split_heads(irfft_adjoint(convolved_gradient, padded_length, axis=1), self.num_heads)
 
@@ -644,7 +663,8 @@ class SpectreDecoderAttention(SpectreAttention):
         reaching = np.cumsum(per_anchor[:, ::-1], axis=1)[:, ::-1]
         first_chunk = -(-np.arange(length) // self.chunk_size)
         covered = first_chunk < self.anchors.size
-        token_query_gradient = np.zeros((batch, length, self.hidden_dimension))
+        # keep recast
+        token_query_gradient = np.zeros((batch, length, self.hidden_dimension), dtype=incoming_gradient.dtype)
         token_query_gradient[:, covered] = reaching[:, first_chunk[covered]]
         token_query_gradient *= mask_column
 
@@ -666,6 +686,7 @@ class SpectreDecoderAttention(SpectreAttention):
             hidden_dimension=self.hidden_dimension,
             batch_size=batch_size,
             memory_tokens=self.memory_tokens,
+            data_type=self.value_projection.weights.dtype,
         )
         self.chunk_gate = None
         if self.memory_tokens:
@@ -680,7 +701,7 @@ class SpectreDecoderAttention(SpectreAttention):
         -------
         (batch, num_frequencies, hidden_dim) activated gate, each head's gate repeated over its channels
         """
-        gate = self.head_gate.forward(query_sum / total_counts)
+        gate = self.head_gate.forward(query_sum / total_counts, keep_descriptor=False)
         batch = gate.shape[0]
         return merge_heads(
             np.broadcast_to(align_gate(gate), (batch, self.num_frequencies, self.num_heads, self.head_dimension))
@@ -711,7 +732,8 @@ class SpectreDecoderAttention(SpectreAttention):
         assert hidden_dim == self.hidden_dimension
 
         self.reset_cache(batch_size=batch)
-        mask = mask if mask is not None else np.ones((batch, length))
+        # keep recast
+        mask = mask if mask is not None else np.ones((batch, length), dtype=input_data.dtype)
 
         query_all = self.query_projection.project(input_data)
         value_all = self.value_projection.project(input_data)
@@ -766,10 +788,7 @@ class SpectrePooledAttention(SpectreAttention):
     registry_name = "SPECTREPooledAttention"
     preserves_shape = False
     consumes_mask = True
-    cache_names = (
-        "input", "mask", "counts", "total_counts", "combined_length", "seq_mu",
-        "gate", "pool_spectrum", "pool_weights", "value_masked",
-    )
+    cache_names = ("mask", "counts", "total_counts", "combined_length", "gate", "pool_spectrum", "value_masked")
 
     def __init__(
         self,
@@ -831,10 +850,10 @@ class SpectrePooledAttention(SpectreAttention):
 
         num_samples = input_data.shape[0]
         memory_tokens = self.memory_tokens
-        self.input = input_data
-        self.mask = (mask if mask is not None else np.ones(input_data.shape[:2])).astype(input_data.dtype)
-        self.counts = np.maximum(self.mask.sum(axis=1, keepdims=True), 1.0)
-        mask_column = self.mask[..., None]
+        # keep recast
+        mask = (mask if mask is not None else np.ones(input_data.shape[:2])).astype(input_data.dtype, copy=False)
+        counts = np.maximum(mask.sum(axis=1, keepdims=True), 1.0)
+        mask_column = mask[..., None]
 
         if memory_tokens:
             memory = self.memory.get_memory()
@@ -842,34 +861,34 @@ class SpectrePooledAttention(SpectreAttention):
             combined = np.concatenate([memory_batch, input_data], axis=1)
         else:
             combined = input_data
-        self.combined_length = combined.shape[1]
+        combined_length = combined.shape[1]
 
         query_all = self.query_projection.forward(combined)
         value_all = self.value_projection.forward(combined)
 
-        self.value_masked = value_all.copy()
-        self.value_masked[:, memory_tokens:] *= mask_column
+        value_masked = value_all.copy()
+        value_masked[:, memory_tokens:] *= mask_column
 
-        # the actual length of the transform -- including the persistent memory
-        self.total_counts = self.counts + memory_tokens
+        total_counts = counts + memory_tokens
         seq_sum = (query_all[:, memory_tokens:] * mask_column).sum(axis=1) + query_all[:, :memory_tokens].sum(axis=1)
-        self.seq_mu = seq_sum / self.total_counts
-        self.gate = self.head_gate.forward(self.seq_mu)
+        gate = self.head_gate.forward(seq_sum / total_counts, keep_descriptor=False)
 
-        self.pool_weights = self.readout_weights()
-        self.pool_spectrum = irfft_adjoint(self.pool_weights, self.combined_length, axis=1)
-        spectrum = np.conj(align_gate(self.gate)[..., 0]) * self.pool_spectrum
-        position_weights = rfft_adjoint(spectrum, self.combined_length, axis=1)
+        pool_spectrum = irfft_adjoint(self.readout_weights(mask, counts, combined_length), combined_length, axis=1)
+        spectrum = np.conj(align_gate(gate)[..., 0]) * pool_spectrum
+        position_weights = rfft_adjoint(spectrum, combined_length, axis=1)
 
-        values = split_heads(self.value_masked, self.num_heads)
+        values = split_heads(value_masked, self.num_heads)
         pooled = np.einsum("bsh,bshc->bhc", position_weights, values)
+        if self.training:
+            self.mask, self.counts, self.total_counts, self.combined_length = mask, counts, total_counts, combined_length
+            self.gate, self.pool_spectrum, self.value_masked = gate, pool_spectrum, value_masked
         return merge_heads(pooled)[:, None, :]
 
-    def readout_weights(self) -> NDArray:
+    def readout_weights(self, mask: NDArray, counts: NDArray, combined_length: int) -> NDArray:
         """(batch, combined_length, heads) readout over the combined sequence, zero on memory slots and padding"""
-        weights = np.zeros((self.mask.shape[0], self.combined_length, self.num_heads), dtype=self.mask.dtype)
-        masked = self.mask[:, :, None] * self.readout.T[None, :, :]
-        weights[:, self.memory_tokens:] = masked / self.counts[..., None]
+        weights = np.zeros((mask.shape[0], combined_length, self.num_heads), dtype=mask.dtype)
+        masked = mask[:, :, None] * self.readout.T[None, :, :]
+        weights[:, self.memory_tokens:] = masked / counts[..., None]
         return weights
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:

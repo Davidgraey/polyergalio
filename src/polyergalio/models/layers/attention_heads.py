@@ -4,7 +4,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 import polyergalio.models.activations as activations
-from polyergalio.models.activations import mod_relu, mod_relu_derivative
+from polyergalio.models.activations import DERIVATIVE_INPUTS, mod_relu, mod_relu_derivative
 from polyergalio.models.layers.basic_layers import RNG, FullyConnectedLayer, Layer, RMSNormLayer
 from polyergalio.models.weight_initialization import get_weight_init
 
@@ -26,6 +26,14 @@ def align_gate(gate: NDArray) -> NDArray:
     return np.transpose(gate, (0, 2, 1))[..., None]
 
 
+def to_head_batches(array: NDArray, num_heads: int, width: int) -> NDArray:
+    """
+    (..., num_heads * width) or (..., num_heads, width) -> (num_heads, rows, width) for a batched matmul.
+    Made C-contiguous first: a strided view, such as the .real of a complex array, would drop matmul out of BLAS.
+    """
+    return np.ascontiguousarray(array).reshape(-1, num_heads, width).transpose(1, 0, 2)
+
+
 def shift_frequencies(array: NDArray, offset: int) -> NDArray:
     """shift along the last (frequency) axis, zero filled rather than circular"""
     out = np.zeros_like(array)
@@ -44,6 +52,9 @@ class DenseHead(Layer):
     (ni, no) map over its own slice of the input
 
         y_h = activation(x_h W_h + b_h)
+
+    Backward needs the input and whichever of z and output the activation's derivative reads (none for linear).
+    Only those are kept, and only in training mode.
 
     Input shape: (..., num_heads * ni)
     Output shape: (..., num_heads * no)
@@ -79,6 +90,7 @@ class DenseHead(Layer):
         self.initialization_kwargs = dict(initialization_kwargs or {})
         self.activation_function = activations.activation_dictionary[activation_type]
         self.activation_derivative = activations.derivative_dictionary[activation_type]
+        self.derivative_inputs = DERIVATIVE_INPUTS[activation_type]
         self.declare_shapes(inputs=((num_heads * input_dimension,),), outputs=((num_heads * output_dimension,),))
 
         initializer = get_weight_init(initialization or activation_type, **self.initialization_kwargs)
@@ -88,26 +100,33 @@ class DenseHead(Layer):
 
     def pre_activation(self, input_data: NDArray) -> NDArray:
         """(..., num_heads * ni) -> (..., num_heads, no), before the activation"""
-        return np.einsum("...hi,hio->...ho", split_heads(input_data, self.num_heads), self.weights) + self.bias
+        heads = to_head_batches(input_data, self.num_heads, self.input_dimension)
+        z = np.add(np.matmul(heads, self.weights).transpose(1, 0, 2), self.bias, order="C")
+        return z.reshape(*input_data.shape[:-1], self.num_heads, self.output_dimension)
 
     def project(self, input_data: NDArray) -> NDArray:
         """the full map without caching, for decoding"""
         return merge_heads(self.activation_function(self.pre_activation(input_data)))
 
     def forward(self, input_data: NDArray) -> NDArray:
-        self.input = input_data
-        self.z = self.pre_activation(input_data)
-        self.output = self.activation_function(self.z)
-        return merge_heads(self.output)
+        inputs = np.ascontiguousarray(input_data)
+        z = self.pre_activation(inputs)
+        output = self.activation_function(z)
+        if self.training:
+            self.input = inputs
+            self.z = z if "z" in self.derivative_inputs else None
+            self.output = output if "output" in self.derivative_inputs else None
+        return merge_heads(output)
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         delta = self.activation_derivative(self.output, self.z, split_heads(incoming_gradient, self.num_heads))
-        flat_input = split_heads(self.input, self.num_heads).reshape(-1, self.num_heads, self.input_dimension)
-        flat_delta = delta.reshape(-1, self.num_heads, self.output_dimension)
+        inputs = to_head_batches(self.input, self.num_heads, self.input_dimension)
+        deltas = to_head_batches(delta, self.num_heads, self.output_dimension)
 
-        self.gradient_weights = np.einsum("nhi,nho->hio", flat_input, flat_delta, optimize=True)
-        self.gradient_bias = flat_delta.sum(axis=0)
-        return merge_heads(np.einsum("...ho,hio->...hi", delta, self.weights, optimize=True))
+        self.gradient_weights = np.matmul(inputs.transpose(0, 2, 1), deltas)
+        self.gradient_bias = deltas.sum(axis=1)
+        input_gradient = np.matmul(deltas, self.weights.transpose(0, 2, 1)).transpose(1, 0, 2)
+        return merge_heads(input_gradient.reshape(*delta.shape[:-2], self.num_heads, self.input_dimension))
 
     def __str__(self):
         return f"DenseHead, {self.num_heads} heads of {self.input_dimension} -> {self.output_dimension}, {self.activation_type}"
@@ -176,7 +195,7 @@ class HeadGate(Layer):
     Input shape: (batch, num_heads * head_dim) pooled query
     Output shape: (batch, num_heads, num_frequencies) complex gate
     """
-    cache_names = ("std", "x_norm", "normed", "gate_raw", "gate_pre_activation", "gate")
+    cache_names = ("std", "x_norm", "normed", "gate_raw", "gate_pre_activation")
 
     def __init__(
         self,
@@ -256,11 +275,12 @@ class HeadGate(Layer):
             banded += self.band_scale * self.band_taps[:, index, None] * shift_frequencies(gate, offset)
         return gate + banded
 
-    def forward(self, pooled_query: NDArray) -> NDArray:
+    def forward(self, pooled_query: NDArray, keep_descriptor: bool = True) -> NDArray:
         """
         Parameters
         ----------
         pooled_query : (batch, hidden) mean query, heads laid out along the hidden axis
+        keep_descriptor : hold the normalised query for the descriptor property; False when nothing reads it
 
         Returns
         -------
@@ -268,22 +288,27 @@ class HeadGate(Layer):
         """
         heads = split_heads(pooled_query, self.num_heads)
         centred = heads - heads.mean(axis=-1, keepdims=True)
-        self.std = np.sqrt(np.mean(centred ** 2, axis=-1, keepdims=True) + self.DESCRIPTOR_EPS)
-        self.x_norm = centred / self.std
-        self.normed = self.gamma * self.x_norm + self.beta
+        std = np.sqrt(np.mean(centred ** 2, axis=-1, keepdims=True) + self.DESCRIPTOR_EPS)
+        x_norm = centred / std
+        normed = self.gamma * x_norm + self.beta
+        self.normed = normed if keep_descriptor else None
 
-        hidden = self.hidden_layer.forward(merge_heads(self.normed))
+        hidden = self.hidden_layer.forward(merge_heads(normed))
         projection = split_heads(self.output_layer.forward(hidden), self.num_heads)
 
         real, imaginary = np.split(projection, 2, axis=-1)
-        self.gate_raw = real + 1j * imaginary
-        self.gate_pre_activation = self.band_update(self.gate_raw) if self.band_radius else self.gate_raw
-        self.gate = mod_relu(self.gate_pre_activation, self.activation_bias)
-        return self.gate
+        gate_raw = real + 1j * imaginary
+        gate_pre_activation = self.band_update(gate_raw) if self.band_radius else gate_raw
+        if self.training:
+            self.std = std
+            self.x_norm = x_norm
+            self.gate_pre_activation = gate_pre_activation
+            self.gate_raw = gate_raw if self.band_radius else None
+        return mod_relu(gate_pre_activation, self.activation_bias)
 
     @property
     def descriptor(self) -> NDArray:
-        """(batch, hidden) per-head normalised pooled query, the conditioning the WRM reads"""
+        """(batch, hidden) per-head normalised pooled query, the conditioning the WRM reads; set by forward(keep_descriptor=True)"""
         return merge_heads(self.normed)
 
     def backward(self, gate_gradient: NDArray, descriptor_gradient: Optional[NDArray] = None) -> NDArray:

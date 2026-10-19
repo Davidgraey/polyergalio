@@ -6,6 +6,8 @@ import pickle
 import struct
 from typing import Any
 
+import numpy as np
+
 LENGTH = struct.Struct(">Q")
 HANDSHAKE_LIMIT = 4096
 SKELETON_LIMIT = 1 << 26
@@ -13,11 +15,16 @@ BUFFER_LIMIT = 1 << 34
 BUFFER_COUNT_LIMIT = 1 << 16
 CHUNK_BYTES = 1 << 20
 
+NUMPY_DTYPES = {
+    scalar.__name__ for scalar in set(np.sctypeDict.values())
+    if isinstance(scalar, type) and issubclass(scalar, np.generic) and getattr(np, scalar.__name__, None) is scalar
+}
+
 ALLOWED_GLOBALS = {
     "builtins": {"dict", "list", "tuple", "set", "frozenset", "str", "int", "float", "bool", "bytes", "bytearray",
                  "complex", "slice", "range"},
     "collections": {"OrderedDict"},
-    "numpy": {"ndarray", "dtype"},
+    "numpy": {"ndarray", "dtype"} | NUMPY_DTYPES,
     "numpy.core.multiarray": {"_reconstruct", "scalar"},
     "numpy._core.multiarray": {"_reconstruct", "scalar"},
     "numpy.core.numeric": {"_frombuffer"},
