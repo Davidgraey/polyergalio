@@ -11,21 +11,21 @@ from polyergalio.models.constants import (
     EPSILON,
     MASKED_LOGIT,
 )
-from polyergalio.models.heads.decision_utilities import decision_type_ids
 from polyergalio.models.layers.basic_layers import (
     RNG,
     FullyConnectedLayer,
     Layer,
     NormalizeLayer,
 )
+from polyergalio.models.layers.heads.decision_utilities import decision_type_ids
 from polyergalio.models.layers.mixture_layers import MixtureOfExperts
 from polyergalio.models.weight_initialization import get_weight_init
 
 
 class LowRankBottleNeck(Layer):
     """
-    reduction in parameters as a linear bottleneck for high-dimensional output (MLM)
-        1200 -> 200 -> 70000
+    reduction in parameters as a linear bottleneck for high-dimensional output - like Masked Language Modeling task
+        with high vocab
     """
     parameter_names = ("fc_down_projection", "fc_up_projection")
 
@@ -100,27 +100,27 @@ class DecisionHead(Layer):
         [CLS] <type> <instructions> [SEP]
         [MARK] <option1> [MARK] <option2> ... [SEP] <state> [SEP]
 
-    the head mean-pools the encoder's hidden state across each option's own
-    span -- from its [MARK] to the next control token -- adds a learned
-    embedding of the question type, and scores every option with one shared
-    scorer. Pooling the whole span, not just the [MARK] position, keeps a
-    long option's tokens from being squeezed through a single position.
+    the head mean-pools the encoder's hidden state across each option's own span
+        from its [MARK] to the next control token
+
+    adds a learned embedding of the question / task type scores every option with one shared scorer
+
+    Pooling the whole span, not just the [MARK] position, keeps a long option's tokens from being squeezed through a
+        single position.
+
     A softmax over the valid options answers all three types:
         CHOICE: argmax between the valid options
         SCORE: expected level over the ordered levels,
         BINARY: P(true) with options fixed as [false, true].
 
-    a second output head reads [CLS] into two act logits [defer, act], trained to
-    predict whether the answer will be right: the escalation signal
+    a second output head reads [CLS] into two act logits [defer, act], trained to predict whether the answer will be
+        correct: this is the 'escalation' signal
 
     Input shape: (batch, sequence, hidden_dim)
     Output shape: (batch, options) logits, MASKED_LOGIT on padded slots
     """
     parameter_names = ("type_embedding", "embedding_norm", "trunk_a", "trunk_norm", "scorer", "act_head")
-    cache_names = (
-        "hidden_shape", "marker_pos", "marker_end", "span_mask", "span_lengths",
-        "token_mask", "decisiontype", "act_logits", "act_gradient", "output",
-    )
+    cache_names = ("span_mask", "span_lengths", "token_mask", "decisiontype", "act_logits", "act_gradient")
     TEMPERATURE_GRID = np.exp(np.linspace(np.log(0.05), np.log(10.0), 81))
 
     def __init__(self,
@@ -145,9 +145,8 @@ class DecisionHead(Layer):
         hidden_dimension : width of the option scorer's hidden layer
         num_types : number of question types, see DECISION_TYPES
         activation_type : activation for the trunk experts
-        act_weight : scale on the acttion loss gradient -- start small and grow over time.
-        type_initialization : WEIGHT_INIT_DISPATCHER name for the question-type embedding
-        type_initialization_kwargs : keyword arguments bound to that initializer
+        act_weight : scale on the acttion loss gradient -- start small and grow over time
+        type_initialization, type_initialization_kwargs : keyword arguments bound to initializer
         moe_shared_experts, moe_routed_experts, moe_top_k, moe_routed_scaling, moe_num_groups, moe_top_groups :
             see MixtureOfExperts
         """
@@ -228,38 +227,40 @@ class DecisionHead(Layer):
                 "DecisionHead needs marker_end, the exclusive end of each option's span"
             )
         batch, sequence_length = hidden_state.shape[:2]
-        self.hidden_shape = hidden_state.shape
-        self.marker_pos = np.asarray(marker_pos, dtype=int)
-        self.marker_end = np.asarray(marker_end, dtype=int)
-        self.token_mask = (np.ones(self.marker_pos.shape, dtype=bool)
-                           if token_mask is None
-                           else np.asarray(token_mask, dtype=bool)
-                           )
-        self.decisiontype = (np.full(batch, DECISION_TYPES.CHOICE.value)
-                             if decisiontypes is None
-                             else decision_type_ids(decisiontypes)
-                             )
+        marker_pos = np.asarray(marker_pos, dtype=int)
+        marker_end = np.asarray(marker_end, dtype=int)
+        token_mask = (np.ones(marker_pos.shape, dtype=bool)
+                      if token_mask is None
+                      else np.asarray(token_mask, dtype=bool)
+                      )
+        decisiontype = (np.full(batch, DECISION_TYPES.CHOICE.value)
+                        if decisiontypes is None
+                        else decision_type_ids(decisiontypes)
+                        )
 
         positions = np.arange(sequence_length)
-        self.span_mask = (
-            (positions[None, None, :] >= self.marker_pos[..., None])
-            & (positions[None, None, :] < self.marker_end[..., None])
-            & self.token_mask[..., None]
+        span_mask = (
+            (positions[None, None, :] >= marker_pos[..., None])
+            & (positions[None, None, :] < marker_end[..., None])
+            & token_mask[..., None]
         )
-        self.span_lengths = np.maximum(self.span_mask.sum(axis=-1, keepdims=True), 1)
-        span_weights = self.span_mask / self.span_lengths
+        span_lengths = np.maximum(span_mask.sum(axis=-1, keepdims=True), 1)
+        # keep recast
+        span_weights = (span_mask / span_lengths).astype(hidden_state.dtype)
 
-        type_vector = self.type_embedding[self.decisiontype]
+        type_vector = self.type_embedding[decisiontype]
         markers = np.einsum("bot,bth->boh", span_weights, hidden_state)
-        xs = self.trunk_a(self.embedding_norm(markers)+ type_vector[:, None, :], mask=self.token_mask)
-        xs = self.trunk_norm(xs, mask=self.token_mask)
+        xs = self.trunk_a(self.embedding_norm(markers)+ type_vector[:, None, :], mask=token_mask)
+        xs = self.trunk_norm(xs, mask=token_mask)
 
         scores = self.scorer(xs)[..., 0]
 
         self.act_logits = self.act_head(hidden_state[:, 0] + type_vector)
         self.act_gradient = None
-        self.output = np.where(self.token_mask, scores, MASKED_LOGIT)
-        return self.output
+        if self.training:
+            self.span_mask, self.span_lengths = span_mask, span_lengths
+            self.token_mask, self.decisiontype = token_mask, decisiontype
+        return np.where(token_mask, scores, MASKED_LOGIT)
 
     @property
     def act_probabilities(self) -> NDArray:
@@ -269,8 +270,8 @@ class DecisionHead(Layer):
 
     def score_act(self, correct: NDArray) -> float:
         """
-        Cross-entropy of the act branch against per-row correctness. Caches its
-        gradient so the next backward pass trains the act branch.
+        Cross-entropy of the act branch against per-row correctness. Caches its gradient so the next backward pass
+            can train the act branch.
 
         Parameters
         ----------
@@ -297,7 +298,8 @@ class DecisionHead(Layer):
         grad_typed = grad_trunk * self.token_mask[..., None]
         grad_markers = self.embedding_norm.backward(grad_typed) * self.token_mask[..., None]
 
-        span_weights = self.span_mask / self.span_lengths
+        # keep recast
+        span_weights = (self.span_mask / self.span_lengths).astype(grad_markers.dtype)
         grad_hidden = np.einsum("bot,boh->bth", span_weights, grad_markers)
         grad_type = np.sum(grad_typed, axis=1)
 

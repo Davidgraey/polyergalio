@@ -36,9 +36,8 @@ from polyergalio.encoders.tokenizer import SentencePieceTokenizer, TokenSequence
 from polyergalio.generators.data_generators import token_accuracy
 from polyergalio.models.constants import DECISION_TYPES, ClassificationTask
 from polyergalio.models.embedding.embedding import TextEmbedding
-from polyergalio.models.embedding.positional import RopeEmbedding
 from polyergalio.models.layers.basic_layers import DropoutLayer, FullyConnectedLayer, RMSNormLayer
-from polyergalio.models.heads import (
+from polyergalio.models.layers.heads import (
     DecisionHead,
     decision_correct,
     decode_decisions,
@@ -129,8 +128,7 @@ def build_encoder(vocab_size: int, padding_idx: int) -> Network:
     embedding = net.connect(
         TextEmbedding(vocab_size, HIDDEN_DIM, padding_idx=padding_idx), net.input, name="embedding"
     )
-    positional = net.connect(RopeEmbedding(SEQUENCE_LENGTH, HIDDEN_DIM), embedding, name="positional_emb")
-    prenorm = net.connect(RMSNormLayer(HIDDEN_DIM), positional, name="prenorm")
+    prenorm = net.connect(RMSNormLayer(HIDDEN_DIM), embedding, name="prenorm")
     attention = net.connect(
         SpectreAttention(SEQUENCE_LENGTH, HIDDEN_DIM, num_heads=NUM_HEADS), prenorm, name="attention"
     )
@@ -142,12 +140,14 @@ def build_encoder(vocab_size: int, padding_idx: int) -> Network:
 
     gathered = net.connect(MaskGather(), block_out, name="mask_gather")
     net.output = net.connect(
-        FullyConnectedLayer(HIDDEN_DIM, vocab_size, "linear", is_output=True), gathered, name="mlm_head"
+        FullyConnectedLayer(
+            HIDDEN_DIM, vocab_size, "linear", is_output=True, initialization_override="truncated_normal", initialization_kwargs={"std": 0.01}
+        ), gathered, name="mlm_head"
     )
     return net
 
 
-ENCODER_CHAIN = ("positional_emb", "prenorm", "attention", "ffn_1", "ffn_2", "postnorm", "dropout")
+ENCODER_CHAIN = ("prenorm", "attention", "ffn_1", "ffn_2", "postnorm", "dropout")
 
 
 def build_decision_network(encoder: Network) -> Network:

@@ -28,7 +28,6 @@ from polyergalio.encoders.tokenizer import SentencePieceTokenizer, fit_tokenizer
 from polyergalio.generators.data_generators import token_accuracy
 from polyergalio.models.constants import ClassificationTask
 from polyergalio.models.embedding.embedding import TextEmbedding
-from polyergalio.models.embedding.positional import RopeEmbedding
 from polyergalio.models.layers.basic_layers import (
     DropoutLayer,
     FullyConnectedLayer,
@@ -129,10 +128,7 @@ def build_encoder(vocab_size: int, padding_idx: int) -> Network:
         net.input,
         name="embedding",
     )
-    positional = net.connect(
-        RopeEmbedding(SEQUENCE_LENGTH, HIDDEN_DIM), embedding, name="positional_emb"
-    )
-    prenorm = net.connect(RMSNormLayer(HIDDEN_DIM), positional, name="prenorm")
+    prenorm = net.connect(RMSNormLayer(HIDDEN_DIM), embedding, name="prenorm")
     attention = net.connect(
         SpectreAttention(
             SEQUENCE_LENGTH,
@@ -157,14 +153,16 @@ def build_encoder(vocab_size: int, padding_idx: int) -> Network:
     net.connect(PoolingLayer(), block_out, name="pooled")
     gathered = net.connect(MaskGather(), block_out, name="mask_gather")
     net.output = net.connect(
-        FullyConnectedLayer(HIDDEN_DIM, vocab_size, "linear", is_output=True),
+        FullyConnectedLayer(
+            HIDDEN_DIM, vocab_size, "linear", is_output=True, initialization_override="truncated_normal", initialization_kwargs={"std": 0.01}
+        ),
         gathered,
         name="mlm_head",
     )
     return net
 
 
-ENCODER_CHAIN = ("positional_emb", "prenorm", "attention", "ffn_1", "ffn_2", "postnorm", "dropout")
+ENCODER_CHAIN = ("prenorm", "attention", "ffn_1", "ffn_2", "postnorm", "dropout")
 
 
 def build_seq2seq(encoder: Network, vocab_size: int) -> Network:
@@ -220,7 +218,9 @@ def build_seq2seq(encoder: Network, vocab_size: int) -> Network:
     dropped = net.connect(DropoutLayer(DROPOUT_PROB), postnorm, name="decoder_dropout")
     hidden = net.connect(LatentSum(), dropped, conditioned, name="decoder_residual")
     net.output = net.connect(
-        FullyConnectedLayer(HIDDEN_DIM, vocab_size, "linear", is_output=True),
+        FullyConnectedLayer(
+            HIDDEN_DIM, vocab_size, "linear", is_output=True, initialization_override="truncated_normal", initialization_kwargs={"std": 0.01}
+        ),
         hidden,
         name="lm_head",
     )
@@ -410,7 +410,7 @@ def generate(
     encoder.eval()
     seq2seq.eval()
     encoder.forward(ids, mask=attention_mask, target_mask=attention_mask)
-    latent = layers["latent_projection"].forward(encoder.activations["pooled"])
+    latent = layers["latent_projection"].forward(encoder.node("pooled").layer.output)
 
     start = layers["shift_right"].start_token[0, 0]
     step_input = np.broadcast_to(start, (batch, HIDDEN_DIM)) + latent[:, 0]

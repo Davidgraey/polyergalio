@@ -21,7 +21,7 @@ import numpy as np
 from polyergalio.generators.data_generators import RandomDatasetGenerator
 from polyergalio.models.constants import DECISION_TYPES, EPSILON
 from polyergalio.models.embedding.embedding import TextEmbedding
-from polyergalio.models.heads import (
+from polyergalio.models.layers.heads import (
     DecisionHead,
     calibrated_probabilities,
     decision_confidence,
@@ -29,8 +29,8 @@ from polyergalio.models.heads import (
     decision_type_ids,
     decode_decisions,
     fit_temperatures,
-    masked_softmax,
 )
+from polyergalio.models.activations import masked_softmax
 from polyergalio.models.layers.spectre_layers import SpectreAttention
 from polyergalio.models.model_loss import DecisionLoss
 from polyergalio.models.network import Network

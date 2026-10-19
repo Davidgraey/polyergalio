@@ -1,3 +1,24 @@
+0.1.9
+=====================
+- TESTS are still broken - I'm not fixing these until I get to a more stable build
+- Memory and matmul optimizations - I went through and modified each layer's cached values while training. 
+  - This should free up some unused memory
+  - Added purge() post-update - so each layer drops its cache and gradients once weights are modified, rather than holding onto it until the full update pass is complete for the Network
+  - migrated to matmul over einsum in a couple of locations - should be faster in most backend numpy builds (BLAS)
+- ** AI usage ** used Claude Sonnet 5.5 to suggest / assist with variable caching updates to layers. (only maintaining variables that are necessary for backward passes)
+- ** AI usage ** - Streamlit App cleanup - variable collision in BE naming convention
+
+0.1.8
+=====================
+- TESTS are still broken - I'm not fixing these until I get to a more stable build
+- Added another utility layer to project a mask after downscaling to a latent-space.
+- Split out attention heads to their own module
+- Built out GMVAE in autoencoder_layers.py
+- Added a "pooled Spectre" variant
+- updated base model with quality-of-life serialization / unserialization
+- ** AI usage ** - Extended app/labeling streamlit application with a refactor
+- ** AI usage ** - generated docstrings for the new modules
+
 0.1.7
 =====================
 - Tweaks to Nodes and connections to support a "multiple output" layer.

@@ -17,7 +17,11 @@ data encoding and processing pipelines to supervised learning and clustering.
 The focus of this repository is:
 - **Classic and alternative ML algorithms implemented with a unified 
   interface**
-- **Numerical stability and performance**
+- **Core implementations leveraging Numpy and Scipy -- no 10GB dependency install** 
+- **Configurable and transparent ML neural network layers and operators that can be serialized, optimized and easily trained**
+- 
+- **Numerical stability**
+
 - **Novel extensions and original research contributions**
 
 All algorithms are implemented in **NumPy** and **SciPy**, with minimal external dependencies.
@@ -35,19 +39,24 @@ For local development:
 pip install -e ".[test]"
 ```
 ---
+## A note on Generative LLM usage
+- Generative LLMs were sometimes used in creating tests, examples and streamlit applications.
+- No autonomous agents were used, and all processes and modules were human-reviewed
+- Finally, the usage of LLMs is called out in `CHANGES.md`, via the  ** AI usage ** line item with specific areas and usages identified.
+
+---
 ## Layout / Inheritance
-|--> Serializable
-|-------> Composite Base Class
-|--------------> Network
-|--------------> Feature Pipeline
-|--------------> CompositeNode (NOT SUBCLASSES)
-|
-|-------> BasalEstimator
-|--------------> Layer
-|--------------> Processor (feature processing)
-|--------------> FittedModel
-|--------------> 
-|--> 
+- |--> Serializable
+- |-------> Composite Base Class
+- |--------------> Network
+- |--------------> Feature Pipeline
+- |--------------> CompositeNode (NOT SUBCLASSES)
+- |-------> BasalEstimator
+- |--------------> Layer
+- |--------------> Processor (feature processing)
+- |--------------> FittedModel
+- |--------------> 
+- |--> 
 
 ### Encoders
 

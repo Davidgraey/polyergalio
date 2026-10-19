@@ -74,6 +74,8 @@ def train(data, hidden: int, num_shared: int, num_routed: int, top_k: int, learn
     ax.set_xlabel("Step")
     fig.tight_layout()
 
+    net.train()
+    net.forward(x)
     plot_expert_routing(
         moe.gate.mask,
         moe.gate_weights,

@@ -16,6 +16,8 @@ Timing and memory profiling for any call, block, or model, in one pass.
 
     print(profiler.summary())
 
+    print(profiler.profile_network(network, x, num_loops=10))
+
 Memory is Python allocated while the block ran, as seen by tracemalloc, which covers numpy buffers.
 Use `with Profiler() as profiler:` to keep tracing on across several measurements, so arrays freed inside a block that
 were allocated before it are still counted.
@@ -29,10 +31,13 @@ from dataclasses import asdict, dataclass
 from functools import wraps
 from typing import Any, Callable, Iterator, Optional
 
+import numpy as np
+
 from polyergalio.base_model import BasalEstimator
 from polyergalio.composite_model import Composite
 
 MEGABYTE = 1e6
+PHASES = ("forward", "backward")
 
 
 @dataclass
@@ -96,7 +101,7 @@ class Frame:
     child_time: float = 0.0
 
 
-def named_estimators(model: Any, path: Optional[str] = None) -> list[tuple[str, Any]]:
+def named_estimators(model: Any, path: Optional[str] = None, depth: Optional[int] = None) -> list[tuple[str, Any]]:
     """
     Every estimator reachable from a model, with a label built from the path to it.
 
@@ -107,23 +112,26 @@ def named_estimators(model: Any, path: Optional[str] = None) -> list[tuple[str, 
     ----------
     model : an estimator or a Composite such as a Network
     path : label for the model itself; defaults to its class name or Composite name
+    depth : levels below the model to descend, 1 for a network's nodes only; None descends fully
     """
     found, seen = [], set()
 
-    def visit(member: Any, label: str) -> None:
+    def visit(member: Any, label: str, level: int) -> None:
         if id(member) in seen:
             return
         seen.add(id(member))
         found.append((label, member))
+        if depth is not None and level >= depth:
+            return
         if isinstance(member, Composite):
             for node in member.nodes:
                 if not node.is_source:
-                    visit(node.component, f"{label}/{node.name}")
+                    visit(node.component, f"{label}/{node.name}", level + 1)
         elif isinstance(member, BasalEstimator):
             for sublayer in member.sublayers():
-                visit(sublayer, f"{label}/{type(sublayer).__name__}")
+                visit(sublayer, f"{label}/{type(sublayer).__name__}", level + 1)
 
-    visit(model, path or getattr(model, "name", None) or type(model).__name__)
+    visit(model, path or getattr(model, "name", None) or type(model).__name__, 0)
     return found
 
 
@@ -241,7 +249,9 @@ class Profiler:
         return measured
 
     @contextmanager
-    def instrument(self, model: Any, phases: tuple[str, ...] = ("forward", "backward")) -> Iterator[None]:
+    def instrument(
+        self, model: Any, phases: tuple[str, ...] = PHASES, depth: Optional[int] = None
+    ) -> Iterator[None]:
         """
         Measure every estimator in a model, per phase, for the duration of the block.
 
@@ -251,9 +261,10 @@ class Profiler:
         ----------
         model : an estimator or Composite
         phases : method names to wrap on every estimator that has them
+        depth : levels below the model to wrap, 1 for a network's nodes only; None wraps every sublayer too
         """
         restore = []
-        for label, estimator in named_estimators(model):
+        for label, estimator in named_estimators(model, depth=depth):
             for phase in phases:
                 original = getattr(estimator, phase, None)
                 if not callable(original):
@@ -268,6 +279,97 @@ class Profiler:
                     delattr(estimator, phase)
                 else:
                     setattr(estimator, phase, previous)
+
+    def profile_network(
+        self,
+        network: Any,
+        x_data: Any,
+        gradient: Any = None,
+        num_loops: int = 5,
+        warmup: int = 1,
+        depth: Optional[int] = 1,
+        **forward_kwargs,
+    ) -> str:
+        """
+        Run training steps through a network and report forward and backward cost per node.
+
+        The network keeps whatever mode it is in; backward needs it in train mode. Warmup steps run untimed, so
+        one-off costs such as first-call allocation stay out of the report.
+
+        Parameters
+        ----------
+        network : a Network or other Composite
+        x_data : input to forward
+        gradient : gradient fed to backward; ones shaped like the output if None
+        num_loops : measured steps
+        warmup : untimed steps before measuring
+        depth : 1 profiles the nodes; None also profiles every sublayer inside them
+        forward_kwargs : passed to forward, e.g. mask
+        """
+        def step() -> None:
+            output = network.forward(x_data, **forward_kwargs)
+            network.backward(np.ones_like(output) if gradient is None else gradient)
+
+        for _ in range(warmup):
+            step()
+        with self:
+            with self.instrument(network, depth=depth):
+                for _ in range(num_loops):
+                    step()
+        return self.node_summary()
+
+    def node_rows(self) -> list[dict]:
+        """
+        Forward and backward cost per instrumented estimator, largest step first.
+
+        step_ms is the mean forward plus the mean backward, share is its fraction of the root's step (the largest
+        step if the root was not instrumented), kept_mb is what forward leaves allocated, and the peaks are above the
+        level at entry.
+        """
+        grouped: dict[str, dict[str, Measurement]] = {}
+        for label, entry in self.measurements.items():
+            stem, _, phase = label.rpartition(".")
+            if stem and phase in PHASES:
+                grouped.setdefault(stem, {})[phase] = entry
+
+        rows = []
+        for stem, phases in grouped.items():
+            forward, backward = phases.get("forward"), phases.get("backward")
+            rows.append(
+                {
+                    "node": stem,
+                    "calls": max(entry.calls for entry in phases.values()),
+                    "forward_ms": forward.mean_time * 1e3 if forward else 0.0,
+                    "backward_ms": backward.mean_time * 1e3 if backward else 0.0,
+                    "kept_mb": forward.mean_net_bytes / MEGABYTE if forward else 0.0,
+                    "forward_peak_mb": forward.mean_peak / MEGABYTE if forward else 0.0,
+                    "backward_peak_mb": backward.mean_peak / MEGABYTE if backward else 0.0,
+                }
+            )
+        for row in rows:
+            row["step_ms"] = row["forward_ms"] + row["backward_ms"]
+        roots = [row for row in rows if "/" not in row["node"]]
+        reference = max((row["step_ms"] for row in (roots or rows)), default=0.0) or 1.0
+        for row in rows:
+            row["share"] = row["step_ms"] / reference
+        return sorted(rows, key=lambda row: row["step_ms"], reverse=True)
+
+    def node_summary(self, top: Optional[int] = None) -> str:
+        """Table of node_rows, largest step first; `top` limits the rows shown."""
+        rows = self.node_rows()[:top]
+        width = max((len(row["node"]) for row in rows), default=4)
+        header = (
+            f"{'node':{width}s} {'calls':>6s} {'fwd ms':>9s} {'bwd ms':>9s} {'step ms':>9s} {'share %':>8s} "
+            f"{'kept MB':>8s} {'fwd MB':>8s} {'bwd MB':>8s}"
+        )
+        lines = [header, "-" * len(header)]
+        for row in rows:
+            lines.append(
+                f"{row['node']:{width}s} {row['calls']:6d} {row['forward_ms']:9.2f} {row['backward_ms']:9.2f} "
+                f"{row['step_ms']:9.2f} {100 * row['share']:8.1f} {row['kept_mb']:8.2f} "
+                f"{row['forward_peak_mb']:8.2f} {row['backward_peak_mb']:8.2f}"
+            )
+        return "\n".join(lines)
 
     def rows(self) -> list[dict]:
         """Every measurement as a flat dict, ready for a DataFrame; times in seconds, memory in bytes."""
@@ -324,3 +426,12 @@ if __name__ == "__main__":
         with profiler.instrument(layer):
             layer.backward(layer.forward(inputs))
     print(profiler.summary())
+
+    from polyergalio.models.layers import PoolingLayer, SpectreAttention
+    from polyergalio.models.network import Network
+
+    network = Network(input_shape=(32, 64), name="net")
+    mixed = network.connect(SpectreAttention(32, 64, num_heads=4, use_wrm=False), network.input, name="mixer")
+    pooled = network.connect(PoolingLayer(), mixed, name="pooled")
+    network.output = network.connect(FullyConnectedLayer(64, 8, "linear"), pooled, name="head")
+    print(Profiler().profile_network(network, inputs.reshape(-1, 32, 64)[:16], num_loops=5))

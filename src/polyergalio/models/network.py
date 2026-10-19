@@ -25,7 +25,6 @@ passes them to its own sublayers.
 from __future__ import annotations
 
 import inspect
-import time
 from itertools import islice
 from typing import Iterable, Optional, Sequence
 
@@ -145,8 +144,8 @@ class Node(CompositeNode):
         else:
             gradients[self] = part
 
-    def take(self, gradients: dict, values: dict):
-        """The gradient with respect to this node's output, removed from gradients; values are the forward activations by name."""
+    def take(self, gradients: dict):
+        """The gradient with respect to this node's output, removed from gradients."""
         return gradients.pop(self)
 
     def resolve_shapes(self) -> None:
@@ -209,7 +208,7 @@ class RoutingNode(Node):
                                                     --output 1  -[edge]-> Node(Layer)
 
     A layer that declares n output shapes has n outputs; one that declares a single shape has any number, all of that
-    shape, checked against what forward returns. Outputs with no edge are dropped, with zero gradient.
+    shape, checked against what forward returns. Outputs with no edge are dropped, and the layer is handed None for their gradient.
     """
 
     def __init__(self, name: str, layer: BasalEstimator, sources: tuple = ()):
@@ -406,12 +405,10 @@ class RoutingNode(Node):
         else:
             parts[output] = part
 
-    def take(self, gradients: dict, values: dict) -> tuple:
+    def take(self, gradients: dict) -> tuple:
+        """One gradient per output up to the last that received one, None where an output got none."""
         parts = gradients.pop(self)
-        return tuple(
-            parts[output] if output in parts else np.zeros_like(produced)
-            for output, produced in enumerate(values[self.name])
-        )
+        return tuple(parts.get(output) for output in range(max(parts) + 1))
 
     def routing_text(self) -> str:
         """The routing as one line: output -> consumers."""
@@ -494,9 +491,6 @@ class Network(Composite):
         super().__init__(name)
         self.data_type, self.complex_data_type = resolve_data_types(data_type, complex_data_type)
         self._output = None
-        self.training = True
-        self.activations = {}
-        self._timings = {}
 
         self._input = Node(INPUT_NAME, shape=tuple(input_shape))
         self._input_shape = tuple(input_shape)
@@ -606,10 +600,6 @@ class Network(Composite):
                 f"{node.name!r} is the network's output; set another output before deleting it"
             )
 
-    def after_delete(self, node: Node) -> None:
-        self.activations.pop(node.name, None)
-        self._timings.pop(node.name, None)
-
     def entry_point(self, layer: BasalEstimator):
         return layer.forward
 
@@ -709,7 +699,8 @@ class Network(Composite):
         return node_class(name, layer, sources)
 
     def after_connect(self, node: Node) -> None:
-        node.train(self.training)
+        peers = [layer for layer in self.layers if layer is not node.layer]
+        node.train(any(layer.training for layer in peers) if peers else True)
         self._output = node
 
     def check_graph(self, layer: BasalEstimator, given: int) -> None:
@@ -824,7 +815,9 @@ class Network(Composite):
 
         kwargs : offered to every node, and picked up only by the layers
             that declare a matching optional parameter -- mask, forced_activation,
-            or anything a layer adds later. A layer that doesn't declare the
+            or anything a layer adds later. The mask stops at a layer with consumes_mask
+            (a pooling layer) and is not offered downstream of it, until a layer with
+            restores_mask (an expanding layer) brings the sequence axis back. A layer that doesn't declare the
             name never receives it, so unused kwargs are silently ignored.
             Mode is not a kwarg: layers read their own `training`, set by train() / eval().
         """
@@ -835,6 +828,7 @@ class Network(Composite):
             elif x_data.dtype.kind == "c":
                 x_data = x_data.astype(self.complex_data_type, copy=False)
         values = {self._input: x_data}
+        masked = {self._input: True}
 
         for node in self._nodes:
             if node.is_source or not self.is_wired(node):
@@ -842,12 +836,14 @@ class Network(Composite):
             if any(source not in values for source in node.sources):
                 continue
             arguments = [source.read(values, node, position) for position, source in enumerate(node.sources)]
+            masked[node] = all(masked[source] for source in node.sources)
+            keeps_mask = masked[node] or node.layer.restores_mask
+            offered = kwargs if keeps_mask else {key: value for key, value in kwargs.items() if key != "mask"}
             passthrough = (
-                kwargs
+                offered
                 if node.accepts_any_kwarg
-                else {key: value for key, value in kwargs.items() if key in node.forward_kwargs}
+                else {key: value for key, value in offered.items() if key in node.forward_kwargs}
             )
-            start = time.perf_counter()
             try:
                 values[node] = node.layer.forward(*arguments, **passthrough)
             except Exception as error:
@@ -856,9 +852,8 @@ class Network(Composite):
                     f"{node.name} ({node.layer.__class__.__name__}).forward failed "
                     f"on input shape(s) {shapes}: {error}"
                 ) from error
-            self.record_timing(node.name, "forward", time.perf_counter() - start)
+            masked[node] = keeps_mask and not node.layer.consumes_mask
 
-        self.activations = {node.name: value for node, value in values.items()}
         if output not in values:
             raise ValueError(
                 f"the output node {output.name!r} was not run: it, or a node it "
@@ -876,8 +871,7 @@ class Network(Composite):
             if node.is_source or node not in gradients:
                 continue
 
-            incoming = node.take(gradients, self.activations)
-            start = time.perf_counter()
+            incoming = node.take(gradients)
             try:
                 returned = node.layer.backward(incoming)
             except Exception as error:
@@ -885,7 +879,6 @@ class Network(Composite):
                     f"{node.name} ({node.layer.__class__.__name__}).backward failed "
                     f"on gradient shape {describe_shape(incoming)}: {error}"
                 ) from error
-            self.record_timing(node.name, "backward", time.perf_counter() - start)
             parts = returned if len(node.sources) > 1 else (returned,)
 
             if len(parts) != len(node.sources):
@@ -901,60 +894,6 @@ class Network(Composite):
 
     def __call__(self, x_data: NDArray, **kwargs) -> NDArray:
         return self.forward(x_data, **kwargs)
-
-    def record_timing(self, name: str, phase: str, elapsed: float) -> None:
-        entry = self._timings.setdefault(
-            name,
-            {
-                "forward_total": 0.0,
-                "forward_calls": 0,
-                "backward_total": 0.0,
-                "backward_calls": 0,
-            },
-        )
-        entry[f"{phase}_total"] += elapsed
-        entry[f"{phase}_calls"] += 1
-
-    def reset_timings(self) -> None:
-        """clear accumulated per-node timing, e.g. between epochs"""
-        self._timings = {}
-
-    def timing_summary(self, top: Optional[int] = None) -> str:
-        """
-        Per-node timing, sorted by total forward+backward time descending.
-
-        Parameters
-        ----------
-        top : only show this many nodes; None shows every timed node
-        """
-        rows = [
-            (
-                name,
-                entry["forward_total"],
-                entry["forward_calls"],
-                entry["backward_total"],
-                entry["backward_calls"],
-            )
-            for name, entry in self._timings.items()
-        ]
-        rows.sort(key=lambda row: row[1] + row[3], reverse=True)
-        if top is not None:
-            rows = rows[:top]
-
-        width = max((len(name) for name, *_ in rows), default=4)
-        lines = [f"{self.name}: per-node timing"]
-        lines.append(
-            f"  {'node'.ljust(width)}  {'fwd avg (ms)':>13} {'fwd total (s)':>14} "
-            f"{'bwd avg (ms)':>13} {'bwd total (s)':>14}"
-        )
-        for name, fwd_total, fwd_calls, bwd_total, bwd_calls in rows:
-            fwd_avg = (fwd_total / fwd_calls * 1000) if fwd_calls else 0.0
-            bwd_avg = (bwd_total / bwd_calls * 1000) if bwd_calls else 0.0
-            lines.append(
-                f"  {name.ljust(width)}  {fwd_avg:13.3f} {fwd_total:14.4f} "
-                f"{bwd_avg:13.3f} {bwd_total:14.4f}"
-            )
-        return "\n".join(lines)
 
     # ------------- inspection
     def validate(self) -> list[str]:
@@ -1079,8 +1018,8 @@ class Network(Composite):
         """
         Change the network's precision, and every layer's with it.
 
-        Layers connected afterwards keep their own dtype until the next recast. Gradients are reset to zeros and
-        stored activations are cleared; recast before creating an optimizer, whose state is keyed to the gradients.
+        Layers connected afterwards keep their own dtype until the next recast. Gradients are reset to zeros;
+        recast before creating an optimizer, whose state is keyed to the gradients.
 
         Parameters
         ----------
@@ -1094,16 +1033,20 @@ class Network(Composite):
         self.data_type, self.complex_data_type = resolve_data_types(data_type, complex_data_type)
         for layer in self.layers:
             layer.recast(self.data_type, self.complex_data_type)
-        self.activations = {}
         return self
 
     # ------------- mode
     def train(self, mode: bool = True) -> Network:
         """Switch the network, and every node and layer in it, between training and inference."""
-        self.training = mode
         for node in self._nodes:
             node.train(mode)
         return self
+
+    @property
+    def training(self) -> bool:
+        """True while any layer is training; a network with no layers reports True."""
+        layers = self.layers
+        return any(layer.training for layer in layers) if layers else True
 
     def eval(self) -> Network:
         """Switch to inference."""
@@ -1120,10 +1063,9 @@ class Network(Composite):
         return sum(layer.num_parameters for layer in self.layers)
 
     def purge(self) -> None:
-        """Clear every layer's forward-pass caches and the stored activations."""
+        """Clear every layer's forward-pass caches."""
         for layer in self.layers:
             layer.purge()
-        self.activations = {}
 
     def zero_gradients(self) -> None:
         for layer in self.layers:
@@ -1175,14 +1117,10 @@ class Network(Composite):
             if not node.is_source
         }
 
-    def summary(self, x_data: Optional[NDArray] = None) -> str:
+    def summary(self) -> str:
         """
         Summary of the network -- shapshot view of the setup
         """
-        if x_data is not None:
-            self.forward(x_data)
-        shapes = {name: describe_shape(value) for name, value in self.activations.items()}
-
         listed = [node for node in self._nodes if not node.is_source]
         width = max((len(node.name) for node in listed), default=4)
 
@@ -1193,7 +1131,7 @@ class Network(Composite):
             lines.append(
                 f"  {node.name.ljust(width)}  "
                 f"{','.join(source.name for source in node.sources):<26} "
-                f"{shapes.get(node.name, node.out_shape)}{marker}"
+                f"{node.out_shapes if isinstance(node, RoutingNode) else node.out_shape}{marker}"
             )
 
         for node in listed:

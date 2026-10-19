@@ -78,7 +78,7 @@ class PrototypeLayer(Layer):
     adaptive: bool = False
     parameter_names = ("weights",)
     state_names = ("initialized",)
-    cache_names = ("input", "distance_cache", "kernel", "sample_weights", "assignment", "lead_shape", "energy_gradient")
+    cache_names = ("input", "kernel", "sample_weights", "assignment", "lead_shape", "energy_gradient")
 
     def __init__(
         self,
@@ -169,7 +169,7 @@ class PrototypeLayer(Layer):
         """
         training_now = self.training if training_now is None else training_now
         x_data = np.asarray(x_data)
-        self.lead_shape = x_data.shape[:-1]
+        lead_shape = x_data.shape[:-1]
         flat = x_data.reshape(-1, self.input_dimension)
         if not self.initialized:
             self.initialize(flat)
@@ -180,12 +180,9 @@ class PrototypeLayer(Layer):
         assignment, free_energy = soft_assign(scores, self.temperature)
         energy_per_sample, energy_gradient = self.energy_terms(distances, kernel, assignment, free_energy)
 
-        self.input = flat
-        self.distance_cache = distances
-        self.kernel = kernel
-        self.sample_weights = sample_weights
-        self.assignment = assignment
-        self.energy_gradient = energy_gradient
+        if self.training:
+            self.input, self.kernel, self.sample_weights = flat, kernel, sample_weights
+            self.assignment, self.energy_gradient, self.lead_shape = assignment, energy_gradient, lead_shape
         self.energy = float(self.energy_weight * np.mean(sample_weights * energy_per_sample) / 2.0)
 
         if self.output_type == "assignment":
@@ -196,7 +193,7 @@ class PrototypeLayer(Layer):
             result = assignment @ self.weights
         else:
             result = assignment @ self.positions
-        return result.reshape(*self.lead_shape, -1)
+        return result.reshape(*lead_shape, -1)
 
     def backward(self, incoming_grad: Optional[NDArray] = None) -> NDArray:
         """
@@ -209,7 +206,7 @@ class PrototypeLayer(Layer):
         """
         count = len(self.input)
         grad_distances = self.energy_weight * self.sample_weights[:, None] * self.energy_gradient / (2.0 * count)
-        grad_scores = np.zeros_like(self.distance_cache)
+        grad_scores = np.zeros_like(self.assignment)
         grad_weights = np.zeros_like(self.weights)
 
         if incoming_grad is not None:

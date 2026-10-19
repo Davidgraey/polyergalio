@@ -34,13 +34,6 @@ class Layer(BasalEstimator, ABC):
         for name in self.cache_names:
             setattr(self, name, None)
 
-    def purge(self) -> None:
-        """Clear the forward-pass caches and those of every sublayer."""
-        for name in self.cache_names:
-            setattr(self, name, None)
-        for sublayer in self.sublayers():
-            sublayer.purge()
-
 
 class FullyConnectedLayer(Layer):
     """ activation(x @ weights + bias) """
@@ -101,16 +94,20 @@ class FullyConnectedLayer(Layer):
         -------
         (..., no) activated projection of the input
         """
-        activation = activations.activation_dictionary[forced_activation or self.activation_type]
-        self.in_shape = incoming_x.shape
-        if not self.training:
-            return activation(
-                incoming_x.reshape(-1, self.in_shape[-1]) @ self.weights + self.bias
-            ).reshape(*self.in_shape[:-1], -1)
-        self.input = incoming_x.reshape(-1, self.in_shape[-1])
-        self.z = self.input @ self.weights + self.bias
-        self.output = activation(self.z)
-        return self.output.reshape(*self.in_shape[:-1], -1)
+        name = forced_activation or self.activation_type
+        activation = activations.activation_dictionary[name]
+        in_shape = incoming_x.shape
+        inputs = incoming_x.reshape(-1, in_shape[-1])
+        z = inputs @ self.weights
+        z += self.bias
+        output = activation(z)
+        if self.training:
+            kept = activations.DERIVATIVE_INPUTS[name]
+            self.in_shape = in_shape
+            self.input = inputs
+            self.z = z if "z" in kept else None
+            self.output = output if "output" in kept else None
+        return output.reshape(*in_shape[:-1], -1)
 
     def backward(self,
                  incoming_grad: NDArray,
@@ -146,7 +143,7 @@ class FullyConnectedLayer(Layer):
 class DropoutLayer(Layer):
     """Hinton style or simple bool mask dropout, active only in training mode."""
     preserves_shape = True
-    cache_names = ("input", "mask", "output")
+    cache_names = ("mask",)
 
     def __init__(self,
                  dropout_prob: float = 0.5,
@@ -186,16 +183,20 @@ class DropoutLayer(Layer):
             # pass through -- no modification
             return incoming_x
 
-        self.mask = RNG.binomial(1, self.keep_prob, size=incoming_x.shape)
+        # keep recast
+        self.mask = RNG.random(incoming_x.shape, dtype=incoming_x.dtype) < self.keep_prob
+        output = incoming_x * self.mask
         if self.use_rescale:
-            self.mask = self.mask / self.keep_prob
-        self.output = incoming_x * self.mask
-        return self.output
+            output /= self.keep_prob
+        return output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         if self.mask is None:
             return incoming_grad
-        return incoming_grad * self.mask
+        gradient = incoming_grad * self.mask
+        if self.use_rescale:
+            gradient /= self.keep_prob
+        return gradient
 
     def __str__(self):
         method = "Hinton / rescaling dropout" if self.use_rescale else "bool dropout"
@@ -208,7 +209,7 @@ class DropoutLayer(Layer):
 class NormalizeLayer(Layer):
     """Layer norm over the last axis, with an optional learnable shift and scale."""
     parameter_names = ("shift_beta", "scale_gamma")
-    cache_names = ("in_shape", "input", "x_norm", "std")
+    cache_names = ("x_norm", "std")
 
     def __init__(self, input_dimension: int, shift_scale: bool = True, eps: float = 1e-6):
         """
@@ -239,23 +240,15 @@ class NormalizeLayer(Layer):
         mask : unused; each position is normalized against only its own features, kept for pass-through
             compatibility with the graph
         """
-        self.in_shape = incoming_x.shape
-        input_reshaped = incoming_x.reshape(-1, self.in_shape[-1])
-
-        mean = np.mean(input_reshaped, axis=-1, keepdims=True)
-
-        if not self.training:
-            centered = (input_reshaped - mean) / np.sqrt(np.var(input_reshaped, axis=-1, keepdims=True) + self.eps)
-            if self.shift_scale:
-                return (self.scale_gamma * centered + self.shift_beta).reshape(self.in_shape)
-
-        self.std = np.sqrt(np.var(input_reshaped, axis=-1, keepdims=True) + self.eps)
-        self.x_norm = (input_reshaped - mean) / self.std
-
-        output = self.x_norm
-        if self.shift_scale:
-            output = self.scale_gamma * self.x_norm + self.shift_beta
-        return output.reshape(self.in_shape)
+        in_shape = incoming_x.shape
+        rows = incoming_x.reshape(-1, in_shape[-1])
+        std = np.sqrt(np.var(rows, axis=-1, keepdims=True) + self.eps)
+        x_norm = (rows - np.mean(rows, axis=-1, keepdims=True)) / std
+        if self.training:
+            self.std = std
+            self.x_norm = x_norm
+        output = self.scale_gamma * x_norm + self.shift_beta if self.shift_scale else x_norm
+        return output.reshape(in_shape)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         original_shape = incoming_grad.shape
@@ -287,7 +280,7 @@ class RMSNormLayer(Layer):
     learnable per-feature scale.
     """
     parameter_names = ("scale_gamma",)
-    cache_names = ("input", "x_norm", "rms")
+    cache_names = ("x_norm", "rms")
 
     def __init__(self, input_dimension: int, padding_epsilon: float = 1e-10):
         """
@@ -313,15 +306,12 @@ class RMSNormLayer(Layer):
         """
         in_shape = incoming_x.shape
         input_reshaped = incoming_x.reshape(-1, in_shape[-1])
-        if not self.training:
-            return (self.scale_gamma
-                    * (input_reshaped
-                       / (np.sqrt(np.mean(input_reshaped ** 2, axis=-1, keepdims=True) + self.padding_epsilon))
-                       )).reshape(in_shape)
-
-        self.rms = np.sqrt(np.mean(input_reshaped ** 2, axis=-1, keepdims=True) + self.padding_epsilon)
-        self.x_norm = input_reshaped / self.rms
-        return (self.x_norm * self.scale_gamma).reshape(in_shape)
+        rms = np.sqrt(np.mean(input_reshaped ** 2, axis=-1, keepdims=True) + self.padding_epsilon)
+        x_norm = input_reshaped / rms
+        if self.training:
+            self.rms = rms
+            self.x_norm = x_norm
+        return (x_norm * self.scale_gamma).reshape(in_shape)
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         original_shape = incoming_grad.shape
@@ -398,3 +388,54 @@ class StandardizeLayer(Layer):
 
     def __repr__(self):
         return self.__str__()
+
+class PersistentMemory(Layer):
+    """
+    Learned, fixed-width context that is persisted
+    per SPECTRE's persistent-memory extension
+
+    holds M, shape (memory_tokens, hidden_dim), trained jointly with the model.
+    Memory is "injected" into the data-stream (sequence) itself before attention/fft transforms
+    This is a container layer
+    """
+
+    preserves_shape = False
+    parameter_names = ("memory",)
+
+    def __init__(
+        self,
+        memory_tokens: int,
+        hidden_dimension: int,
+        initialization: str = "truncated_normal",
+        initialization_kwargs: Optional[dict] = None,
+    ):
+        """
+        Parameters
+        ----------
+        memory_tokens : learned slots, zero disables the bank
+        hidden_dimension : channel width of each slot
+        initialization : any WEIGHT_INIT_DISPATCHER name; slots are token-like, so fan-in is not the slot count
+        initialization_kwargs : keyword arguments bound to the initializer
+        """
+        super().__init__()
+        assert memory_tokens >= 0, "memory_tokens must be zero or positive"
+        self.memory_tokens = memory_tokens
+        self.hidden_dimension = hidden_dimension
+        self.initialization = initialization
+        self.initialization_kwargs = dict(initialization_kwargs or {})
+
+        self.declare_shapes(inputs=(), outputs=((self.hidden_dimension,),))
+
+        initializer = get_weight_init(initialization, **self.initialization_kwargs)
+        self.memory = initializer(RNG, ni=memory_tokens, no=hidden_dimension)
+        self.zero_gradients()
+
+    def get_memory(self) -> NDArray:
+        return self.memory
+
+    def forward(self) -> NDArray:
+        return self.get_memory()
+
+    def backward(self, incoming_gradient: NDArray) -> None:
+        self.gradient_memory += incoming_gradient
+

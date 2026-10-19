@@ -11,6 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from polyergalio.models.constants import ANY_SHAPE
+from polyergalio.models.embedding.positional import SinusoidEmbedding
 from polyergalio.models.layers.basic_layers import Layer
 
 
@@ -26,7 +27,7 @@ def reduce_to_shape(grad: NDArray, target_shape: tuple) -> NDArray:
 
 class LatentStack(Layer):
     """Stack two arrays along the latent dimension (-1)."""
-    cache_names = ("split_dims", "a_shape", "b_shape")
+    cache_names = ("split_dims",)
 
     def __init__(self):
         super().__init__()
@@ -45,11 +46,10 @@ class LatentStack(Layer):
         -------
         [array_a, array_b] joined along the hidden dimension
         """
-        self.a_shape = array_a.shape
-        self.b_shape = array_b.shape
-        assert self.a_shape[0] == self.b_shape[0]
+        assert array_a.shape[0] == array_b.shape[0]
 
-        self.split_dims = (self.a_shape[-1], self.b_shape[-1])
+        if self.training:
+            self.split_dims = (array_a.shape[-1], array_b.shape[-1])
 
         if array_a.ndim == 1:
             return np.hstack((array_a.ravel(), array_b.ravel()))
@@ -75,10 +75,7 @@ class BroadcastOperator(Layer, ABC):
 
     A subclass supplies combine(), the operation, and partials(), the gradient with respect to each broadcast input.
     """
-    cache_names = (
-        "shape_a", "shape_b", "bcast_a", "bcast_b", "expanded_dim",
-        "array_a", "array_b", "output", "gradient_array_a", "gradient_array_b",
-    )
+    cache_names = ("shape_a", "shape_b", "expanded_dim")
 
     def __init__(self, broadcast_axis: Optional[int] = None):
         super().__init__()
@@ -99,25 +96,25 @@ class BroadcastOperator(Layer, ABC):
         ----------
         mask : unused; the operation is per-position, kept for pass-through compatibility with the graph
         """
-        self.shape_a = array_a.shape
-        self.shape_b = array_b.shape
         axis = 1 if self.broadcast_axis is None else self.broadcast_axis
-        self.bcast_a, self.bcast_b, self.expanded_dim = array_a, array_b, None
+        bcast_a, bcast_b, expanded_dim = array_a, array_b, None
 
         try:
             if array_a.ndim < array_b.ndim:
-                self.bcast_a = np.expand_dims(array_a, axis)
-                self.expanded_dim = (1, axis)
+                bcast_a = np.expand_dims(array_a, axis)
+                expanded_dim = (1, axis)
             elif array_a.ndim > array_b.ndim:
-                self.bcast_b = np.expand_dims(array_b, axis)
-                self.expanded_dim = (2, axis)
-            self.output = self.combine(self.bcast_a, self.bcast_b)
+                bcast_b = np.expand_dims(array_b, axis)
+                expanded_dim = (2, axis)
+            output = self.combine(bcast_a, bcast_b)
         except ValueError as error:
             raise RuntimeError(f"{self.__class__.__name__}: Inputs not broadcastable. {error}")
 
-        self.array_a = array_a
-        self.array_b = array_b
-        return self.output
+        if self.training:
+            self.shape_a, self.shape_b, self.expanded_dim = array_a.shape, array_b.shape, expanded_dim
+            if "bcast_a" in self.cache_names:
+                self.bcast_a, self.bcast_b = bcast_a, bcast_b
+        return output
 
     def backward(self, incoming_grad: NDArray) -> tuple[NDArray, NDArray]:
         """
@@ -133,9 +130,7 @@ class BroadcastOperator(Layer, ABC):
             else:
                 grad_b = grad_b.sum(axis=axis)
 
-        self.gradient_array_a = reduce_to_shape(grad_a, self.shape_a)
-        self.gradient_array_b = reduce_to_shape(grad_b, self.shape_b)
-        return self.gradient_array_a, self.gradient_array_b
+        return reduce_to_shape(grad_a, self.shape_a), reduce_to_shape(grad_b, self.shape_b)
 
     def __str__(self):
         return self.__class__.__name__
@@ -156,6 +151,7 @@ class LatentSum(BroadcastOperator):
 
 class LatentProduct(BroadcastOperator):
     """array_a * array_b, element-wise"""
+    cache_names = BroadcastOperator.cache_names + ("bcast_a", "bcast_b")
 
     def combine(self, array_a: NDArray, array_b: NDArray) -> NDArray:
         return array_a * array_b
@@ -172,6 +168,73 @@ class LatentDifference(BroadcastOperator):
 
     def partials(self, incoming_grad: NDArray) -> tuple[NDArray, NDArray]:
         return incoming_grad, -incoming_grad
+
+
+class LatentExpand(Layer):
+    """
+    Broadcast a pooled latent over sequence_length positions and add its SinusoidEmbedding.
+
+    Input shape: (batch, 1, hidden_dimension)
+    Output shape: (batch, sequence_length, hidden_dimension)
+
+    restores_mask: the layer receives the padding mask even after a pooling layer consumed it, zeroes the padded
+    positions, and passes the mask on to the layers after it.
+    """
+    restores_mask = True
+    cache_names = ("token_mask",)
+
+    def __init__(self, sequence_length: int, hidden_dimension: int, base_freq: int = 10000):
+        """
+        Parameters
+        ----------
+        sequence_length : positions in the output
+        hidden_dimension : channel width of the latent, must be even
+        base_freq : wavelength base of the SinusoidEmbedding
+        """
+        super().__init__()
+        assert hidden_dimension % 2 == 0, f"hidden_dimension must be even, got {hidden_dimension}"
+        self.sequence_length: int = sequence_length
+        self.hidden_dimension: int = hidden_dimension
+        self.base_freq = base_freq
+        self.position = SinusoidEmbedding(sequence_length, hidden_dimension, base_freq)
+        self.declare_shapes(
+            inputs=((1, hidden_dimension),), outputs=((sequence_length, hidden_dimension),)
+        )
+
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
+        """
+        Parameters
+        ----------
+        incoming_x : (batch, 1, hidden_dimension)
+        mask : (batch, sequence_length), 1 for a real position and 0 for padding
+        """
+        assert incoming_x.ndim == 3 and incoming_x.shape[1:] == (1, self.hidden_dimension), (
+            f"expected (batch, 1, {self.hidden_dimension}), got {incoming_x.shape}"
+        )
+        tiled = np.repeat(incoming_x, self.sequence_length, axis=1)
+        output = self.position(tiled)
+        token_mask = None
+
+        if mask is not None:
+            assert mask.shape == output.shape[:2], (
+                f"mask shape {mask.shape} must match the output's (batch, sequence) axes {output.shape[:2]}"
+            )
+            token_mask = mask[..., None].astype(output.dtype)
+            output = output * token_mask
+        if self.training:
+            self.token_mask = token_mask
+        return output
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        if self.token_mask is not None:
+            incoming_grad = incoming_grad * self.token_mask
+        return self.position.backward(incoming_grad).sum(axis=1, keepdims=True)
+
+    def __str__(self):
+        return f"LatentExpand of one latent over {self.sequence_length} positions, {self.hidden_dimension} wide"
+
+    def __repr__(self):
+        return self.__str__()
 
 
 class SplitLayer(Layer):
@@ -228,7 +291,8 @@ class SplitLayer(Layer):
         """
         if self.target_axis == "sequence" and input_data.ndim < 2:
             raise ValueError(f"axis 'sequence' needs (batch, sequence, ...), got shape {input_data.shape}")
-        self.in_shape = input_data.shape
+        if self.training:
+            self.in_shape = input_data.shape
         length = input_data.shape[self.split_axis]
         num_slices = -(-length // self.slice_size)
         padding = [(0, 0)] * input_data.ndim
@@ -240,7 +304,7 @@ class SplitLayer(Layer):
         """
         Parameters
         ----------
-        incoming_grads : one gradient per slice, in the order forward returned them
+        incoming_grads : one gradient per slice, in the order forward returned them; None or missing for a dropped slice
 
         Returns
         -------
@@ -248,11 +312,15 @@ class SplitLayer(Layer):
         """
         length = self.in_shape[self.split_axis]
         num_slices = -(-length // self.slice_size)
-        if len(incoming_grads) != num_slices:
-            raise ValueError(f"expected {num_slices} gradients, got {len(incoming_grads)}")
+        if len(incoming_grads) > num_slices:
+            raise ValueError(f"expected at most {num_slices} gradients, got {len(incoming_grads)}")
 
+        present = next(np.asarray(grad) for grad in incoming_grads if grad is not None)
+        slice_shape = list(self.in_shape)
+        slice_shape[self.split_axis] = self.slice_size
+        grads = list(incoming_grads) + [None] * (num_slices - len(incoming_grads))
         joined = np.concatenate(
-            [np.asarray(grad) for grad in incoming_grads],
+            [np.zeros(slice_shape, dtype=present.dtype) if grad is None else np.asarray(grad) for grad in grads],
             axis=self.split_axis
         )
         keep = [slice(None)] * joined.ndim
@@ -261,7 +329,7 @@ class SplitLayer(Layer):
         return joined[tuple(keep)]
 
     def __str__(self):
-        return f"Split of the {self.axis} axis into slices of {self.slice_size}"
+        return f"Split of the {self.target_axis} axis into slices of {self.slice_size}"
 
     def __repr__(self):
         return self.__str__()
@@ -274,7 +342,6 @@ class ShiftRight(Layer):
     """
     preserves_shape = True
     parameter_names = ("start_token",)
-    cache_names = ("output",)
 
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -298,8 +365,7 @@ class ShiftRight(Layer):
         )
         batch = input_data.shape[0]
         start = np.broadcast_to(self.start_token, (batch, 1, self.hidden_dim))
-        self.output = np.concatenate([start, input_data[:, :-1, :]], axis=1)
-        return self.output
+        return np.concatenate([start, input_data[:, :-1, :]], axis=1)
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         self.gradient_start_token = incoming_gradient[:, :1, :].sum(axis=0, keepdims=True)
@@ -343,17 +409,13 @@ class MaskGather(Layer):
         -------
         (num_selected, hidden) the selected positions
         """
-        self.in_shape = incoming_x.shape
-
-        if mask is not None:
-            self.select_mask = np.asarray(mask, dtype=bool)
-        else:
-            self.select_mask = np.ones(incoming_x.shape[:2], dtype=bool)
-
+        select = np.ones(incoming_x.shape[:2], dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
         if target_mask is not None:
-            self.select_mask &= np.asarray(target_mask, dtype=bool)
+            select = select & np.asarray(target_mask, dtype=bool)
 
-        return incoming_x[self.select_mask]
+        if self.training:
+            self.in_shape, self.select_mask = incoming_x.shape, select
+        return incoming_x[select]
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         full_grad = np.zeros(self.in_shape, dtype=incoming_grad.dtype)

@@ -6,7 +6,6 @@ from polyergalio.models.constants import MASKED_LOGIT
 activation_dictionary = {}
 activation = lambda f: activation_dictionary.setdefault(f.__name__, f)
 derivative_dictionary = {}
-
 derivative = lambda f: derivative_dictionary.setdefault(f.__name__[:-11], f)
 
 
@@ -17,6 +16,7 @@ def sigmoid(x_array: NDArray) -> NDArray:
 
     out = np.clip(x_array, -limit, limit)
 
+    # out kwarg for inplace ops
     np.negative(out, out=out)
     np.exp(out, out=out)
     out += 1.0
@@ -84,6 +84,7 @@ def masked_softmax(
     exps = np.exp(scaled - scaled.max(axis=-1, keepdims=True)) * token_mask
     return exps / exps.sum(axis=-1, keepdims=True)
 
+
 @activation
 def linear(x_array: NDArray) -> NDArray:
     """linear forward - for regression"""
@@ -121,6 +122,7 @@ def relu_leaky(x: NDArray, alpha=0.1) -> NDArray:
     """
     return np.where(x > 0, x, alpha * x)
 
+
 @activation
 def mod_relu(x: NDArray, bias: float = -0.2) -> NDArray:
     """
@@ -139,6 +141,19 @@ def mod_relu(x: NDArray, bias: float = -0.2) -> NDArray:
 #   gradient -- the post-activation output of the forward pass
 #   x        -- the pre-activation z of the forward pass
 #   upstream -- incoming dL/d(output)
+
+# which of the forward pass's output and pre-activation z each derivative reads; a layer keeps only these for backward
+DERIVATIVE_INPUTS = {
+    "linear": (),
+    "sigmoid": ("output",),
+    "tanh": ("output",),
+    "softmax": ("output",),
+    "relu": ("z",),
+    "relu_leaky": ("z",),
+    "swish": ("z",),
+    "elu": ("z",),
+}
+
 
 @derivative
 def sigmoid_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray:
