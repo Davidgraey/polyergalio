@@ -37,7 +37,7 @@ from polyergalio.generators.data_generators import token_accuracy
 from polyergalio.models.constants import DECISION_TYPES, ClassificationTask
 from polyergalio.models.embedding.embedding import TextEmbedding
 from polyergalio.models.layers.basic_layers import DropoutLayer, FullyConnectedLayer, RMSNormLayer
-from polyergalio.models.layers.heads import (
+from polyergalio.models.layers.model_heads import (
     DecisionHead,
     decision_correct,
     decode_decisions,

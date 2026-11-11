@@ -141,6 +141,7 @@ class GradientDescent(FittedModel):
         -------
         log likelihood, float
         """
+        # TODO: replace padding with WHERE safeties
         _p = np.clip(prediction, EPSILON, 1 - EPSILON)
         if self.task == ClassificationTask.MULTINOMIAL:
             llh = np.mean(np.sum(targets * np.log(_p), axis=-1))

@@ -1,8 +1,8 @@
 """
 Clustering example.
 
-Runs every clustering mechanism in this package -- PLSOM, GPLSOM, FreePLSOM
-and CentroidNeuralNetwork -- against several RandomDatasetGenerator
+Runs every clustering mechanism in this package -- PLSOM, GPLSOM, FreePLSOM,
+SelfOrganizingLatentSpace (SOLS) and CentroidNeuralNetwork -- against several RandomDatasetGenerator
 "clustering" scenarios, each picked to show off one of the generator's
 clustering controls (plain blobs, non-convex shapes, imbalance/separation,
 noise/outliers, higher dimensionality).
@@ -47,6 +47,7 @@ from polyergalio.models.clustering.cluster_metrics import (
 from polyergalio.models.clustering.freeplsom_clustering import FreePLSOM
 from polyergalio.models.clustering.gplsom_clustering import GPLSOM
 from polyergalio.models.clustering.plsom_clustering import PLSOM
+from polyergalio.models.clustering.plsom_latent import SelfOrganizingLatentSpace
 from polyergalio.visuals.animation_utils import thin_indices
 from polyergalio.visuals.cluster_visuals import (
     animate_growth,
@@ -102,9 +103,10 @@ SCENARIOS = {
     ),
 }
 
-MECHANISM_NAMES = ("PLSOM", "GPLSOM", "FreePLSOM", "CentroidNN")
+MECHANISM_NAMES = ("PLSOM", "GPLSOM", "FreePLSOM", "SOLS", "CentroidNN")
 GRID_DIM = 6  # PLSOM's fixed width/height
 GROW_EPOCHS = 256  # GPLSOM / FreePLSOM
+SOLS_ITERATIONS = 256
 CNN_MAX_CLUSTERS = 20
 CNN_ITERATIONS = 256
 
@@ -129,7 +131,7 @@ def report(name, x_data, truth, prediction, elapsed):
 # Each returns (prediction, elapsed, history). history is a list of
 # per-step snapshots -- one per training epoch for the PLSOM family, one per
 # cluster count grown for CentroidNeuralNetwork -- used by animate_growth and
-# animate_membership. Snapshots kept by `stride` also carry a cluster
+# animate_membership. Snapshots num_kept by `stride` also carry a cluster
 # membership ('prediction' for the PLSOM family, 'labels' for CentroidNN).
 
 
@@ -255,6 +257,35 @@ def run_freeplsom(x_data, k, stride=1):
     return prediction, time.time() - start, history
 
 
+def run_sols(x_data, k, stride=1):
+    sols = SelfOrganizingLatentSpace(
+        width=GRID_DIM,
+        height=GRID_DIM,
+        input_dim=x_data.shape[1],
+        lock_seed=42,
+    )
+    history = []
+
+    def on_epoch(model, step):
+        history.append(
+            dict(
+                shape=tuple(model.network_shape),
+                weights=model.weights.copy(),
+                background=model.standardize(x_data),
+            )
+        )
+
+    start = time.time()
+    sols.fit(x_data, num_iterations=SOLS_ITERATIONS, on_epoch=on_epoch)
+    prediction = sols.predict(x_data, n_clusters=k)
+    print(f"      settled after {len(history)} cycles")
+    for idx in thin_indices(len(history), stride):
+        history[idx]["prediction"] = _predict_from_weights(
+            sols.standardize, x_data, history[idx]["weights"], k
+        )
+    return prediction, time.time() - start, history
+
+
 def run_centroid_nn(x_data, k, stride=1):
     cnn = CentroidNeuralNetwork(max_clusters=max(k + 3, CNN_MAX_CLUSTERS), epsilon=0.2)
     start = time.time()
@@ -276,6 +307,7 @@ RUNNERS = dict(
     PLSOM=run_plsom,
     GPLSOM=run_gplsom,
     FreePLSOM=run_freeplsom,
+    SOLS=run_sols,
     CentroidNN=run_centroid_nn,
 )
 

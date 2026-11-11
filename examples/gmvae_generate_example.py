@@ -42,7 +42,8 @@ def train(net, data):
         optimizer.step(net)
         if step % READOUT_EVERY == 0 or step == STEPS - 1:
             reconstruction = 0.5 * (error ** 2).sum(axis=1).mean() / OBSERVATION_VARIANCE
-            print(f"step {step:5d}  reconstruction {reconstruction:7.2f}  kl {net.divergence:5.2f}")
+            print(f"step {step:5d}  reconstruction {reconstruction:7.2f}  continuous kl {net.continuous_divergence:5.2f}  "
+                  f"usage kl {net.usage_divergence:5.2f}  information kl {net.information_divergence:5.2f}")
 
 
 def compare(label, samples, data):
@@ -59,7 +60,8 @@ def main():
     data = make_data(NUM_TRAIN, mixing, rng)
     held_out = make_data(NUM_HELD_OUT, mixing, rng)
 
-    net = GMVAELayer(FEATURES, LATENT, COMPONENTS, kl_weight=KL_WEIGHT, temperature=0.5)
+    net = GMVAELayer(FEATURES, LATENT, COMPONENTS, continuous_kl_weight=KL_WEIGHT,
+                      usage_kl_weight=KL_WEIGHT, information_kl_weight=KL_WEIGHT)
 
     net.eval()
     compare("untrained", net.generate(NUM_GENERATED), data)

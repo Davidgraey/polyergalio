@@ -90,7 +90,7 @@ class TextProcessor(Processor):
         delete_prob : fraction of content tokens TOKEN_DELETION removes
         infill_prob : fraction of content TEXT_INFILLING covers with spans
         infill_poisson_lambda : mean of the Poisson distribution TEXT_INFILLING draws span lengths from
-        pool_size : sentences kept from the fitted corpus for NEXT_SENTENCE negatives
+        pool_size : sentences num_kept from the fitted corpus for NEXT_SENTENCE negatives
         random_seed : seed for every random draw
         """
         super().__init__(target)
@@ -232,7 +232,7 @@ class TextProcessor(Processor):
         }
 
     def choose_positions(self, input_ids: np.ndarray, probability: float) -> np.ndarray:
-        """content positions kept with the given probability, at least one if any exist"""
+        """content positions num_kept with the given probability, at least one if any exist"""
         candidates = self.content_positions(input_ids)
         chosen = candidates[self.rng.random(candidates.size) < probability]
         if chosen.size == 0 and candidates.size:
@@ -316,7 +316,7 @@ class TextProcessor(Processor):
         SpanBERT span masking with the span boundary objective. Contiguous
         spans, geometric lengths clipped to max_span_length, are masked up to
         mask_prob of the content, with 80/10/10 [MASK]/random/unchanged
-        decided per span. Spans are kept one token apart so both boundary
+        decided per span. Spans are num_kept one token apart so both boundary
         tokens are always observed. Spans are over subword pieces, not
         whole words.
 

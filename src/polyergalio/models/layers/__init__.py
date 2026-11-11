@@ -1,9 +1,12 @@
 # up-import our layers
-from polyergalio.models.layers.autoencode_layers import (
-    GaussianMixtureLayer,
+from polyergalio.models.layers.autoencoder_layers import (
+    AffineCouplingLayer,
     GMVAELayer,
+    NVPVAELayer,
+    VAELayer,
 )
 from polyergalio.models.layers.basic_layers import (
+    AdaptiveLayerNorm,
     DropoutLayer,
     FullyConnectedLayer,
     Layer,
@@ -23,11 +26,7 @@ from polyergalio.models.layers.fft_layers import (
     FrequencyFFT,
     InverseFourierLayer,
 )
-from polyergalio.models.layers.hyena_layers import (
-    HyenaFilter,
-    HyenaOperator,
-    ShortConvolution,
-)
+
 from polyergalio.models.layers.latent_attention import (
     LatentAttention,
     LatentDecoderAttention,
@@ -41,6 +40,7 @@ from polyergalio.models.layers.mixture_layers import (
     VotingWeight,
     VotingWeightBalanced,
 )
+from polyergalio.models.layers.noise_layers import AdaptiveNoiseSampler
 from polyergalio.models.layers.operator_layers import (
     LatentStack,
     LatentExpand,
@@ -48,6 +48,7 @@ from polyergalio.models.layers.operator_layers import (
     LatentProduct,
     LatentDifference,
     MaskGather,
+    PatchTokenizer,
     ShiftRight,
     SplitLayer,
     BroadcastOperator,
@@ -59,3 +60,10 @@ from polyergalio.models.layers.spectre_layers import (
     SpectrePooledAttention
 )
 from polyergalio.models.layers.wavelet_layers import WaveletRefinementModule
+# from polyergalio.models.layers.diffusion_layers import (
+#     ConditionEmbedding,
+#     SpectreDenoiser,
+#     SpectreDiTBlock,
+#     SpectreLatentDiffusion,
+#     TimestepEmbedding,
+# )

@@ -69,7 +69,7 @@ class PrototypeLayer(Layer):
 
     Not adaptive: SGD steps the prototypes at its own rate, and adaptive
     optimizers (Adam) apply a plain gradient step at learning_rate instead of
-    their rescaling, so the epsilon and Lloyd step sizes are kept and no
+    their rescaling, so the epsilon and Lloyd step sizes are num_kept and no
     optimizer state has to follow structural changes.
     """
 
@@ -165,7 +165,7 @@ class PrototypeLayer(Layer):
 
         Returns
         -------
-        the output selected at construction, leading axes kept
+        the output selected at construction, leading axes num_kept
         """
         training_now = self.training if training_now is None else training_now
         x_data = np.asarray(x_data)

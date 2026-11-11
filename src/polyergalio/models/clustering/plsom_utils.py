@@ -1,7 +1,6 @@
 import copy
 from collections import deque
 
-import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 from polyergalio.models.constants import EPSILON
@@ -9,26 +8,27 @@ from polyergalio.models.constants import EPSILON
 # from smlib.mltools import log
 
 
-def scale_colormap(col: NDArray) -> NDArray:
-    absmax = np.abs(col).max()
-    norm = plt.Normalize(-absmax, absmax)
-    cmap = plt.get_cmap("RdYlGn")
-    colors = cmap(norm(col))
-    return colors
+def free_energy(scores: NDArray, temperature: float, axis: int = -1) -> NDArray:
+    """
+    Soft-minimum of scores, F = -T log sum_k exp(-score_k / T)
 
+    Parameters
+    ----------
+    scores : distances or neighborhood-smoothed distances, lowest wins
+    temperature : softness of the minimum; 0 or below gives the hard minimum
+    axis : axis holding the candidates (prototypes)
 
-def plot_variable_importance(variable_coef, feature_names):
-    length = len(variable_coef)
-    n_feats = len(feature_names)
-    fig = plt.figure(figsize=(12, n_feats * length // 3))
-    for i in range(length):
-        plt.subplot(length + 1, 1, i + 1)
-        # datset = datset.sort_values(by='p_score1', ascending=False)
-        plt.bar(x=variable_coef[i], y=feature_names, palette=scale_colormap(variable_coef[i]))
-        plt.ylabel('Feature', fontsize=10)
-        plt.xlabel('Score', fontsize=18)
+    Returns
+    -------
+    free energy with `axis` reduced away
+    """
+    if temperature <= 0:
+        return scores.min(axis=axis)
 
-    return fig
+    logits = -scores / temperature
+    peak = logits.max(axis=axis, keepdims=True)
+    total = np.exp(logits - peak).sum(axis=axis)
+    return -temperature * (np.squeeze(peak, axis=axis) + np.log(total))
 
 
 def umat_fill_outer(u_matrix, cols, rows):

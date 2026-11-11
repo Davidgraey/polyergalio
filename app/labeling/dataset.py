@@ -6,7 +6,7 @@ Accepted formats (UTF-8):
 
 Integrity rules: ids must be unique, malformed JSONL lines are a hard error
 (never silently dropped), and the file's SHA-256 is recorded so the app can
-warn when a dataset changes underneath existing labels. Text is kept exactly
+warn when a dataset changes underneath existing labels. Text is num_kept exactly
 as stored — label offsets depend on it.
 """
 

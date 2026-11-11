@@ -47,11 +47,13 @@ def plot_classification(task, accuracies: dict, losses: dict, checkpoints: tuple
 
 
 def run_classification(
-    task_name: str, kinds: list, length: int, hidden: int, heads: int, steps: int, learning_rate: float,
-    batch_size: int, seeds: int, seed: int,
+    task_name: str, kinds: list, length: int, hidden: int, heads: int, latents: int, steps: int,
+    learning_rate: float, batch_size: int, seeds: int, seed: int,
 ) -> None:
     """Train each chosen model on the task and compare held-out accuracy."""
-    task = prepare_task(task_name, hidden=hidden, heads=heads, length=length, batch_size=batch_size, seed=seed)
+    task = prepare_task(
+        task_name, hidden=hidden, heads=heads, length=length, batch_size=batch_size, seed=seed, latents=latents
+    )
     checkpoints = checkpoints_for(steps)
     parameters, accuracies, losses = compare_models(
         task, kinds, steps, learning_rate, tuple(range(seeds)), checkpoints
@@ -74,7 +76,7 @@ def plot_profile(rows: list[dict]) -> None:
         axes[0].bar(positions + offset, [row[key] for row in rows], width, label=key)
     axes[0].set_ylabel("Milliseconds")
     axes[0].set_title("Time per call")
-    memory_keys = ("forward peak MB", "kept MB", "backward peak MB")
+    memory_keys = ("forward peak MB", "num_kept MB", "backward peak MB")
     width = 0.26
     for index, key in enumerate(memory_keys):
         axes[1].bar(positions + (index - 1) * width, [row[key] for row in rows], width, label=key)
@@ -87,9 +89,9 @@ def plot_profile(rows: list[dict]) -> None:
     fig.tight_layout()
 
 
-def run_profile(length: int, hidden: int, heads: int, batch: int, memory_tokens: int) -> None:
+def run_profile(length: int, hidden: int, heads: int, batch: int, memory_tokens: int, latents: int) -> None:
     """Time and memory of the mixers on random input."""
-    rows = profile_mixers(length, hidden, heads, batch, memory_tokens)
+    rows = profile_mixers(length, hidden, heads, batch, memory_tokens, latents)
     frame = pd.DataFrame(rows)
     base = frame.iloc[0]
     for row in rows:
@@ -106,7 +108,7 @@ def run_profile(length: int, hidden: int, heads: int, batch: int, memory_tokens:
                 "forward time": frame["forward ms"] / base["forward ms"],
                 "backward time": frame["backward ms"] / base["backward ms"],
                 "backward peak memory": frame["backward peak MB"] / base["backward peak MB"],
-                "kept memory": frame["kept MB"] / base["kept MB"],
+                "num_kept memory": frame["num_kept MB"] / base["num_kept MB"],
             }
         ),
     )
@@ -119,7 +121,8 @@ def render() -> None:
     with left:
         st.write(
             "SpectrePooledAttention gates the sequence spectrum like SpectreAttention but returns one vector per "
-            "sample: a masked weighted mean whose weights are a learned positional readout. Mean-pooling a Spectre output keeps only the gate's zero-frequency bin when "
+            "sample (or K with Latents): a masked weighted mean whose weights are a learned positional readout, "
+            "with the head reading all K flattened together. Mean-pooling a Spectre output keeps only the gate's zero-frequency bin when "
             "nothing is padded, so it cannot see position; the fixed-length marker task shows this. The next-sentence "
             "task needs SentencePiece."
         )
@@ -136,6 +139,7 @@ def render() -> None:
             length = int(st.number_input("Sequence length", 16, 128, 32, step=8, key="spp_length"))
             hidden = int(st.number_input("Hidden dim", 4, 128, 32, step=4, key="spp_hidden"))
             heads = int(st.number_input("Heads", 1, 16, 4, key="spp_heads"))
+            latents = int(st.number_input("Latents (K)", 1, length, 1, key="spp_latents"))
             learning_rate = float(st.number_input("Learning rate", 0.0001, 0.1, 0.003, step=0.001, format="%.4f", key="spp_lr"))
             steps = int(st.number_input("Training steps", 50, 3000, 400, step=50, key="spp_steps"))
             batch_size = int(st.number_input("Batch size", 8, 128, 32, step=8, key="spp_batch"))
@@ -146,8 +150,8 @@ def render() -> None:
             return
         with right:
             run_panel(
-                "spp_classify", run_classification, task_name, kinds, length, hidden, heads, steps, learning_rate,
-                batch_size, seeds, seed,
+                "spp_classify", run_classification, task_name, kinds, length, hidden, heads, latents, steps,
+                learning_rate, batch_size, seeds, seed,
             )
         return
 
@@ -156,6 +160,7 @@ def render() -> None:
         length = int(st.number_input("Sequence length", 16, 2048, 256, step=16, key="spp_plength"))
         hidden = int(st.number_input("Hidden dim", 8, 1024, 256, step=8, key="spp_phidden"))
         heads = int(st.number_input("Heads", 1, 32, 8, key="spp_pheads"))
+        latents = int(st.number_input("Latents (K)", 1, length, 1, key="spp_platents"))
         batch = int(st.number_input("Batch size", 1, 32, 2, key="spp_pbatch"))
         memory_tokens = int(st.number_input("Memory tokens", 0, 256, 0, step=16, key="spp_pmemory"))
     if hidden % heads:
@@ -163,4 +168,4 @@ def render() -> None:
         return
     with right:
         st.caption("Float32 and complex64. Time is the median of three untraced runs; memory comes from the Profiler.")
-        run_panel("spp_profile", run_profile, length, hidden, heads, batch, memory_tokens)
+        run_panel("spp_profile", run_profile, length, hidden, heads, batch, memory_tokens, latents)

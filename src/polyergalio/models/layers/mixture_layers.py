@@ -757,7 +757,7 @@ class SimpleMixtureOfExperts(Layer):
 
 class PoolingLayer(Layer):
     """
-    Mean pooling layer to compute the average across the sequence dimension.
+    Mean pooling layer to compute the average across the sequence input_dimension.
 
     Input shape: (batch, sequence, hidden)
     Output shape: (batch, 1, hidden)

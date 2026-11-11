@@ -1,8 +1,8 @@
 """
 Spectre pooled-attention example: classify a sequence from one summary vector, and profile the cost.
 
-SpectrePooledAttention returns (batch, 1, hidden) from (batch, sequence, hidden): a spectral gate followed by a
-learned positional readout. It is compared with SpectreAttention
+SpectrePooledAttention returns (batch, K, hidden) from (batch, sequence, hidden): a spectral gate followed by K
+learned positional readouts (num_latent_projections). The head flattens the K summaries into one vector per sample. It is compared with SpectreAttention
 followed by mean pooling, and for the text task also with reading the [CLS] position as BERT does.
 
 Tasks
@@ -32,19 +32,20 @@ from polyergalio.encoders.tokenizer import SentencePieceTokenizer, fit_tokenizer
 from polyergalio.models.embedding.embedding import TextEmbedding
 from polyergalio.models.layers.basic_layers import FullyConnectedLayer, RMSNormLayer
 from polyergalio.models.layers.mixture_layers import PoolingLayer
-from polyergalio.models.layers.operator_layers import MaskGather
+from polyergalio.models.layers.operator_layers import FlattenLayer, MaskGather
 from polyergalio.models.layers.spectre_layers import SpectreAttention
 from polyergalio.models.layers import SpectrePooledAttention
 from polyergalio.models.model_loss import SparseCrossEntropyLoss
 from polyergalio.models.network import Network
 from polyergalio.models.optimizers import Adam
-from polyergalio.profiling import Profiler
+from polyergalio.profiling.profiling import Profiler
 
 TARGET_VOCAB_SIZE = 200
 SEQUENCE_LENGTH = 32
 HIDDEN_DIM = 32
 FFN_HIDDEN = 64
 NUM_HEADS = 4
+NUM_LATENTS = 1
 BATCH_SIZE = 32
 STEPS = 800
 LEARNING_RATE = 3e-3
@@ -162,7 +163,7 @@ def marker_batch(rng: np.random.Generator, count: int, length: int, hidden: int,
 
 # -------------    networks    ------------------------------------------------
 def build_mixer(
-    net: Network, kind: str, source, length: int, hidden: int, heads: int
+    net: Network, kind: str, source, length: int, hidden: int, heads: int, latents: int = NUM_LATENTS
 ):
     """Connect the mixer for kind to source and return the node holding one summary vector."""
     if kind in ("spectre_mean", "spectre_cls"):
@@ -172,20 +173,30 @@ def build_mixer(
         summary_layer = PoolingLayer() if kind == "spectre_mean" else MaskGather()
         return net.connect(summary_layer, mixed, name="summary")
     return net.connect(
-        SpectrePooledAttention(length, hidden, num_heads=heads), source, name="mixer"
+        SpectrePooledAttention(length, hidden, num_heads=heads, num_latent_projections=latents),
+        source,
+        name="mixer",
     )
 
 
-def build_head(net: Network, summary, hidden: int):
-    """Two-layer is-next / is-first-half classifier on the summary vector."""
-    ffn = net.connect(FullyConnectedLayer(hidden, FFN_HIDDEN, "swish"), summary, name="hidden")
+def build_head(net: Network, summary, hidden: int, latents: int = 1):
+    """
+    Two-layer is-next / is-first-half classifier on the summary vectors.
+
+    Parameters
+    ----------
+    summary : node holding (batch, latents, hidden)
+    latents : summaries per sample; they are flattened into one (batch, latents * hidden) vector
+    """
+    flat = net.connect(FlattenLayer(), summary, name="flatten")
+    ffn = net.connect(FullyConnectedLayer(latents * hidden, FFN_HIDDEN, "swish"), flat, name="hidden")
     net.output = net.connect(FullyConnectedLayer(FFN_HIDDEN, 2, "linear", is_output=True), ffn, name="classifier")
     return net
 
 
 def build_text_model(
     kind: str, vocab_size: int, padding_idx: int, length: int = SEQUENCE_LENGTH, hidden: int = HIDDEN_DIM,
-    heads: int = NUM_HEADS,
+    heads: int = NUM_HEADS, latents: int = NUM_LATENTS,
 ) -> Network:
     """
     TextEmbedding -> RMSNorm -> mixer -> summary vector -> classifier.
@@ -195,6 +206,7 @@ def build_text_model(
     kind : a key of MODELS
     vocab_size : the tokenizer's fitted vocabulary size
     padding_idx : id whose embedding row is fixed at zero
+    latents : summaries per sample for the SpectrePooled model; the other models always give one
 
     Returns
     -------
@@ -203,13 +215,15 @@ def build_text_model(
     net = Network(name=kind, input_shape=(length,))
     embedding = net.connect(TextEmbedding(vocab_size, hidden, padding_idx=padding_idx), net.input, name="embedding")
     normed = net.connect(RMSNormLayer(hidden), embedding, name="prenorm")
-    return build_head(net, build_mixer(net, kind, normed, length, hidden, heads), hidden)
+    latents = latents if kind == "pooled" else 1
+    return build_head(net, build_mixer(net, kind, normed, length, hidden, heads, latents), hidden, latents)
 
 
-def build_marker_model(kind: str, length: int, hidden: int, heads: int) -> Network:
-    """mixer -> summary vector -> classifier, on continuous token features."""
+def build_marker_model(kind: str, length: int, hidden: int, heads: int, latents: int = NUM_LATENTS) -> Network:
+    """mixer -> summary vectors -> classifier, on continuous token features."""
     net = Network(name=kind, input_shape=(length, hidden))
-    return build_head(net, build_mixer(net, kind, net.input, length, hidden, heads), hidden)
+    latents = latents if kind == "pooled" else 1
+    return build_head(net, build_mixer(net, kind, net.input, length, hidden, heads, latents), hidden, latents)
 
 
 # -------------    training    ------------------------------------------------
@@ -259,7 +273,7 @@ def checkpoints_for(steps: int) -> tuple:
 
 def prepare_task(
     name: str, hidden: int = HIDDEN_DIM, heads: int = NUM_HEADS, length: int = SEQUENCE_LENGTH,
-    batch_size: int = BATCH_SIZE, seed: int = 0,
+    batch_size: int = BATCH_SIZE, seed: int = 0, latents: int = NUM_LATENTS,
 ) -> Task:
     """
     Data, models and a fixed held-out batch for one task.
@@ -270,7 +284,11 @@ def prepare_task(
     hidden, heads, length : model and sequence size
     batch_size : training batch size
     seed : data seed
+    latents : summaries per sample in the SpectrePooled model
     """
+    kinds = models_for(name)
+    if latents > 1:
+        kinds["pooled"] += f", K={latents}"
     if name == "next sentence":
         stories, held_out = generate_stories(np.random.default_rng(seed))
         tokenizer = fit_text_tokenizer(stories)
@@ -286,8 +304,8 @@ def prepare_task(
             return sentence_batch(train_processor, [stories[i] for i in rng.integers(len(stories), size=batch_size)])
 
         return Task(
-            kinds=models_for(name),
-            build=lambda kind: build_text_model(kind, vocab_size, padding_idx, length, hidden, heads),
+            kinds=kinds,
+            build=lambda kind: build_text_model(kind, vocab_size, padding_idx, length, hidden, heads, latents),
             draw=draw,
             eval_batch=sentence_batch(eval_processor, [held_out[i] for i in picks]),
         )
@@ -295,8 +313,8 @@ def prepare_task(
     fixed_length = name == "marker position, fixed length"
     eval_rng = np.random.default_rng(seed + 1)
     return Task(
-        kinds=models_for(name),
-        build=lambda kind: build_marker_model(kind, length, hidden, heads),
+        kinds=kinds,
+        build=lambda kind: build_marker_model(kind, length, hidden, heads, latents),
         draw=lambda rng: marker_batch(rng, batch_size, length, hidden, fixed_length),
         eval_batch=marker_batch(eval_rng, EVAL_PAIRS, length, hidden, fixed_length),
     )
@@ -338,7 +356,7 @@ def accuracy_table(task: Task, parameters: dict, accuracies: dict, checkpoints: 
 # -------------    profile    -------------------------------------------------
 def profile_mixers(
     length: int = PROFILE_LENGTH, hidden: int = PROFILE_HIDDEN, heads: int = PROFILE_HEADS,
-    batch: int = PROFILE_BATCH, memory_tokens: int = 0, repeats: int = 3,
+    batch: int = PROFILE_BATCH, memory_tokens: int = 0, latents: int = NUM_LATENTS, repeats: int = 3,
 ) -> list[dict]:
     """
     Time and memory of SpectreAttention (with its mean pool's gradient) and SpectrePooledAttention, float32.
@@ -352,7 +370,9 @@ def profile_mixers(
     """
     makers = {
         "Spectre": lambda: SpectreAttention(length, hidden, num_heads=heads, memory_tokens=memory_tokens, use_wrm=False),
-        "SpectrePooled": lambda: SpectrePooledAttention(length, hidden, num_heads=heads, memory_tokens=memory_tokens),
+        "SpectrePooled": lambda: SpectrePooledAttention(
+            length, hidden, num_heads=heads, memory_tokens=memory_tokens, num_latent_projections=latents
+        ),
     }
     rng = np.random.default_rng(0)
     x = rng.normal(size=(batch, length, hidden)).astype(np.float32)
@@ -396,7 +416,7 @@ def profile_mixers(
                 "forward ms": float(np.median([t[0] for t in timings]) * 1e3),
                 "backward ms": float(np.median([t[1] for t in timings]) * 1e3),
                 "forward peak MB": forward.max_peak / 1e6,
-                "kept MB": forward.net_bytes / 1e6,
+                "num_kept MB": forward.net_bytes / 1e6,
                 "backward peak MB": backward.max_peak / 1e6,
             }
         )
@@ -422,12 +442,12 @@ def main():
         parameters, accuracies, _ = compare_models(task, list(task.kinds), STEPS, LEARNING_RATE, SEEDS, checkpoints)
         print_accuracy(name, accuracy_table(task, parameters, accuracies, checkpoints))
 
-    print(f"\nprofile: length {PROFILE_LENGTH}, hidden {PROFILE_HIDDEN}, {PROFILE_HEADS} heads, batch {PROFILE_BATCH}")
-    print(f"{'layer':26s} {'params':>9s} {'fwd ms':>8s} {'bwd ms':>8s} {'fwd MB':>8s} {'kept MB':>8s} {'bwd MB':>8s}")
+    print(f"\nprofile: length {PROFILE_LENGTH}, hidden {PROFILE_HIDDEN}, {PROFILE_HEADS} model_heads, batch {PROFILE_BATCH}")
+    print(f"{'layer':26s} {'params':>9s} {'fwd ms':>8s} {'bwd ms':>8s} {'fwd MB':>8s} {'num_kept MB':>8s} {'bwd MB':>8s}")
     for row in profile_mixers():
         print(
             f"{row['layer']:26s} {row['parameters']:9d} {row['forward ms']:8.1f} {row['backward ms']:8.1f} "
-            f"{row['forward peak MB']:8.1f} {row['kept MB']:8.1f} {row['backward peak MB']:8.1f}"
+            f"{row['forward peak MB']:8.1f} {row['num_kept MB']:8.1f} {row['backward peak MB']:8.1f}"
         )
 
 

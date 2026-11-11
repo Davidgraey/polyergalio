@@ -21,7 +21,7 @@ import numpy as np
 from polyergalio.generators.data_generators import RandomDatasetGenerator
 from polyergalio.models.constants import DECISION_TYPES, EPSILON
 from polyergalio.models.embedding.embedding import TextEmbedding
-from polyergalio.models.layers.heads import (
+from polyergalio.models.layers.model_heads import (
     DecisionHead,
     calibrated_probabilities,
     decision_confidence,
@@ -163,7 +163,7 @@ def print_evaluation(results: dict, temperatures: dict) -> None:
     print(f"NLL raw {results['nll_raw']:.3f} -> calibrated {results['nll_calibrated']:.3f}")
     print(f"accuracy {correct.mean():.3f}  mean confidence {results['confidence'].mean():.3f}  mean P(act) {results['act'].mean():.3f}")
     print(f"escalated to system two: {escalated.mean():.3f} of rows")
-    print(f"accuracy kept {rate(correct, ~escalated):.3f}  escalated {rate(correct, escalated):.3f}")
+    print(f"accuracy num_kept {rate(correct, ~escalated):.3f}  escalated {rate(correct, escalated):.3f}")
 
 
 def print_predictions(results: dict, y, kwargs: dict, count: int = 8) -> None:
@@ -176,7 +176,7 @@ def print_predictions(results: dict, y, kwargs: dict, count: int = 8) -> None:
         print(
             f"  {names[int(kwargs['decisiontypes'][row])]:6s} {y[row]} -> {results['predicted'][row]}  "
             f"[{probabilities}]  confidence {results['confidence'][row]:.2f}  P(act) {results['act'][row]:.2f}  "
-            f"{'escalated' if results['escalated'][row] else 'kept'}"
+            f"{'escalated' if results['escalated'][row] else 'num_kept'}"
         )
 
 

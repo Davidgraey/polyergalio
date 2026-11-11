@@ -1,7 +1,8 @@
 """
-Slightly more abstract chunks
+Slightly more abstract prediction layers as structural units - a prediction "head"
+
 """
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,7 +18,7 @@ from polyergalio.models.layers.basic_layers import (
     Layer,
     NormalizeLayer,
 )
-from polyergalio.models.layers.heads.decision_utilities import decision_type_ids
+from polyergalio.models.layers.model_heads.decision_utilities import decision_type_ids
 from polyergalio.models.layers.mixture_layers import MixtureOfExperts
 from polyergalio.models.weight_initialization import get_weight_init
 
@@ -73,7 +74,7 @@ class LowRankBottleNeck(Layer):
             Parameters
             ----------
             incoming_x : (..., ni) input, already standardized if called for
-            mask : unused; every row is projected independently, kept for pass-through compatibility with the graph
+            mask : unused; every row is projected independently, num_kept for pass-through compatibility with the graph
 
             Returns
             -------
@@ -320,6 +321,198 @@ class DecisionHead(Layer):
             f"DecisionHead, marker scorer {self.input_dimension} -> {self.hidden_dimension} -> 1 "
             f"over {self.num_types} question types, + act branch"
         )
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class MixtureDensityHead(Layer):
+    """
+    maps input to the parameters of J gaussian distributions over a latent-space of size Z.
+
+    Controls added to try to keep bounds on the distributions with applied limits
+
+    Output is packed along the last axis as [log_pi (J), mu (J*Z), sigma (J*Z)]:
+        log_pi : log-softmax of logits soft-clipped to +-logit_limit, so each weight stays within
+            exp(2 * logit_limit) of any other and no component dies or dominates outright
+        mu : soft-clipped to +-mu_limit
+        sigma : log-uniform between sigma_min and sigma_max (a sigmoid in log space)
+
+    Parameters
+    ----------
+    input_dim : size of the incoming hidden state
+    latent_dim : Z
+    components : J
+    logit_limit : bound on the mixture logits
+    mu_limit : bound on every mean
+    sigma_min, sigma_max : bounds on every standard deviation
+    initial_sigma : sigma at initialization, within the bounds
+    init_std : standard deviation of the projection's initial weights
+    """
+    parameter_names = ("projection",)
+    cache_names = ("log_pi", "slope_logit", "slope_mu", "sigma", "sigma_gate")
+
+    def __init__(self,
+                 input_dim: int,
+                 latent_dim: int,
+                 components: int = 5,
+                 logit_limit: float = 4.0,
+                 mu_limit: float = 5.0,
+                 sigma_min: float = 0.05,
+                 sigma_max: float = 2.0,
+                 initial_sigma: float = 0.5,
+                 init_std: float = 0.01,
+                 ):
+        super().__init__()
+        if not 0 < sigma_min <= initial_sigma <= sigma_max:
+            raise ValueError("Need 0 < sigma_min <= initial_sigma <= sigma_max")
+
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.components = components
+        self.logit_limit = logit_limit
+        self.mu_limit = mu_limit
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.initial_sigma = initial_sigma
+        self.init_std = init_std
+        self.log_ratio = float(np.log(sigma_max / sigma_min))
+
+        self.projection = FullyConnectedLayer(
+            input_dimension=input_dim,
+            output_dimension=self.output_dim,
+            activation_type="linear",
+            initialization_override="truncated_normal",
+            initialization_kwargs={"std": init_std},
+            is_output=True,
+        )
+
+        start = np.log(initial_sigma / sigma_min) / self.log_ratio
+        self.projection.bias[0, components + components * latent_dim:] = np.log(start / (1.0 - start)) if 0 < start < 1 else 0.0
+
+        self.declare_shapes(inputs=((input_dim,),), outputs=((self.output_dim,),))
+        self.zero_gradients()
+
+    @staticmethod
+    def soft_clip(values: NDArray, limit: float) -> Tuple[NDArray, NDArray]:
+        """limit * tanh(values / limit): near identity around 0, bounded by +-limit. Returns it and its slope."""
+        squashed = np.tanh(values / limit)
+        return limit * squashed, 1.0 - squashed ** 2
+
+    @property
+    def output_dim(self) -> int:
+        return self.components * (1 + 2 * self.latent_dim)
+
+    def unpack(self, packed: NDArray) -> Tuple[NDArray, NDArray, NDArray]:
+        """
+        Parameters
+        ----------
+        packed : (..., J + 2*J*Z) output of forward
+
+        Returns
+        -------
+        log_pi (..., J), mu (..., J, Z), sigma (..., J, Z)
+        """
+        j, z = self.components, self.latent_dim
+        full_shape = packed.shape[:-1]
+        return (packed[..., :j],
+                packed[..., j:j + j * z].reshape(*full_shape, j, z),
+                packed[..., j + j * z:].reshape(*full_shape, j, z))
+
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
+        """
+        # TODO: check our loss functions and all forward / backwards - currently we have different packing vs unpacking
+        calling forward then unpack
+        pred = self.forward(x)
+        pred_pi, pred_mu, pred_sigma = self.unpack(pred)
+
+        Parameters
+        ----------
+        incoming_x : (..., input_dim)
+        mask : unused; every position is projected independently, num_kept for pass-through compatibility with the graph
+
+        Returns
+        -------
+        Output is packed along the last axis as [log_pi (J), mu (J*Z), sigma (J*Z)]:
+        self.unpack() gives back these correctly sliced
+
+            log_pi : log-softmax of logits soft-clipped to +-logit_limit, so each weight stays within
+                exp(2 * logit_limit) of any other and no component dies or dominates outright
+            mu : soft-clipped to +-mu_limit
+            sigma : log-uniform between sigma_min and sigma_max (a sigmoid in log space)
+        """
+        j, z = self.components, self.latent_dim
+        raw = self.projection.forward(incoming_x)
+
+        logits, self.slope_logit = self.soft_clip(raw[..., :j], self.logit_limit)
+        mu, self.slope_mu = self.soft_clip(raw[..., j:j + j * z], self.mu_limit)
+        # hard clipped between -50 || +50
+        self.sigma_gate = 1.0 / (1.0 + np.exp(-np.clip(raw[..., j + j * z:], -50.0, 50.0)))
+        self.sigma = self.sigma_min * np.exp(self.log_ratio * self.sigma_gate)
+
+        peak = logits.max(axis=-1, keepdims=True)
+        self.log_pi = logits - peak - np.log(np.exp(logits - peak).sum(axis=-1, keepdims=True))
+        return np.concatenate([self.log_pi, mu, self.sigma], axis=-1)
+
+    def backward(self, incoming_gradient: NDArray) -> NDArray:
+        """
+        Parameters
+        ----------
+        incoming_gradient : (..., J + 2*J*Z) gradient with respect to the packed output
+
+        Returns
+        -------
+        (..., input_dim) gradient with respect to the input
+        """
+        j, z = self.components, self.latent_dim
+        grad_log_pi = incoming_gradient[..., :j]
+        grad_mu = incoming_gradient[..., j:j + j * z]
+        grad_sigma = incoming_gradient[..., j + j * z:]
+
+        grad_logits = grad_log_pi - np.exp(self.log_pi) * grad_log_pi.sum(axis=-1, keepdims=True)
+        raw_gradient = np.concatenate([
+            grad_logits * self.slope_logit,
+            grad_mu * self.slope_mu,
+            grad_sigma * self.sigma * self.log_ratio * self.sigma_gate * (1.0 - self.sigma_gate),
+        ], axis=-1)
+        return self.projection.backward(raw_gradient)
+
+    def sample(self, packed: NDArray, temperature: float = 0.0, rng: Optional[np.random.Generator] = None) -> NDArray:
+        """
+        Draw one latent per position from the predicted mixture.
+
+        Temperature tau reshapes the mixture before drawing: weights go as pi^(1/tau) and every sigma is scaled
+        by sqrt(tau). tau = 1 is the model's own density, below 1 concentrates on likely modes, above 1 spreads.
+        tau = 0 is deterministic: the mean of the highest-weight component.
+
+        Parameters
+        ----------
+        packed : (..., J + 2*J*Z) output of forward
+        temperature : tau >= 0
+        rng : source of randomness, required when temperature > 0
+
+        Returns
+        -------
+        (..., Z) float64
+        """
+        if temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        log_pi, mu, sigma = self.unpack(packed)
+
+        if temperature == 0:
+            best = log_pi.argmax(axis=-1)[..., None, None]
+            return np.take_along_axis(mu, best, axis=-2)[..., 0, :]
+
+        if rng is None:
+            raise ValueError("rng is required when temperature > 0")
+        chosen = (log_pi / temperature + rng.gumbel(size=log_pi.shape)).argmax(axis=-1)[..., None, None]
+        center = np.take_along_axis(mu, chosen, axis=-2)[..., 0, :]
+        spread = np.take_along_axis(sigma, chosen, axis=-2)[..., 0, :]
+        return center + spread * np.sqrt(temperature) * rng.standard_normal(center.shape)
+
+    def __str__(self):
+        return (f"MixtureDensityHead, {self.input_dim} -> {self.components} Gaussians over {self.latent_dim}, "
+                f"mu +-{self.mu_limit:g}, sigma [{self.sigma_min:g}, {self.sigma_max:g}]")
 
     def __repr__(self):
         return self.__str__()

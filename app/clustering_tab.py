@@ -1,4 +1,4 @@
-"""Clustering tab: PLSOM, GPLSOM, FreePLSOM and CentroidNeuralNetwork."""
+"""Clustering tab: PLSOM, GPLSOM, FreePLSOM, SOLS and CentroidNeuralNetwork."""
 
 import numpy as np
 import pandas as pd
@@ -49,6 +49,15 @@ DIAGRAMS = {
         ("Grow, prune or merge single neurons", "Cluster the neurons"),
         ("Cluster the neurons", "Label points by nearest neuron"),
     ],
+    "SOLS": [
+        ("Data", "Standardize"),
+        ("Standardize", "Soft assignment: softmax over distance and lattice terms"),
+        ("Soft assignment: softmax over distance and lattice terms", "Update latent positions and prototypes"),
+        ("Update latent positions and prototypes", "Per-sample neighborhood: epsilon, theta and gamma"),
+        ("Per-sample neighborhood: epsilon, theta and gamma", "Repeat until the objective settles"),
+        ("Repeat until the objective settles", "Cluster the live prototypes"),
+        ("Cluster the live prototypes", "Label points by nearest prototype"),
+    ],
     "CentroidNN": [
         ("Data", "Standardize"),
         ("Standardize", "Start with two centroids"),
@@ -93,7 +102,7 @@ def render() -> None:
     left, right = st.columns([1, 2])
     with left:
         st.write(
-            "Parameterless self-organizing maps and a centroid network that grows its cluster count, "
+            "Self-organizing maps, a self-organizing latent space and a centroid network that grows its cluster count, "
             "compared on synthetic scenarios."
         )
         with st.expander("Model structure", expanded=True):

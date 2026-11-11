@@ -27,7 +27,7 @@ def show_store_banners(store, ds, manifest: dict, root: str) -> None:
                  icon=":material/error:")
     if report["truncated_tail"]:
         st.warning("The last write before the previous shutdown was incomplete. It was quarantined and new "
-                   "writes are kept separate from it.", icon=":material/warning:")
+                   "writes are num_kept separate from it.", icon=":material/warning:")
     if report["recovered_from_snapshot"]:
         st.warning(f"The label log was missing and was rebuilt from {plain(report['recovered_from_snapshot'])}.",
                    icon=":material/warning:")

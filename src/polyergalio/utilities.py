@@ -11,7 +11,7 @@ from typing import Optional, Callable, Iterable
 import numpy as np
 from numpy.typing import NDArray
 
-from polyergalio.models.constants import EPSILON
+from polyergalio.models.constants import EPSILON, GLOBAL_DTYPE
 
 
 # -------------- Decorators  --------------
@@ -70,8 +70,8 @@ def log_timeit(func: Callable, logger: Optional):
 
 def preformat_expected_shapes(x: NDArray, y: NDArray) -> tuple[NDArray, NDArray]:
     """conform the shapes of input and targets, and recast into lower-precision dtype"""
-    x_prime = np.asarray(x).astype(np.float16)
-    y_prime = np.asarray(y).astype(np.float16)
+    x_prime = np.asarray(x).astype(GLOBAL_DTYPE)
+    y_prime = np.asarray(y).astype(GLOBAL_DTYPE)
 
     if x.ndim == 1:  # single sample
         x_prime = x_prime.reshape(1, -1)
@@ -99,7 +99,7 @@ def rolling_windows_nd(data: NDArray,
     ----------
     data : data array, of at least 2 dimensions
     window : the size (int) of the window
-    axis : the target dimension to tile / roll our windows over.  The specified dimension will be expanded into NxM
+    axis : the target input_dimension to tile / roll our windows over.  The specified input_dimension will be expanded into NxM
         dimensions, where Nis the number of windows, and M is the window size.
     num_overlap : the number of indices to overlap each window
 

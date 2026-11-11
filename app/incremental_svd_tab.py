@@ -58,7 +58,7 @@ def frame_axes(ax, title: str, width: float, height: float) -> None:
 
 
 def plot_shapes(layer: IncrementalSVDLayer, batch_rows: int) -> None:
-    """Block diagrams, sides scaled by the square root of each dimension: the merge core, the forward pass, the factors held."""
+    """Block diagrams, sides scaled by the square root of each input_dimension: the merge core, the forward pass, the factors held."""
     features, outputs = layer.input_dimension, layer.output_dimension
     rank = layer.singular_values.size
     width = min(features, batch_rows)
@@ -192,10 +192,10 @@ def render() -> None:
         st.subheader("Settings")
         features = int(st.number_input("Features", 2, 24, 8, key="svd_features"))
         form = st.selectbox("Output form", FORMS, key="svd_form")
-        num_components = int(st.number_input("Components kept", 1, features, features, key="svd_components"))
+        num_components = int(st.number_input("Components num_kept", 1, features, features, key="svd_components"))
         output_dimension = features
         if form != "orthogonalized":
-            output_dimension = int(st.number_input("Output dimension", 1, features, min(features, 4), key="svd_output"))
+            output_dimension = int(st.number_input("Output input_dimension", 1, features, min(features, 4), key="svd_output"))
         standardize = st.checkbox("Standardize outputs", value=True, key="svd_standardize")
         decay_rate = float(st.number_input("Decay rate", 0.5, 1.0, 0.99, step=0.01, format="%.2f", key="svd_decay"))
         size = int(st.number_input("Batch size", 1, 1000, 100, key="svd_batch"))
@@ -205,7 +205,7 @@ def render() -> None:
         scenario = st.selectbox("Scenario", SCENARIOS, key="svd_scenario")
         seed = int(st.number_input("Seed", 0, 9999, 0, key="svd_seed"))
     if output_dimension < features and output_dimension > num_components:
-        right.warning("Output dimension cannot exceed the components kept.")
+        right.warning("Output input_dimension cannot exceed the components num_kept.")
         return
 
     with right:

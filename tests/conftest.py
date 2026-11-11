@@ -28,7 +28,6 @@ STEP = 1e-6
 
 
 # -------------    numerical helpers    ----------------------------
-# ------------------------------------------------------------------
 def numeric_gradient(scalar_function, tensor, step: float = STEP):
     """
     Central-difference gradient of scalar_function() with respect to tensor.
