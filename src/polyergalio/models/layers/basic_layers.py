@@ -3,8 +3,6 @@ Exercise: the contents of basal_layers rebuilt on BasalEstimator.
 
 RNG is a module-level stand-in for the global generator.
 """
-from __future__ import annotations
-
 from abc import ABC
 from typing import Optional
 
@@ -88,7 +86,7 @@ class FullyConnectedLayer(Layer):
         ----------
         incoming_x : (..., ni) input, already standardized if called for
         forced_activation : activation name used instead of activation_type
-        mask : unused; every row is projected independently, kept for pass-through compatibility with the graph
+        mask : unused; every row is projected independently, num_kept for pass-through compatibility with the graph
 
         Returns
         -------
@@ -129,6 +127,8 @@ class FullyConnectedLayer(Layer):
 
         self.gradient_weights = self.input.T @ delta
         self.gradient_bias = delta.sum(axis=0, keepdims=True)
+        # self.accumulate_gradient(name="weights", value=self.input.T @ delta)
+        # self.accumulate_gradient(name="bias", value=delta.sum(axis=0, keepdims=True))
 
         final_grad = delta @ self.weights.T
         return final_grad.reshape(*self.in_shape[:-1], -1)
@@ -153,7 +153,7 @@ class DropoutLayer(Layer):
         Parameters
         ----------
         dropout_prob : chance each element is zeroed, strictly between 0 and 1
-        use_rescale : scale kept elements by 1 / keep_prob, so the expected activation is unchanged
+        use_rescale : scale num_kept elements by 1 / keep_prob, so the expected activation is unchanged
         """
         super().__init__()
         assert (dropout_prob > 0.0) and (dropout_prob < 1.0)
@@ -172,7 +172,7 @@ class DropoutLayer(Layer):
         Parameters
         ----------
         incoming_x : any shape
-        mask : unused; dropout is applied per element regardless of padding, kept for pass-through compatibility
+        mask : unused; dropout is applied per element regardless of padding, num_kept for pass-through compatibility
             with the graph
 
         Returns
@@ -237,7 +237,7 @@ class NormalizeLayer(Layer):
         Parameters
         ----------
         incoming_x : (..., ni)
-        mask : unused; each position is normalized against only its own features, kept for pass-through
+        mask : unused; each position is normalized against only its own features, num_kept for pass-through
             compatibility with the graph
         """
         in_shape = incoming_x.shape
@@ -274,6 +274,95 @@ class NormalizeLayer(Layer):
         return self.__str__()
 
 
+class AdaptiveLayerNorm(Layer):
+    """
+    Layer norm whose shift and scale are computed from a condition (adaLN, Peebles & Xie 2023):
+
+        out = norm(x) * (1 + scale(c)) + shift(c),   [shift, scale] = modulation(swish(c))
+
+    The normalization has no learned affine. The modulation starts at zero, so the layer starts as a plain layer norm.
+    A condition with fewer axes than x is shared by every position, so (batch, nc) conditions (batch, sequence, ni); a
+    condition axis of size 1 is broadcast the same way.
+
+    Inputs: x (batch, ..., ni), condition (batch, nc) or the same leading shape as x with a trailing nc
+    Output shape: same as x
+    """
+    parameter_names = ("modulation",)
+    cache_names = ("x_norm", "std", "scale", "condition", "shared")
+
+    def __init__(self, input_dimension: int, condition_dimension: int, eps: float = 1e-6):
+        """
+        Parameters
+        ----------
+        input_dimension : size of the last axis of x
+        condition_dimension : size of the last axis of the condition
+        eps : added to the variance for numerical stability
+        """
+        super().__init__()
+        self.input_dimension = input_dimension
+        self.condition_dimension = condition_dimension
+        self.eps = eps
+        self.modulation = FullyConnectedLayer(condition_dimension, 2 * input_dimension, "linear",
+                                              initialization_override="zeros")
+        self.declare_shapes(inputs=((input_dimension,), (condition_dimension,)), outputs=((input_dimension,),))
+        self.zero_gradients()
+
+    def forward(self, incoming_x: NDArray, condition: NDArray, mask: Optional[NDArray] = None) -> NDArray:
+        """
+        Parameters
+        ----------
+        incoming_x : (batch, ..., ni)
+        condition : (batch, nc), or (batch, ..., nc) with each leading axis equal to x's or 1
+        mask : unused; each position is normalized against only its own features, num_kept for pass-through
+            compatibility with the graph
+        """
+        rows = incoming_x.reshape(-1, self.input_dimension)
+        std = np.sqrt(np.var(rows, axis=-1, keepdims=True) + self.eps)
+        x_norm = ((rows - np.mean(rows, axis=-1, keepdims=True)) / std).reshape(incoming_x.shape)
+
+        shift, scale = np.split(self.modulation(activations.swish(condition)), 2, axis=-1)
+        shared = condition.ndim < incoming_x.ndim
+        if shared:
+            shift, scale = shift[:, None], scale[:, None]
+        if self.training:
+            self.x_norm, self.std, self.scale = x_norm, std, scale
+            self.condition, self.shared = condition, shared
+        return x_norm * (1.0 + scale) + shift
+
+    def reduce_to_condition(self, gradient: NDArray) -> NDArray:
+        """Sum a gradient shaped like x down to the leading shape of the condition, wherever forward broadcast it."""
+        if self.shared:
+            gradient = gradient.sum(axis=1)
+        for axis, size in enumerate(self.condition.shape[:-1]):
+            if size == 1 and gradient.shape[axis] != 1:
+                gradient = gradient.sum(axis=axis, keepdims=True)
+        return gradient
+
+    def backward(self, incoming_grad: NDArray) -> tuple[NDArray, NDArray]:
+        """
+        Returns
+        -------
+        gradient with respect to x and to the condition, each in its own input shape
+        """
+        shift_gradient = self.reduce_to_condition(incoming_grad)
+        scale_gradient = self.reduce_to_condition(incoming_grad * self.x_norm)
+        activated_gradient = self.modulation.backward(np.concatenate([shift_gradient, scale_gradient], axis=-1))
+        condition_gradient = activations.swish_derivative(None, self.condition, activated_gradient)
+
+        z = (incoming_grad * (1.0 + self.scale)).reshape(-1, self.input_dimension)
+        x_norm = self.x_norm.reshape(-1, self.input_dimension)
+        x_gradient = (1.0 / self.std) * (
+            z - np.mean(z, axis=-1, keepdims=True) - x_norm * np.mean(z * x_norm, axis=-1, keepdims=True)
+        )
+        return x_gradient.reshape(incoming_grad.shape), condition_gradient
+
+    def __str__(self):
+        return f"Adaptive LayerNorm over {self.input_dimension}, conditioned on {self.condition_dimension}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
 class RMSNormLayer(Layer):
     """
     Root-mean-square norm over the last axis. No mean subtraction and no shift, so the only parameter is a
@@ -301,7 +390,7 @@ class RMSNormLayer(Layer):
         Parameters
         ----------
         incoming_x : (..., ni)
-        mask : unused; each position is normalized against only its own features, kept for pass-through
+        mask : unused; each position is normalized against only its own features, num_kept for pass-through
             compatibility with the graph
         """
         in_shape = incoming_x.shape

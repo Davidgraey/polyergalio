@@ -134,7 +134,7 @@ class ProcessorNode(CompositeNode):
 
     @property
     def outputs(self) -> dict:
-        """the processor's metadata entry: output dimension, variable names, encoder type"""
+        """the processor's metadata entry: output input_dimension, variable names, encoder type"""
         (entry,) = self.component.metadata.values()
         return entry
 

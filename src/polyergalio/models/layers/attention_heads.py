@@ -9,6 +9,7 @@ from polyergalio.models.layers.basic_layers import RNG, FullyConnectedLayer, Lay
 from polyergalio.models.weight_initialization import get_weight_init
 
 DESCRIPTOR_EPS = 1e-10
+MODRELU_BIAS = 0.223
 
 # -------------head layout funcs----------------------------------
 def split_heads(array: NDArray, num_heads: int) -> NDArray:
@@ -54,7 +55,7 @@ class DenseHead(Layer):
         y_h = activation(x_h W_h + b_h)
 
     Backward needs the input and whichever of z and output the activation's derivative reads (none for linear).
-    Only those are kept, and only in training mode.
+    Only those are num_kept, and only in training mode.
 
     Input shape: (..., num_heads * ni)
     Output shape: (..., num_heads * no)
@@ -129,7 +130,7 @@ class DenseHead(Layer):
         return merge_heads(input_gradient.reshape(*delta.shape[:-2], self.num_heads, self.input_dimension))
 
     def __str__(self):
-        return f"DenseHead, {self.num_heads} heads of {self.input_dimension} -> {self.output_dimension}, {self.activation_type}"
+        return f"DenseHead, {self.num_heads} model_heads of {self.input_dimension} -> {self.output_dimension}, {self.activation_type}"
 
     def __repr__(self):
         return self.__str__()
@@ -173,7 +174,7 @@ class HeadProjection(DenseHead):
         self.hidden_dimension = num_heads * head_dimension
 
     def __str__(self):
-        return f"HeadProjection, {self.num_heads} heads of {self.head_dimension} -> {self.head_dimension}"
+        return f"HeadProjection, {self.num_heads} model_heads of {self.head_dimension} -> {self.head_dimension}"
 
 
 class HeadGate(Layer):
@@ -203,7 +204,7 @@ class HeadGate(Layer):
         head_dimension: int,
         num_frequencies: int,
         gate_dimension: int,
-        modrelu_bias: float = -0.1,
+        modrelu_bias: float = MODRELU_BIAS,
         band_radius: int = 0,
         weight_scale: float = 0.1,
         hidden_initialization: str = "relu",
@@ -279,7 +280,7 @@ class HeadGate(Layer):
         """
         Parameters
         ----------
-        pooled_query : (batch, hidden) mean query, heads laid out along the hidden axis
+        pooled_query : (batch, hidden) mean query, model_heads laid out along the hidden axis
         keep_descriptor : hold the normalised query for the descriptor property; False when nothing reads it
 
         Returns
@@ -360,7 +361,7 @@ class HeadGate(Layer):
     def __str__(self):
         band = f", band radius {self.band_radius}" if self.band_radius else ""
         return (
-            f"HeadGate, {self.num_heads} heads of {self.head_dimension} -> {self.gate_dimension} -> "
+            f"HeadGate, {self.num_heads} model_heads of {self.head_dimension} -> {self.gate_dimension} -> "
             f"{self.num_frequencies} complex frequencies{band}"
         )
 
@@ -373,11 +374,11 @@ class LatentHead(Layer):
     Per-head projection through a shared low-rank latent space representation -
     MLA's compression in place of DenseHead's block-diagonal map.
 
-        c = RMSNorm(x W_down)         (..., rank), one latent for all heads
+        c = RMSNorm(x W_down)         (..., rank), one latent for all model_heads
         y_h = c W_up[h] + b[h]        (..., head_dimension), independent per head
 
     DenseHead gives each head its own slice of the input. Here every head reads the same latent of the whole input,
-    so heads mix channels through the bottleneck. compress and expand are public so a caller can pool, cache or
+    so model_heads mix channels through the bottleneck. compress and expand are public so a caller can pool, cache or
     reuse the latent: pooling c and expanding once equals expanding every token and pooling.
 
     Input shape: (..., hidden_dimension)
@@ -428,7 +429,7 @@ class LatentHead(Layer):
         return self.norm.forward(self.down.forward(input_data))
 
     def expand(self, latent: NDArray) -> NDArray:
-        """(..., rank) -> (..., num_heads * head_dimension); the latent is kept for backward_expand in training"""
+        """(..., rank) -> (..., num_heads * head_dimension); the latent is num_kept for backward_expand in training"""
         if self.training:
             self.latent = latent
         return merge_heads(np.einsum("...r,hro->...ho", latent, self.weights, optimize=True) + self.bias)
@@ -454,7 +455,7 @@ class LatentHead(Layer):
 
     def __str__(self):
         return (
-            f"LatentHead, {self.hidden_dimension} -> rank {self.rank} -> {self.num_heads} heads of {self.head_dimension}"
+            f"LatentHead, {self.hidden_dimension} -> rank {self.rank} -> {self.num_heads} model_heads of {self.head_dimension}"
         )
 
     def __repr__(self):

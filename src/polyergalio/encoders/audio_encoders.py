@@ -3,7 +3,7 @@ Signal (audio) preprocessing / encoders ------------------------
 Waveform to windowed spectral features and back again.
 """
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -63,9 +63,9 @@ def progressive_downsample(
     data: NDArray, factors: list[int], mask: Optional[NDArray] = None
 ) -> list[tuple[NDArray, Optional[NDArray]]]:
     """
-    BUILD a resolution pyramid by chaining downsample_sequence
+    construct a resolution pyramid by chaining downsample_sequence
 
-    Each level downsamples the PREVIOUS level's output
+    NOTE - Each level downsamples the PREVIOUS level's output
 
     Parameters
     ----------
@@ -167,20 +167,27 @@ def _paired_bins(num_frequencies: int, window_size: Optional[int]) -> slice:
 
 
 def to_power(
-    spectrum: NDArray, window_size: Optional[int] = None, one_sided: bool = True
+    spectrum: NDArray,
+    window_size: Optional[int] = None,
+    one_sided: bool = True,
+    window_kernel: Optional[NDArray] = None,
 ) -> NDArray:
     """
-    Power spectrum, |X|^2 for every bin.
+    Power spectrum, |X|squared for every bin, optionally normalized by window energy.
 
     Parameters
     ----------
     spectrum : complex rfft output
-    window_size : length of the window the spectrum came from. Defaults to the
-        even case, so pass it explicitly whenever the window length is odd.
-    one_sided : double the paired bins so the total matches the energy of the
-        full two sided spectrum
+    window_size : length of the window the spectrum came from. Defaults to the even case, so pass it explicitly
+        whenever the window length is odd.
+    one_sided : double the paired bins so the total matches the energy of the full two sided spectrum
+    window_kernel : taper the spectrum was computed with. Power is divided by its energy, sum(kernel**2), so
+        unit variance noise has unit power per bin whatever the window length or taper.
     """
     power = np.abs(spectrum) ** 2
+
+    if window_kernel is not None:
+        power = power / np.sum(window_kernel ** 2)
 
     if one_sided:
         power[..., _paired_bins(spectrum.shape[-1], window_size)] *= 2
@@ -201,6 +208,75 @@ def from_decibels(decibels: NDArray, epsilon: float = EPSILON) -> NDArray:
 def frequency_axis(window_size: int, sample_rate: int) -> NDArray:
     """centre frequency in Hz of each rfft bin"""
     return np.fft.rfftfreq(window_size, d=1.0 / sample_rate)
+
+
+def band_edges(
+    freqs: NDArray,
+    num_bands: int,
+    min_frequency: Optional[float] = None,
+    max_frequency: Optional[float] = None,
+    min_bins: int = 1,
+) -> NDArray:
+    """
+    Bin index edges of log spaced bands. Where log spacing would give a band fewer than `min_bins`
+    bins (the low frequencies), bands are widened to `min_bins`, so the lowest bands keep full
+    bin resolution and the log spacing takes over as the bins get relatively narrower.
+
+    Parameters
+    ----------
+    freqs : centre frequency in Hz of each rfft bin
+    num_bands : number of bands
+    min_frequency : lowest frequency covered, defaults to the first bin above DC
+    max_frequency : highest frequency covered, defaults to Nyquist
+    min_bins : fewest rfft bins a band may span
+
+    Returns
+    -------
+    (num_bands + 1,) integer bin edges, band i spans bins edges[i]:edges[i + 1]
+    """
+    low = 1 if min_frequency is None else max(1, int(np.searchsorted(freqs, min_frequency)))
+    high = len(freqs) if max_frequency is None else int(np.searchsorted(freqs, max_frequency, side="right"))
+    assert high - low >= num_bands * min_bins, (
+        f"{num_bands} bands of {min_bins} bins need {num_bands * min_bins} bins, "
+        f"only {high - low} between {freqs[low]:.1f} and {freqs[high - 1]:.1f} Hz"
+    )
+
+    targets = np.geomspace(freqs[low], freqs[high - 1], num_bands + 1)
+    edges = np.searchsorted(freqs, targets).astype(int)
+    edges[0] = low
+
+    for i in range(1, num_bands + 1):
+        edges[i] = max(edges[i], edges[i - 1] + min_bins)
+    edges[-1] = high
+    for i in range(num_bands - 1, 0, -1):
+        edges[i] = min(edges[i], edges[i + 1] - min_bins)
+
+    return edges
+
+
+def band_matrix(edges: NDArray, num_frequencies: int) -> NDArray:
+    """(num_bands, num_frequencies) matrix whose rows average the bins of each band"""
+    matrix = np.zeros((len(edges) - 1, num_frequencies))
+    for band, (start, stop) in enumerate(zip(edges[:-1], edges[1:])):
+        matrix[band, start:stop] = 1.0 / (stop - start)
+    return matrix
+
+
+def band_pool(power: NDArray, weights: NDArray) -> NDArray:
+    """
+    Average power across the bins of each band. Pool before taking decibels: averaging power
+    removes the per-bin chi-squared scatter that averaging decibels would keep.
+
+    Parameters
+    ----------
+    power : (..., num_frequencies)
+    weights : (num_bands, num_frequencies) from band_matrix
+
+    Returns
+    -------
+    (..., num_bands)
+    """
+    return power @ weights.T
 
 
 # -------------    windows back to a waveform    --------------------
@@ -298,19 +374,29 @@ def plot_window_spectra(
 # ------------------------------------------------------------------
 class AudioProcessor(Processor):
     """
-    Waveform to a windowed spectral representation.
+    Waveform to a windowed spectral representation, windowed power, or windowed amplitude
+    Windows are tiled across the `overlap_ratio`
 
-    channel is the channel to pull out of a multi channel file.
+    Spectral -
+    Uses a Blackman kernel to reduce artifacts
+
+    channel is the channel to pull out of a multi-channel file (L, R or other)
     """
+    state_names = ("mean", "standard_deviation", "band_mean", "band_std")
 
     def __init__(
         self,
         sample_rate: int,
         window_ms: float = 20.0,
-        overlap_ratio: float = 1 / 3,
+        overlap_ratio: float = 1 / 5,
         use_decibels: bool = True,
         target: str = "waveform",
         channel: int = 0,
+        standardize: bool = True,
+        num_bands: int = 64,
+        min_frequency: Optional[float] = None,
+        max_frequency: Optional[float] = 10_000.0,
+        min_bins: int = 1,
     ):
         """
         Parameters
@@ -321,6 +407,10 @@ class AudioProcessor(Processor):
         use_decibels : encode to decibels rather than raw power
         target : name of the signal being encoded
         channel : channel index within a multi channel source
+        num_bands : number of log spaced bands in the "bands" encoding
+        min_frequency : lowest band frequency in Hz, defaults to the first bin above DC
+        max_frequency : highest band frequency in Hz
+        min_bins : fewest rfft bins a band may span, low bands are widened to this
         """
         super().__init__(target=target)
         self.channel = channel
@@ -329,36 +419,132 @@ class AudioProcessor(Processor):
         self.overlap_ratio = overlap_ratio
         self.use_decibels = use_decibels
 
+        self.mean = 0
+        self.standard_deviation = 1
+        self.seen_samples = 0
+
         self.window_size: int = window_size_from_ms(sample_rate, window_ms)
-        self.num_overlap: int = int(self.window_size * overlap_ratio)
+        self.num_overlap: int = int(self.window_size * (overlap_ratio / 2))
         self.window_kernel: NDArray = np.blackman(self.window_size)
         self.freqs: NDArray = frequency_axis(self.window_size, sample_rate)
         self.spectrum: Optional[NDArray] = None
+        self.standardize = standardize
+
+        self.num_bands = num_bands
+        self.min_frequency = min_frequency
+        self.max_frequency = max_frequency
+        self.min_bins = min_bins
+        edges = band_edges(self.freqs, num_bands, min_frequency, max_frequency, min_bins)
+        self.band_weights: NDArray = band_matrix(edges, len(self.freqs))
+        self.band_frequencies: NDArray = self.band_weights @ self.freqs
+        self.band_mean = np.zeros(num_bands)
+        self.band_std = np.ones(num_bands)
 
 
-    def fit(self, values: NDArray) -> "AudioProcessor":
-        """record the observed range, which inverse() needs to undo scaling"""
-        self.obs_min_max = (float(np.min(values)), float(np.max(values)))
+    def fit(self, values: NDArray | Sequence[NDArray]) -> "AudioProcessor":
+        """
+        Record the waveform mean and std, and the per band mean and std of the band decibels.
+
+        Parameters
+        ----------
+        values : one waveform, or a list of waveforms, all at this processor's sample rate.
+            Statistics are computed across all of them, replacing any earlier fit.
+        """
+        waveforms = [values] if isinstance(values, np.ndarray) else list(values)
+
+        count = sum(waveform.size for waveform in waveforms)
+        self.mean = float(sum(np.nansum(waveform) for waveform in waveforms) / count)
+        squares = sum(np.nansum((waveform - self.mean) ** 2) for waveform in waveforms)
+        self.standard_deviation = float(np.sqrt(squares / count))
+        self.seen_samples = count
+        self.obs_min_max = (
+            float(min(np.min(waveform) for waveform in waveforms)),
+            float(max(np.max(waveform) for waveform in waveforms)),
+        )
+
+        self.band_mean = np.zeros(self.num_bands)
+        self.band_std = np.ones(self.num_bands)
+        frames = 0
+        band_sum = np.zeros(self.num_bands)
+        band_squares = np.zeros(self.num_bands)
+        for waveform in waveforms:
+            bands = self.encode(waveform)["bands"].reshape(-1, self.num_bands)
+            frames += len(bands)
+            band_sum += bands.sum(axis=0)
+            band_squares += (bands ** 2).sum(axis=0)
+
+        self.band_mean = band_sum / frames
+        self.band_std = np.sqrt(np.maximum(band_squares / frames - self.band_mean ** 2, 0.0))
         self.fitted = True
         return self
 
     def encode(self, values: NDArray) -> dict[str,NDArray]:
         """
-        Waveform to (num_frames, num_frequencies). The complex spectrum is
-        cached on the way through so inverse() can reuse its phase.
-        """
-        windows = build_windows(values, self.window_size, self.num_overlap)
-        power = to_power(windows, window_size=self.window_size)
+        Waveform to windowed features. The complex spectrum is cached on the
+        way through so inverse() can reuse its phase.
 
-        self.spectrum = windowed_spectrum(power, self.window_kernel)
+        Returns
+        -------
+        "spectrum" : (num_frames, num_frequencies), window energy normalized power
+        "bands" : (num_frames, num_bands), log spaced band power, standardized per band
+        "power" : (num_frames, window_size), squared samples
+        "amplitude" : (num_frames, window_size), samples
+        """
+        _values =  (values - self.mean) / (self.standard_deviation + EPSILON)
+
+        windows = build_windows(_values, self.window_size, self.num_overlap)
+
+        self.spectrum = windowed_spectrum(windows, self.window_kernel)
+        spectral_power = to_power(
+            self.spectrum, window_size=self.window_size, window_kernel=self.window_kernel
+        )
+        bands = band_pool(spectral_power, self.band_weights)
+        power = windows ** 2
 
         if self.use_decibels:
-            return {"spectrum": to_decibels(self.spectrum), "amplitude": to_decibels(power)}
+            spectral_power = to_decibels(spectral_power)
+            bands = to_decibels(bands)
+            power = to_decibels(power)
 
-        return {"spectrum": self.spectrum, "amplitude": power}
+        bands = (bands - self.band_mean) / (self.band_std + EPSILON)
 
+        return {"spectrum": spectral_power, "bands": bands, "power": power, "amplitude": windows}
 
-    def fit_encode(self, values: NDArray) -> NDArray:
+    def windowed_spectral(self, values: NDArray, minimum_window_size: int = 100) -> NDArray:
+        """
+        Dyadic multi-resolution spectrum. Level k cuts the signal into 2**k
+        windows (1/1, 1/2 | 1/2, 1/4 | 1/4 | 1/4 | 1/4, ...) down to
+        `minimum_window_size` samples.
+
+        Each window is zero padded to the full signal length before the FFT, so
+        every level shares one frequency axis whatever the window length.
+
+        Parameters
+        ----------
+        values : (..., length)
+        minimum_window_size : smallest window length, in samples
+
+        Returns
+        -------
+        complex spectrum, (..., num_windows, length // 2 + 1), coarsest level first
+        """
+        length = values.shape[-1]
+        assert length >= minimum_window_size, "signal is shorter than minimum_window_size"
+
+        levels = []
+        count = 1
+
+        while length // count >= minimum_window_size:
+            size = length // count
+            windows = values[..., : count * size].reshape(*values.shape[:-1], count, size)
+            tapered = windows * np.blackman(size)
+            padded = np.pad(tapered, [(0, 0)] * (tapered.ndim - 1) + [(0, length - size)])
+            levels.append(np.fft.rfft(padded, axis=-1))
+            count *= 2
+
+        return np.concatenate(levels, axis=-2)
+
+    def fit_encode(self, values: NDArray) -> dict[str, NDArray]:
         return self.fit(values).encode(values)
 
     def inverse(self, values: NDArray) -> NDArray:
@@ -371,7 +557,7 @@ class AudioProcessor(Processor):
         """
         power = from_decibels(values) if self.use_decibels else values
 
-        two_sided = power.copy()
+        two_sided = power * np.sum(self.window_kernel ** 2)
         two_sided[..., _paired_bins(power.shape[-1], self.window_size)] /= 2
 
         magnitude = np.sqrt(two_sided)
@@ -394,6 +580,8 @@ class AudioProcessor(Processor):
             "window_size": self.window_size,
             "num_overlap": self.num_overlap,
             "num_frequencies": len(self.freqs),
+            "num_bands": self.num_bands,
+            "band_frequencies": self.band_frequencies.tolist(),
             "use_decibels": self.use_decibels,
         }
 
@@ -402,4 +590,253 @@ class AudioProcessor(Processor):
         return (
             f"AudioProcessor at {self.sample_rate} Hz, {self.window_size} sample "
             f"windows overlapping {self.num_overlap}, encoding to {units}"
+        )
+
+class FrequencyMatroyskaProcessor(Processor):
+    """
+    Waveform to a stacked multi-resolution spectrum, (batch, stacked_windows, frequencies).
+
+    The signal is cut into 1, 2, 4, ... windows down to `minimum_window_ms`.
+    Each window is Blackman tapered and zero padded, so all windows share one
+    frequency axis.
+
+    Alongside the dB SPL spectrum, window energy normalized power is pooled into log spaced
+    bands and standardized per band.
+    """
+    state_names = ("mean", "standard_deviation", "band_mean", "band_std")
+
+    def __init__(
+        self,
+        sample_rate: int,
+        minimum_window_ms: float = 20.0,
+        use_decibels: bool = True,
+        target: str = "waveform",
+        channel: int = 0,
+        n_fft: Optional[int] = None,
+        num_bands: int = 64,
+        min_frequency: Optional[float] = None,
+        max_frequency: Optional[float] = 10_000.0,
+        min_bins: int = 1,
+    ):
+        """
+        Parameters
+        ----------
+        sample_rate : samples per second of the source signal
+        minimum_window_ms : length of the smallest window in milliseconds
+        use_decibels : encode to decibels rather than raw power
+        target : name of the signal being encoded
+        channel : channel index within a multi channel source
+        n_fft : FFT length every window is zero padded to, defaults to sample_rate (1 Hz bins)
+        num_bands : number of log spaced bands in the "bands" encoding
+        min_frequency : lowest band frequency in Hz, defaults to the first bin above DC
+        max_frequency : highest band frequency in Hz
+        min_bins : fewest bins a band may span, low bands are widened to this
+        """
+        super().__init__(target=target)
+        self.channel = channel
+        self.sample_rate = sample_rate
+        self.minimum_window_ms = minimum_window_ms
+        self.minimum_window_size: int = window_size_from_ms(sample_rate, minimum_window_ms)
+        self.use_decibels = use_decibels
+        self.n_fft: int = sample_rate if n_fft is None else n_fft
+
+        self.volts_to_pascals = 10.0
+        self.p_ref = 20e-6
+        self.noise_floor_threshold_db = 40
+        
+        
+        self.mean = 0
+        self.standard_deviation = 1
+        self.seen_samples = 0
+        self.frequencies: NDArray = frequency_axis(self.n_fft, sample_rate)
+
+        self.num_bands = num_bands
+        self.min_frequency = min_frequency
+        self.max_frequency = max_frequency
+        self.min_bins = min_bins
+        edges = band_edges(self.frequencies, num_bands, min_frequency, max_frequency, min_bins)
+        self.band_weights: NDArray = band_matrix(edges, len(self.frequencies))
+        self.band_frequencies: NDArray = self.band_weights @ self.frequencies
+        self.band_mean = np.zeros(num_bands)
+        self.band_std = np.ones(num_bands)
+
+    def fit(self, values: NDArray | Sequence[NDArray]) -> "FrequencyMatroyskaProcessor":
+        """
+        Record the waveform mean and std, and the per band mean and std of the band decibels.
+
+        Parameters
+        ----------
+        values : one waveform, or a list of waveforms, all at this processor's sample rate.
+            Statistics are computed across all of them, replacing any earlier fit.
+        """
+        waveforms = [values] if isinstance(values, np.ndarray) else list(values)
+
+        count = sum(waveform.size for waveform in waveforms)
+        self.mean = float(sum(np.nansum(waveform) for waveform in waveforms) / count)
+        squares = sum(np.nansum((waveform - self.mean) ** 2) for waveform in waveforms)
+        self.standard_deviation = float(np.sqrt(squares / count))
+        self.seen_samples = count
+        self.obs_min_max = (
+            float(min(np.min(waveform) for waveform in waveforms)),
+            float(max(np.max(waveform) for waveform in waveforms)),
+        )
+
+        self.band_mean = np.zeros(self.num_bands)
+        self.band_std = np.ones(self.num_bands)
+        frames = 0
+        band_sum = np.zeros(self.num_bands)
+        band_squares = np.zeros(self.num_bands)
+        for waveform in waveforms:
+            bands = self.encode(waveform)["bands"].reshape(-1, self.num_bands)
+            frames += len(bands)
+            band_sum += bands.sum(axis=0)
+            band_squares += (bands ** 2).sum(axis=0)
+
+        self.band_mean = band_sum / frames
+        self.band_std = np.sqrt(np.maximum(band_squares / frames - self.band_mean ** 2, 0.0))
+        self.fitted = True
+        return self
+
+    def encode(self, signal: NDArray) -> dict[str, NDArray]:
+        """
+        Waveform to a stacked spectrum.
+
+        Parameters
+        ----------
+        signal : (batch, length) or (length,)
+
+        Returns
+        -------
+        "spectrum" : (batch, stacked_windows, n_fft // 2 + 1), dB SPL
+        "bands" : (batch, stacked_windows, num_bands), log spaced band power, standardized per band
+        "frequency_bins" : (n_fft // 2 + 1,), frequency in Hz of each bin
+        "resolutions" : window count of each level
+        """
+        signal = np.atleast_2d(signal)
+
+        # standardized = (signal - self.mean) / (self.standard_deviation + EPSILON)
+        spectrum, power, resolutions = self.windowed_spectral(signal, self.minimum_window_size, self.n_fft)
+
+        bands = band_pool(power, self.band_weights)
+        if self.use_decibels:
+            bands = to_decibels(bands)
+        bands = (bands - self.band_mean) / (self.band_std + EPSILON)
+
+        return {
+            "spectrum": spectrum,
+            "bands": bands,
+            "frequency_bins": self.frequencies,
+            "resolutions": resolutions
+        }
+
+    def windowed_spectral(
+        self, values: NDArray, minimum_window_size: int = 100, n_fft: Optional[int] = None
+    ) -> tuple[NDArray, NDArray, list[int]]:
+        """
+        Dyadic multi-resolution spectrum. Level k cuts the signal into 2**k
+        windows (1/1, 1/2 | 1/2, 1/4 | 1/4 | 1/4 | 1/4, ...) down to
+        `minimum_window_size` samples.
+
+        The signal is zero padded to a multiple of the finest window count, so
+        every level divides evenly. Each tapered window is then zero padded to
+        `n_fft`, or folded down to it when longer (time aliasing, which samples
+        the window's spectrum at `n_fft` evenly spaced frequencies), so every
+        level shares one frequency axis whatever the signal length.
+
+        Parameters
+        ----------
+        values : (..., length)
+        minimum_window_size : smallest window length, in samples
+        n_fft : FFT length, fixes the number of frequency bins. Defaults to the padded signal length.
+
+        Returns
+        -------
+        spectrum, (..., num_windows, n_fft // 2 + 1), dB SPL, coarsest level first
+        power, same shape, normalized by window energy and signal variance so unit variance noise has unit
+            power in every bin at every level
+        resolutions, window count of each level
+        """
+        length = values.shape[-1]
+        assert length >= minimum_window_size, "signal is shorter than minimum_window_size"
+
+        # fit into the power of 2--
+        max_count = 1 << ((length // minimum_window_size).bit_length() - 1)
+
+        padded_length = -(-length // max_count) * max_count
+
+        n_fft = padded_length if n_fft is None else n_fft
+
+        values = np.pad(values, [(0, 0)] * (values.ndim - 1) + [(0, padded_length - length)])
+
+        levels = []
+        powers = []
+        count = 1
+        resolutions = []
+        while count <= max_count:
+            size = padded_length // count
+            windows = values.reshape(*values.shape[:-1], count, size)
+
+            tapered = windows * np.hanning(size)
+            folds = -(-size // n_fft)
+            padded = np.pad(tapered, [(0, 0)] * (tapered.ndim - 1) + [(0, folds * n_fft - size)])
+            padded = padded.reshape(*tapered.shape[:-1], folds, n_fft).sum(axis=-2)
+            
+            # -----
+            fft_output = np.fft.rfft(padded, axis=-1)
+            window_energy = np.sum(np.hanning(size) ** 2)
+            powers.append(
+                to_power(fft_output, window_size=n_fft) / (window_energy * (self.standard_deviation + EPSILON) ** 2)
+            )
+            frequencies = np.fft.rfftfreq(n_fft, d=1.0 / self.sample_rate)
+            positive_indices = frequencies >= 0
+
+            # positive half of magnitudes (over size)
+            magnitudes = np.abs(fft_output) / size
+            pressure_pascals = magnitudes * self.volts_to_pascals
+            pressure_pascals = np.where(pressure_pascals == 0, 1e-15, pressure_pascals)
+            magnitude_db_spl = 20 * np.log10(pressure_pascals / self.p_ref)
+            masked_db_spl = np.where(
+                magnitude_db_spl < self.noise_floor_threshold_db,
+                self.noise_floor_threshold_db,
+                magnitude_db_spl,
+            )
+            
+            freqs_masked = frequencies[positive_indices]
+            db_masked = masked_db_spl[..., positive_indices]
+            # print(freqs_masked.shape, db_masked.shape)
+            
+            levels.append(db_masked)
+            resolutions.append(count)
+
+            count *= 2
+            
+
+        return np.concatenate(levels, axis=-2), np.concatenate(powers, axis=-2), resolutions
+
+    def fit_encode(self, values: NDArray) -> dict[str, NDArray]:
+        return self.fit(values).encode(values)
+
+    def inverse(self, values: NDArray) -> NDArray:
+        """
+        """
+        return ()
+
+    @property
+    def metadata(self) -> dict:
+        return {
+            "target": self.target,
+            "channel": self.channel,
+            "sample_rate": self.sample_rate,
+            "n_fft": self.n_fft,
+            "num_bands": self.num_bands,
+            "band_frequencies": self.band_frequencies.tolist(),
+            "minimum_window_size": self.minimum_window_size,
+            "use_decibels": self.use_decibels,
+        }
+
+    def __str__(self):
+        units = "dB" if self.use_decibels else "power"
+        return (
+            f"FrequencyMatroyskaProcessor at {self.sample_rate} Hz, windows down to "
+            f"{self.minimum_window_size} samples, encoding to {units}"
         )

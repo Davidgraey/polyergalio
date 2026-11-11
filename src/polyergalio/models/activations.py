@@ -1,3 +1,10 @@
+"""
+Partially Optimized activation functions and their derivatives
+- Reduced temporary assignments to keep memory pressure low
+- Makes use of np.errorstate where possible
+- uses np.{operation_name} when it's helpful - np.divide, np.exp, np.log - as these are very slightly quicker
+
+"""
 import numpy as np
 from numpy.typing import NDArray
 
@@ -11,14 +18,16 @@ derivative = lambda f: derivative_dictionary.setdefault(f.__name__[:-11], f)
 
 @activation
 def sigmoid(x_array: NDArray) -> NDArray:
-    """Numerically stable version of sigmoid via clipping -- the bool masks previously were costly"""
-    limit = np.log(np.finfo(x_array.dtype).max) - 1.0
+    """
+    Numerically stable sigmoid with no clip pass.
 
-    out = np.clip(x_array, -limit, limit)
-
-    # out kwarg for inplace ops
-    np.negative(out, out=out)
-    np.exp(out, out=out)
+    exp(-x) overflows to inf for very negative x; 1 + inf = inf and 1 / inf = 0 is exactly the correct
+    limit, so only the overflow warning needs silencing. Saves a full sweep over memory and the
+    finfo/log lookup the clipped version did on every call.
+    """
+    out = np.negative(x_array)
+    with np.errstate(over="ignore"):
+        np.exp(out, out=out)
     out += 1.0
     np.reciprocal(out, out=out)
     return out
@@ -27,23 +36,32 @@ def sigmoid(x_array: NDArray) -> NDArray:
 @activation
 def swish(x: NDArray):
     """
-    f(x) = x * σ(x)
-    Parameters
-    ----------
-    x :
-
-    Returns
-    -------
-
+    f(x) = x * σ(x) = x / (1 + exp(-x)), fused into one buffer and four passes.
     """
-
-    return x * sigmoid(x)
+    t = np.negative(x)
+    with np.errstate(over="ignore"):
+        np.exp(t, out=t)
+    t += 1.0
+    np.divide(x, t, out=t)
+    return t
 
 
 @activation
 def elu(x: NDArray, alpha: float = 1.0) -> NDArray:
-    """f(x) = x for x > 0, alpha * (exp(x) - 1) otherwise"""
-    return np.where(x > 0, x, alpha * np.expm1(np.minimum(x, 0)))
+    """
+    f(x) = x for x > 0, alpha * (exp(x) - 1) otherwise
+
+    """
+    out = np.minimum(x, 0)
+    np.expm1(out, out=out)
+    scalar_alpha = np.ndim(alpha) == 0
+    if not scalar_alpha or alpha != 1.0:
+        out *= alpha
+    if scalar_alpha and alpha <= 1.0:
+        np.maximum(out, x, out=out)
+    else:
+        out += np.maximum(x, 0)
+    return out
 
 
 @activation
@@ -58,13 +76,14 @@ def softmax(x_array: NDArray) -> NDArray:
     -------
     evaluation (single val for input_sample (row) of x)
     """
-
-    exps = np.exp(x_array - np.max(x_array, axis=-1, keepdims=True))
-    return exps / np.sum(exps, axis=-1, keepdims=True)
+    out = x_array - x_array.max(axis=-1, keepdims=True)
+    np.exp(out, out=out)
+    out /= out.sum(axis=-1, keepdims=True)
+    return out
 
 
 def masked_softmax(
-    logits: NDArray, token_mask: NDArray, temperature: float | NDArray = 1.0
+        logits: NDArray, token_mask: NDArray, temperature: float | NDArray = 1.0
 ) -> NDArray:
     """
     Softmax over each row's valid options only.
@@ -77,12 +96,19 @@ def masked_softmax(
 
     Returns
     -------
-    (batch, options) probabilities, exactly 0 on padded slots
+    (batch, options) probabilities, exactly 0 on padded slots, in logits.dtype
     """
-    temperature = np.reshape(temperature, (-1, 1))
-    scaled = np.where(token_mask, logits / temperature, MASKED_LOGIT)
-    exps = np.exp(scaled - scaled.max(axis=-1, keepdims=True)) * token_mask
-    return exps / exps.sum(axis=-1, keepdims=True)
+    # Casting temperature to the logits dtype matters: np.reshape(1.0, (-1, 1)) is a float64 *array*, so
+    # float32 logits / it silently promoted the whole (batch, options) pipeline to float64.
+    temperature = np.asarray(temperature, dtype=logits.dtype).reshape(-1, 1)
+
+    scaled = logits / temperature
+    np.putmask(scaled, token_mask == 0, MASKED_LOGIT)
+    scaled -= scaled.max(axis=-1, keepdims=True)
+    np.exp(scaled, out=scaled)
+    scaled *= token_mask
+    scaled /= scaled.sum(axis=-1, keepdims=True)
+    return scaled
 
 
 @activation
@@ -93,48 +119,41 @@ def linear(x_array: NDArray) -> NDArray:
 
 @activation
 def tanh(x: NDArray) -> NDArray:
-    """
-    **********ARGUMENTS**********
-    :param x: incoming values in numpy array
-    **********RETURNS**********
-    :return: evaluation (single val for input_sample (row) of x)
-    """
-    # return 2 / (1 + np.e ** (-2 * x)) - 1
     return np.tanh(x)
 
 
 @activation
 def relu(x: NDArray) -> NDArray:
-    """**********ARGUMENTS**********
-    :param x: incoming values in numpy array
-    **********RETURNS**********
-    :return: evaluation (single val for input_sample (row) of x)
-    """
     return np.maximum(0, x)
 
 
 @activation
 def relu_leaky(x: NDArray, alpha=0.1) -> NDArray:
-    """**********ARGUMENTS**********
-    :param x: incoming values in numpy array
-    **********RETURNS**********
-    :return: evaluation (single val for input_sample (row) of x)
     """
-    return np.where(x > 0, x, alpha * x)
+    f(x) = x for x > 0, alpha * x otherwise.
+    """
+    if np.ndim(alpha) != 0:  # per-channel alpha: keep the general path
+        return np.where(x > 0, x, alpha * x)
+    out = np.multiply(x, alpha)
+
+    (np.maximum if alpha <= 1 else np.minimum)(out, x, out=out)
+    return out
 
 
 @activation
 def mod_relu(x: NDArray, bias: float = -0.2) -> NDArray:
     """
-     modrelu = z / |z| * max(|z| +b, 0)
+    modrelu = z / |z| * max(|z| +b, 0)
     """
-    # z / |z|
     magnitude = np.abs(x)
-    phase = np.divide(x, magnitude, out=np.zeros_like(x), where=magnitude != 0)
+    activated = magnitude > np.maximum(-bias, 0.0)
 
-    activated = np.maximum(magnitude + bias, 0.0)
+    magnitude += ~activated
+    inverse = np.divide(activated, magnitude, out=magnitude)
 
-    return activated * phase
+    inverse *= bias
+    inverse += activated
+    return x * inverse
 
 
 # ===================== and their derivatives ======================
@@ -157,7 +176,10 @@ DERIVATIVE_INPUTS = {
 
 @derivative
 def sigmoid_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray:
-    return upstream * gradient * (1 - gradient)
+    d = np.subtract(1.0, gradient)
+    d *= gradient
+    d *= upstream
+    return d
 
 
 @derivative
@@ -167,25 +189,46 @@ def relu_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray
 
 @derivative
 def relu_leaky_derivative(
-    gradient: NDArray, x: NDArray, upstream: NDArray, alpha: float = 0.1
+        gradient: NDArray, x: NDArray, upstream: NDArray, alpha: float = 0.1
 ) -> NDArray:
-    return np.where(x > 0, upstream, upstream * alpha)
+    if np.ndim(alpha) == 0 and 0.0 <= alpha <= 1.0:
+        slope = np.sign(x)
+        np.maximum(slope, alpha, out=slope)
+        slope *= upstream
+        return slope
+    out = np.multiply(upstream, alpha)
+    np.putmask(out, x > 0, upstream)
+    return out
 
 
 @derivative
 def tanh_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray:
-    return upstream * (1 - gradient ** 2)
+    d = np.square(gradient)
+    np.subtract(1.0, d, out=d)
+    d *= upstream
+    return d
 
 
 @derivative
 def swish_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray:
+    """
+    σ(x) * (1 + x * (1 - σ(x)))
+    """
     s = sigmoid(x)
-    return upstream * s * (1 + x * (1 - s))
+    d = np.subtract(1.0, s)
+    d *= s
+    d *= x
+    d += s
+    d *= upstream
+    return d
 
 
 @derivative
 def elu_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray:
-    return upstream * np.where(x > 0, 1.0, np.exp(np.minimum(x, 0)))
+    d = np.minimum(x, 0)
+    np.exp(d, out=d)
+    d *= upstream
+    return d
 
 
 @derivative
@@ -195,31 +238,50 @@ def linear_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArr
 
 @derivative
 def softmax_derivative(gradient: NDArray, x: NDArray, upstream: NDArray) -> NDArray:
-    """True VJP over the last axis, so it holds for any batch shape."""
-    dot = np.sum(upstream * gradient, axis=-1, keepdims=True)
-    return gradient * (upstream - dot)
+    """Over the last axis, so it holds for any batch shape."""
+    # einsum does the row-wise dot without temporary
+    dot = np.einsum("...i,...i->...", upstream, gradient)[..., None]
+    out = upstream - dot
+    out *= gradient
+    return out
 
 
 @derivative
 def mod_relu_derivative(z, beta, dout, eps=1e-8):
-    r = np.abs(z)
-    r_safe = r + eps
-    mask = (r + beta) > 0
+    """
+    Exact gradients of modReLU
 
-    scale = (r + beta) / r_safe
-    proj = np.real(dout * np.conj(z)) / r_safe
+    Parameters
+    ----------
+    z : pre-activation
+    beta : bias, broadcast against z without its first axis
+    dout : complex upstream gradient, dL/dRe + i dL/dIm
 
-    d_bias = (proj * mask).sum(axis=0)
-    d_z = mask * (dout * scale + z * proj * (-beta / r_safe**2))
+    Returns
+    -------
+    d_bias : summed over the first axis
+    d_z : same shape as z
+    """
+    inverse = np.abs(z)
+    activated = inverse > np.maximum(-beta, 0.0)
+    inverse += ~activated
+    np.divide(activated, inverse, out=inverse)
+
+    radial = np.multiply(dout.real, z.real)
+    shrink = np.multiply(dout.imag, z.imag)
+    radial += shrink
+    radial *= inverse
+
+    d_bias = radial.sum(axis=0)
+
+    np.multiply(inverse, beta, out=shrink)
+    radial *= shrink
+    radial *= inverse
+    shrink += activated
+    # free them before the complex
+    del activated, inverse
+
+    d_z = dout * shrink
+    del shrink
+    d_z -= z * radial
     return d_bias, d_z
-
-
-if __name__ == "__main__":
-    x = np.array([[1, 2, 3, 4, 5], [3, 2, 4, 5, 6], [9, 8, 7, 6, 5]]) / 9
-    upstream = np.ones_like(x)
-    for name, _func in activation_dictionary.items():
-        if name == "mod_relu":
-            continue
-        x_hat = _func(x)
-        delta = derivative_dictionary[name](x_hat, x, upstream)
-        print(f"{name}: forward {x_hat.shape} -> delta {delta.shape}")

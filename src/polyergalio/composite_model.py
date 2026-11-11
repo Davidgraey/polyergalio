@@ -5,8 +5,6 @@ A Composite orders its nodes and saves them by name, nesting each component's ow
 Serializable family of its own (NeuralNetwork, UniversalPipeline) and does not share the concerns of the components it
 holds.
 """
-from __future__ import annotations
-
 import inspect
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -371,7 +369,7 @@ class Composite(Serializable, ABC):
         raise NotImplementedError("a composite is restored by rebuild(), which reconnects every node")
 
     @classmethod
-    def rebuild(cls, config: dict, state: dict) -> Composite:
+    def rebuild(cls, config: dict, state: dict):
         """Construct from config, then deserialize and reconnect every node in saved order."""
         composite = cls(**config)
         for name, entry in state["nodes"].items():

@@ -28,7 +28,7 @@ parameters
     array and for a sublayer. Parameters are part of the state, so they are never listed twice.
 
 caches and mode
-    Caches are forward-pass values kept for backward(). They are cleared by purge() and never persisted. Mode is
+    Caches are forward-pass values num_kept for backward(). They are cleared by purge() and never persisted. Mode is
     the training flag, which train() and eval() set on an estimator and every sublayer it holds.
 
 Serialization
@@ -395,6 +395,19 @@ class BasalEstimator(Serializable, ABC):
         """Restore trainable members from get_weights() output, which must hold exactly parameter_names."""
         write_members(self, self.parameter_names, weights, lambda member, value: member.set_weights(value))
 
+    # TODO: temporarily comment this out while we're working
+    # def accumulate_gradient(self, name: str, value: NDArray) -> None:
+    #     """
+    #     Add the incoming `value` into `gradient_<name>`
+    #     if the attribute is None now, we set to the incoming value
+    #     """
+    #
+    #     target_vari = getattr(self, f"gradient_{name}")
+    #     if target_vari is not None:
+    #         setattr(self, f"gradient_{name}", target_vari + value)
+    #     else:
+    #         setattr(self, f"gradient_{name}", value)
+    
     def get_gradients(self) -> dict:
         """
         Gradients to apply in update_weights, keyed `gradient_<name>`. A sublayer's value is its own

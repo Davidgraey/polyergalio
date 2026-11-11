@@ -5,7 +5,7 @@ The gradient dict mirrors the model: `gradient_<name>` for every parameter, with
 is itself an estimator. A NeuralNetwork is keyed by node name, a layer by parameter name. The optimizer walks that tree
 against the model, scales each leaf, and applies the whole scaled tree once with `update_weights`.
 
-Along the way an estimator that is not training is skipped, and one that is not adaptive (the clustering layers) takes
+Along the way an estimator that is not training is skipped, and one that is not adaptive (eg clustering layers) takes
 a plain step at its own learning_rate, whatever the optimizer. Optimizer state is keyed by the path of gradient names,
 so it needs no layer ordering and survives a graph being rewired.
 """
@@ -118,7 +118,7 @@ class SGD(Optimizer):
 
 class Adam(Optimizer):
     """
-    Adaptive moments, kept per gradient path, so a layer's weights and bias each have their own.
+    Adaptive moments, num_kept per gradient path, so a layer's weights and bias each have their own.
     An estimator that is not adaptive steps at its own learning_rate instead and keeps no state.
     """
 

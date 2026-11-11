@@ -26,7 +26,7 @@ def reduce_to_shape(grad: NDArray, target_shape: tuple) -> NDArray:
 
 
 class LatentStack(Layer):
-    """Stack two arrays along the latent dimension (-1)."""
+    """Stack two arrays along the latent input_dimension (-1)."""
     cache_names = ("split_dims",)
 
     def __init__(self):
@@ -44,7 +44,7 @@ class LatentStack(Layer):
         """
         Returns
         -------
-        [array_a, array_b] joined along the hidden dimension
+        [array_a, array_b] joined along the hidden input_dimension
         """
         assert array_a.shape[0] == array_b.shape[0]
 
@@ -94,7 +94,7 @@ class BroadcastOperator(Layer, ABC):
         """
         Parameters
         ----------
-        mask : unused; the operation is per-position, kept for pass-through compatibility with the graph
+        mask : unused; the operation is per-position, num_kept for pass-through compatibility with the graph
         """
         axis = 1 if self.broadcast_axis is None else self.broadcast_axis
         bcast_a, bcast_b, expanded_dim = array_a, array_b, None
@@ -170,49 +170,87 @@ class LatentDifference(BroadcastOperator):
         return incoming_grad, -incoming_grad
 
 
+def latent_expansion(num_latent_projections: int, sequence_length: int) -> NDArray:
+    """
+    Returns
+    -------
+    (sequence_length, num_latent_projections) weights in which position t reads the latent whose block of
+    consecutive positions contains t; one latent is read by every position
+    """
+    expansion = np.zeros((sequence_length, num_latent_projections))
+    for latent, block in enumerate(np.array_split(np.arange(sequence_length), num_latent_projections)):
+        expansion[block, latent] = 1.0
+    return expansion
+
+
 class LatentExpand(Layer):
     """
-    Broadcast a pooled latent over sequence_length positions and add its SinusoidEmbedding.
+    Project num_latent_projections latents up to sequence_length positions and add a SinusoidEmbedding.
 
-    Input shape: (batch, 1, hidden_dimension)
+    Position t receives sum_k expansion[t, k] * latent[k]. One latent is tiled over every position, with no
+    parameters. Several use a learned (sequence_length, num_latent_projections) expansion that starts as
+    consecutive blocks, the transpose of the readout of SpectrePooledAttention.
+
+    Input shape: (batch, num_latent_projections, hidden_dimension)
     Output shape: (batch, sequence_length, hidden_dimension)
 
     restores_mask: the layer receives the padding mask even after a pooling layer consumed it, zeroes the padded
     positions, and passes the mask on to the layers after it.
     """
     restores_mask = True
-    cache_names = ("token_mask",)
+    cache_names = ("token_mask", "latent")
 
-    def __init__(self, sequence_length: int, hidden_dimension: int, base_freq: int = 10000):
+    def __init__(self,
+                 sequence_length: int,
+                 hidden_dimension: int,
+                 base_freq: int = 10000,
+                 num_latent_projections: int = 1,
+                 ):
         """
         Parameters
         ----------
         sequence_length : positions in the output
         hidden_dimension : channel width of the latent, must be even
         base_freq : wavelength base of the SinusoidEmbedding
+        num_latent_projections : latents in the input, between 1 and sequence_length
         """
         super().__init__()
         assert hidden_dimension % 2 == 0, f"hidden_dimension must be even, got {hidden_dimension}"
+        assert 1 <= num_latent_projections <= sequence_length, (
+            f"num_latent_projections must be between 1 and sequence_length {sequence_length}, "
+            f"got {num_latent_projections}"
+        )
         self.sequence_length: int = sequence_length
         self.hidden_dimension: int = hidden_dimension
         self.base_freq = base_freq
+        self.num_latent_projections: int = num_latent_projections
         self.position = SinusoidEmbedding(sequence_length, hidden_dimension, base_freq)
+
+        if num_latent_projections > 1:
+            self.expansion = latent_expansion(num_latent_projections, sequence_length)
+            self.parameter_names += ("expansion",)
         self.declare_shapes(
-            inputs=((1, hidden_dimension),), outputs=((sequence_length, hidden_dimension),)
+            inputs=((num_latent_projections, hidden_dimension),), outputs=((sequence_length, hidden_dimension),)
         )
+        self.zero_gradients()
 
     def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
         """
         Parameters
         ----------
-        incoming_x : (batch, 1, hidden_dimension)
+        incoming_x : (batch, num_latent_projections, hidden_dimension)
         mask : (batch, sequence_length), 1 for a real position and 0 for padding
         """
-        assert incoming_x.ndim == 3 and incoming_x.shape[1:] == (1, self.hidden_dimension), (
-            f"expected (batch, 1, {self.hidden_dimension}), got {incoming_x.shape}"
-        )
-        tiled = np.repeat(incoming_x, self.sequence_length, axis=1)
-        output = self.position(tiled)
+        assert (incoming_x.ndim == 3
+                and incoming_x.shape[1:] == (self.num_latent_projections, self.hidden_dimension)),\
+            (f"expected (batch, {self.num_latent_projections}, {self.hidden_dimension}), got {incoming_x.shape}")
+
+        if self.num_latent_projections > 1:
+            expanded = np.einsum("tk,bkh->bth", self.expansion, incoming_x)
+        else:
+            expanded = np.repeat(incoming_x, self.sequence_length, axis=1)
+
+        output = self.position(expanded)
         token_mask = None
 
         if mask is not None:
@@ -223,15 +261,109 @@ class LatentExpand(Layer):
             output = output * token_mask
         if self.training:
             self.token_mask = token_mask
+            self.latent = incoming_x
         return output
 
     def backward(self, incoming_grad: NDArray) -> NDArray:
         if self.token_mask is not None:
             incoming_grad = incoming_grad * self.token_mask
-        return self.position.backward(incoming_grad).sum(axis=1, keepdims=True)
+        position_grad = self.position.backward(incoming_grad)
+        if self.num_latent_projections == 1:
+            return position_grad.sum(axis=1, keepdims=True)
+        self.gradient_expansion = np.einsum("bth,bkh->tk", position_grad, self.latent)
+        return np.einsum("tk,bth->bkh", self.expansion, position_grad)
 
     def __str__(self):
-        return f"LatentExpand of one latent over {self.sequence_length} positions, {self.hidden_dimension} wide"
+        return (
+            f"LatentExpand of {self.num_latent_projections} latent(s) over {self.sequence_length} positions, "
+            f"{self.hidden_dimension} wide"
+        )
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class PatchTokenizer(Layer):
+    """
+    Group patch_size consecutive positions into one token, or split tokens back into positions.
+
+    (batch, sequence, channels) -> (batch, sequence / patch_size, patch_size * channels), each token holding its
+    patch's positions in order. inverse=True is the opposite reshape. The two directions are each other's backward,
+    and there are no parameters: put a FullyConnectedLayer after the tokenizer to embed the patches, and before the
+    inverse to project back to patch_size * channels.
+
+    Patchifying consumes the padding mask, since the sequence axis shrinks; the inverse restores it and zeroes
+    the padded positions.
+
+    Input shape: (batch, sequence, channels), sequence a multiple of patch_size
+    Output shape: (batch, sequence / patch_size, patch_size * channels)
+    """
+    cache_names = ("token_mask",)
+
+    def __init__(self, patch_size: int, inverse: bool = False):
+        """
+        Parameters
+        ----------
+        patch_size : positions per token
+        inverse : split tokens of width patch_size * channels back into patch_size positions each
+        """
+        super().__init__()
+        assert patch_size >= 1, f"patch_size must be at least 1, got {patch_size}"
+        self.patch_size = patch_size
+        self.inverse = inverse
+        self.consumes_mask = not inverse
+        self.restores_mask = inverse
+        self.preserves_shape = False
+        self.declare_shapes(inputs=(ANY_SHAPE,), outputs=(ANY_SHAPE,))
+
+    def infer_output_shapes(self, input_shapes: tuple[tuple, ...]) -> tuple[tuple, ...]:
+        shape = input_shapes[0]
+        width = shape[-1]
+        if width is None:
+            return (ANY_SHAPE,)
+        new_width = width // self.patch_size if self.inverse else width * self.patch_size
+        if len(shape) == 1:
+            return ((new_width,),)
+        length = shape[-2]
+        if length is not None:
+            length = length * self.patch_size if self.inverse else length // self.patch_size
+        return ((length, new_width),)
+
+    def regroup(self, values: NDArray, inverse: bool) -> NDArray:
+        batch, length, width = values.shape
+        if inverse:
+            assert width % self.patch_size == 0, f"width {width} must be a multiple of patch_size {self.patch_size}"
+            return values.reshape(batch, length * self.patch_size, width // self.patch_size)
+        assert length % self.patch_size == 0, f"sequence {length} must be a multiple of patch_size {self.patch_size}"
+        return values.reshape(batch, length // self.patch_size, width * self.patch_size)
+
+    def forward(self, incoming_x: NDArray, mask: Optional[NDArray] = None) -> NDArray:
+        """
+        Parameters
+        ----------
+        incoming_x : (batch, sequence, channels); (batch, tokens, patch_size * channels) when inverse
+        mask : (batch, positions), only read when inverse: 1 for a real position and 0 for padding
+        """
+        assert incoming_x.ndim == 3, f"expected (batch, sequence, channels), got {incoming_x.shape}"
+        output = self.regroup(incoming_x, self.inverse)
+        token_mask = None
+        if self.inverse and mask is not None:
+            assert mask.shape == output.shape[:2], (
+                f"mask shape {mask.shape} must match the output's (batch, sequence) axes {output.shape[:2]}"
+            )
+            token_mask = mask[..., None].astype(output.dtype)
+            output = output * token_mask
+        if self.training:
+            self.token_mask = token_mask
+        return output
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        if self.inverse and self.token_mask is not None:
+            incoming_grad = incoming_grad * self.token_mask
+        return self.regroup(incoming_grad, not self.inverse)
+
+    def __str__(self):
+        return f"PatchTokenizer, patch size {self.patch_size}{', inverse' if self.inverse else ''}"
 
     def __repr__(self):
         return self.__str__()
@@ -380,14 +512,39 @@ class ShiftRight(Layer):
         return self.__str__()
 
 
+class FlattenLayer(Layer):
+    """
+    Flattens every axis after the batch axis into one, so a dense layer sees each sample as a single vector. The
+    gradient is reshaped back on the way back
+
+    *Has no learnable parameters*
+
+    Input shape: (batch, ..., hidden)
+    Output shape: (batch, product of the trailing axes)
+    """
+    preserves_shape = False
+    cache_names = ("in_shape",)
+
+    def __init__(self):
+        super().__init__()
+        self.declare_shapes(inputs=((None, None),), outputs=((None,),))
+
+    def forward(self, incoming_x: NDArray) -> NDArray:
+        if self.training:
+            self.in_shape = incoming_x.shape
+        return incoming_x.reshape(incoming_x.shape[0], -1)
+
+    def backward(self, incoming_grad: NDArray) -> NDArray:
+        return incoming_grad.reshape(self.in_shape)
+
+
 class MaskGather(Layer):
     """
-    Selects specific positions out of a (batch, sequence, hidden) tensor for a downstream head to run on, and
-    scatters the gradient back into the full shape on the way back. No learnable parameters.
+    Selects specific positions out of a (batch, sequence, hidden) for a downstream head to run on, and
+    sends the gradient back into the full shape on the way back
 
     Input shape: (batch, sequence, hidden)
-    Output shape: (num_selected, hidden), flattened across batch and sequence, since a downstream head only needs
-    a bag of vectors, not which row or position each one came from
+    Output shape: (num_selected, hidden), flattened across sequence and hidden into -1
     """
     preserves_shape = False
     cache_names = ("select_mask", "in_shape")
@@ -402,8 +559,7 @@ class MaskGather(Layer):
         ----------
         incoming_x : (batch, sequence, hidden)
         mask : (batch, sequence) or (batch, sequence, 1) attention mask
-        target_mask : (batch, sequence) or (batch, sequence, 1) bool or 0-1, which positions to pass forward
-            (for training tasks like MLM); None keeps everything
+        target_mask : (batch, sequence) or (batch, sequence, 1) bool or 0-1
 
         Returns
         -------

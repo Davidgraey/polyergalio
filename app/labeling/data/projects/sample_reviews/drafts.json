@@ -1,0 +1,11 @@
+{
+  "sentiment::r01": {
+    "ts": "2026-10-30T18:21:54.013+00:00",
+    "value": {
+      "confidence": 1.0,
+      "value": {
+        "label": "neutral"
+      }
+    }
+  }
+}

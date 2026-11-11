@@ -2,7 +2,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial.distance import cdist, pdist
 from polyergalio.utilities import preformat_expected_shapes
-from polyergalio.models.constants import EPSILON
+from polyergalio.models.constants import EPSILON, GLOBAL_DTYPE
+
 
 
 ########### DISTANCES ###########
@@ -35,8 +36,33 @@ def euclidian_distance(x: NDArray, y: NDArray) -> NDArray:
     :return:
     """
     x, y = preformat_expected_shapes(x, y)
+    if x.ndim == 3 and x.shape[1] == 1 and y.ndim == 2:
+        return pairwise_euclidian_distance(x[:, 0, :], y)
     return np.sqrt(np.sum((x - y) ** 2, axis=-1))  # + EPSILON
     # return cdist(x, y, metric='euclidean')
+
+
+def pairwise_euclidian_distance(x: NDArray, y: NDArray) -> NDArray:
+    """
+    Euclidean distance between every row of x and every row of y, from the expansion
+    |x - y|^2 = |x|^2 - 2 x.y + |y|^2 so memory is (N, M) rather than (N, M, D).
+
+    Parameters
+    ----------
+    x : (N, D) rows
+    y : (M, D) rows
+
+    Returns
+    -------
+    (N, M) distances
+    """
+    x = np.asarray(x, dtype=GLOBAL_DTYPE)
+    y = np.asarray(y, dtype=GLOBAL_DTYPE)
+    center = y.mean(axis=0)
+    x = x - center
+    y = y - center
+    squared = np.sum(x**2, axis=1, keepdims=True) - 2.0 * x @ y.T + np.sum(y**2, axis=1)
+    return np.sqrt(np.maximum(squared, 0.0))
 
 
 def norm_euclidian_distance(x: NDArray, y: NDArray) -> NDArray:
@@ -91,7 +117,7 @@ def cosine_similarity(x: NDArray, y: NDArray) -> NDArray:
     """
     requires numpy v1.7+ for 'where' in np.divide()
     numpy array is [samples, dimension_1, dimension_2, ...]
-    we will compute cosine distance per samples dimension
+    we will compute cosine distance per samples input_dimension
         input array is [500, 5] - output will be [500, 1]
     :param x:
     :param y:

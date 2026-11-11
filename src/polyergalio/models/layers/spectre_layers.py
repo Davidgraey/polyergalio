@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 
 from polyergalio.base_model import resolve_data_types
 from polyergalio.models.layers.attention_heads import (
+    MODRELU_BIAS,
     HeadGate,
     HeadProjection,
     align_gate,
@@ -19,9 +20,6 @@ from polyergalio.models.layers.attention_heads import (
 )
 from polyergalio.models.layers.basic_layers import Layer, PersistentMemory
 from polyergalio.models.layers.wavelet_layers import WaveletRefinementModule
-
-# LayerNorm epsilon for the pooled query within the Head
-DESCRIPTOR_EPS = 1e-8
 
 # -------------    adjoints of the real FFT pair    ----------------
 def rfft_adjoint(grad_freq: NDArray, sequence_length: int, axis: int = 1) -> NDArray:
@@ -47,7 +45,7 @@ def irfft_adjoint(grad_time: NDArray,
 
 class PrefixFFTCache:
     """
-    Batched, hidden_dim-wide Prefix-FFT cache shared by all heads of a
+    Batched, hidden_dim-wide Prefix-FFT cache shared by all model_heads of a
     SpectreDecoderAttention layer.
 
     Ring layout (per batch element), length `max_sequence = memory_tokens + window
@@ -133,7 +131,7 @@ class PrefixFFTCache:
         """
         One-shot cache initialisation
 
-        query, value : (batch, seq, hidden_dim), already re-merged after heads.
+        query, value : (batch, seq, hidden_dim), already re-merged after model_heads.
         mask : (batch, seq) optional validity mask to identify.
 
         single RFFT seeds the full cache.
@@ -175,7 +173,7 @@ class PrefixFFTCache:
         """
         append one token to the sliding window
 
-        query_t, value_t : (batch, hidden_dim), already re-merged after heads.
+        query_t, value_t : (batch, hidden_dim), already re-merged after model_heads.
         valid : bool or (batch,) bool array, for padded/finished sequences
 
         returns the ring's positional `slot` the new token was written to, so callers can
@@ -231,7 +229,7 @@ class PrefixFFTCache:
     def reconstruct(self, gate: np.ndarray, spectrum: Optional[np.ndarray] = None) -> np.ndarray:
         """
         gate : (batch, n_freq, hidden_dim) complex spectral gate, already
-            broadcast/merged across heads (needs to be aligned before reconstruct)
+            broadcast/merged across model_heads (needs to be aligned before reconstruct)
 
         Returns the full ring-ordered reconstruction, shape (batch, max_sequence, hidden_dim).
         Slot ordering, not chronological ordering.
@@ -286,7 +284,7 @@ class SpectreAttention(Layer):
 
     Per-head parts live in their own layers: query_projection and value_projection are each head's
     independent W(q), W(v) (HeadProjection), and head_gate builds each head's spectral gate from its
-    pooled queries (HeadGate). This layer owns what is shared across heads: the persistent memory,
+    pooled queries (HeadGate). This layer owns what is shared across model_heads: the persistent memory,
     masking and pooling, the FFT mixing, and the optional WRM.
     """
 
@@ -301,8 +299,7 @@ class SpectreAttention(Layer):
         num_heads: int = 1,
         band_radius: int = 0,
         memory_tokens: int = 0,
-        causal_decode: bool = False,
-        modrelu_bias: float = -0.1,
+        modrelu_bias: float = MODRELU_BIAS,
         use_wrm: bool = True,
         use_positional_phase: bool = True,
         gate_dimension: Optional[int] = None,
@@ -320,7 +317,7 @@ class SpectreAttention(Layer):
             0 disables it.
         gate_dimension : width of each head's gate MLP hidden layer, head_dim if None
         use_positional_phase: bool - used in decoding process to appply positional influence
-        gate_dimension: Optional int - for gate's hidden dimension (if different from hidden_dimension)
+        gate_dimension: Optional int - for gate's hidden input_dimension (if different from hidden_dimension)
         """
         assert memory_tokens >= 0, "memory_tokens must be zero or positive"
         assert num_heads >= 1, f"num_heads must be at least 1, got {num_heads}"
@@ -337,15 +334,12 @@ class SpectreAttention(Layer):
         self.head_dimension: int = hidden_dimension // num_heads
         self.band_radius = band_radius
         self.memory_tokens: int = memory_tokens
-        self.causal_decode: bool = causal_decode
         self.modrelu_bias: float = modrelu_bias
         self.use_wrm = use_wrm
         self.use_positional_phase: bool = use_positional_phase
         self.gate_dimension = gate_dimension
 
-        # sequence axis is pinned, not wildcarded: fft_length / num_frequencies
-        # are sized off sequence_length at construction time, so a mismatched
-        # sequence length here is a real, catchable error, not a free axis.
+        # sequence axis is pinned: fft_length / num_frequencies
         self.declare_shapes(
             inputs=((self.sequence_length, self.hidden_dimension),),
             outputs=((self.sequence_length, self.hidden_dimension),),
@@ -384,13 +378,7 @@ class SpectreAttention(Layer):
         self.parameter_names = names
         self.zero_gradients()
 
-    def forward(
-        self,
-        input_data: NDArray,
-        mask: Optional[NDArray] = None,
-        training_now: Optional[bool] = None,
-    ):
-        training_now = self.training if training_now is None else training_now
+    def forward(self, input_data: NDArray, mask: Optional[NDArray] = None):
         assert input_data.ndim == 3
         assert input_data.shape[1] == self.sequence_length
         assert input_data.shape[2] == self.hidden_dimension
@@ -423,8 +411,7 @@ class SpectreAttention(Layer):
         total_counts = counts + memory_tokens
         seq_sum = (query_forward * mask_column).sum(axis=1) + query_all[:, :memory_tokens].sum(axis=1)
 
-        gate = self.head_gate.forward(seq_sum / total_counts, keep_descriptor=self.use_wrm)
-        descriptor = self.head_gate.descriptor if self.use_wrm else None
+        gate = self.head_gate.forward(seq_sum / total_counts)
 
         value_transform = np.fft.rfft(value_masked, n=combined_length, axis=1)
         values_gated = split_heads(value_transform, self.num_heads) * align_gate(gate)
@@ -434,8 +421,12 @@ class SpectreAttention(Layer):
         if self.training:
             self.mask, self.total_counts, self.combined_length = mask, total_counts, combined_length
             self.gate, self.value_transform = gate, value_transform
+
+        # post-forward
         if self.use_wrm:
-            output = self.wrm.forward(output, descriptor, training_now=training_now)
+            descriptor = self.head_gate.descriptor
+            output = self.wrm.forward(output, descriptor, training_now=self.training)
+
         return output
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
@@ -477,7 +468,7 @@ class SpectreAttention(Layer):
         memory = f", {self.memory_tokens} memory slots" if self.memory_tokens else ""
         return (
             f"SPECTRE mixer, sequence {self.sequence_length}, "
-            f"hidden {self.hidden_dimension}, {self.num_heads} heads{band}{memory}"
+            f"hidden {self.hidden_dimension}, {self.num_heads} model_heads{band}{memory}"
         )
 
     def __repr__(self):
@@ -489,23 +480,25 @@ class SpectreDecoderAttention(SpectreAttention):
     """
     Causal, autoregressive companion to `SpectreAttention`.
 
-    Training and decoding compute the same function. Position p reads only values at positions <= p
-    (a causal linear convolution, not the encoder's circular one), filtered by a gate built from the
-    pooled query of its chunk's first token and everything before it
+    Training and decoding compute the same function.
+    Sequence position p reads only values at positions <= p
+    p is filtered by a gate built from the pooled query of its chunk's first token and everything before it
 
         anchor(p) = (p // chunk_size) * chunk_size
         gate(p) = gate from mean query over memory + tokens <= anchor(p)
         y_p = sum_{j <= p} h_anchor(p)[p - j] v_j,  h = irfft(gate)
 
     chunk_size=1 refreshes the gate at every token -- exact per-prefix gating at a very high cost.
+
     Increasing the chunk size scales rapidly.
+
     Each chunk's gate lags its tokens by up to chunk_size - 1
 
     Usage
     -----
         # train decoder layer
-        layer = SpectreDecoderAttention(sequence_length=..., hidden_dim=..., num_heads=..., chunk_size=...)
-        out = layer.forward(batch_x, mask=batch_mask, training_now=True)
+        layer = SpectreDecoderAttention(sequence_length=..., hidden_dimension=..., num_heads=..., chunk_size=...)
+        out = layer.forward(batch_x, mask=batch_mask)
         layer.backward(delta_out)
 
         # then for decoding generation --
@@ -515,7 +508,7 @@ class SpectreDecoderAttention(SpectreAttention):
 
 
     use_wrm is not supported: the Wavelet Refinement Module needs the whole window at once, but
-    decoding produces one token at a time. It's kept here to match the main Spectre API sig
+    decoding produces one token at a time. It's num_kept here to match the main Spectre API sig
     """
 
     registry_name = "SPECTREDecoderAttention"
@@ -528,8 +521,7 @@ class SpectreDecoderAttention(SpectreAttention):
         num_heads: int = 1,
         band_radius: int = 0,
         memory_tokens: int = 0,
-        causal_decode: bool = False,
-        modrelu_bias: float = -0.1,
+        modrelu_bias: float = MODRELU_BIAS,
         use_wrm: bool = False,
         use_positional_phase: bool = True,
         gate_dimension: Optional[int] = None,
@@ -553,7 +545,6 @@ class SpectreDecoderAttention(SpectreAttention):
             num_heads=num_heads,
             band_radius=band_radius,
             memory_tokens=memory_tokens,
-            causal_decode=causal_decode,
             modrelu_bias=modrelu_bias,
             use_wrm=use_wrm,
             use_positional_phase=use_positional_phase,
@@ -568,14 +559,12 @@ class SpectreDecoderAttention(SpectreAttention):
         self,
         input_data: NDArray,
         mask: Optional[NDArray] = None,
-        training_now: Optional[bool] = None,
     ) -> NDArray:
         """
         Parameters
         ----------
         input_data : (batch, sequence_length, hidden_dim)
         mask : (batch, sequence_length), 1 for a real token and 0 for padding
-        training_now : unused, accepted for the graph
 
         Returns
         -------
@@ -609,7 +598,7 @@ class SpectreDecoderAttention(SpectreAttention):
         pooled = (prefix_queries + memory_query_sum) / chunk_counts
 
         num_chunks = anchors.size
-        gate = self.head_gate.forward(pooled.reshape(batch * num_chunks, self.hidden_dimension), keep_descriptor=False)
+        gate = self.head_gate.forward(pooled.reshape(batch * num_chunks, self.hidden_dimension))
 
         padded_length = 2 * combined_length
         value_transform = np.fft.rfft(values, n=padded_length, axis=1)
@@ -701,7 +690,7 @@ class SpectreDecoderAttention(SpectreAttention):
         -------
         (batch, num_frequencies, hidden_dim) activated gate, each head's gate repeated over its channels
         """
-        gate = self.head_gate.forward(query_sum / total_counts, keep_descriptor=False)
+        gate = self.head_gate.forward(query_sum / total_counts)
         batch = gate.shape[0]
         return merge_heads(
             np.broadcast_to(align_gate(gate), (batch, self.num_frequencies, self.num_heads, self.head_dimension))
@@ -769,20 +758,63 @@ class SpectreDecoderAttention(SpectreAttention):
             self.chunk_gate = self.gate_from_pooled_sum(self.cache.sum_query, total_counts)
         return self.read_slot(self.chunk_gate, slot)
 
+    def decode_error(self, input_data: NDArray, mask: Optional[NDArray] = None) -> float:
+        """
+        Largest difference between the training forward and cached stepping over the same sequence.
+
+        The decode cache is left as it was.
+
+        Parameters
+        ----------
+        input_data : (batch, sequence_length, hidden_dim)
+        mask : (batch, sequence_length), 1 for a real token and 0 for padding; padded positions are not compared
+
+        Returns
+        -------
+        maximum absolute difference over the real positions, 0.0 if there are none
+        """
+        batch, length, _ = input_data.shape
+        valid = np.ones((batch, length), dtype=bool) if mask is None else np.asarray(mask).astype(bool)
+        if not valid.any():
+            return 0.0
+
+        full = self.forward(input_data, mask=mask)
+        saved = self.cache, self.chunk_gate
+        try:
+            self.reset_cache(batch)
+            stepped = np.stack([self.decode_step(input_data[:, t], valid=valid[:, t]) for t in range(length)], axis=1)
+        finally:
+            self.cache, self.chunk_gate = saved
+        return float(np.abs(stepped - full)[valid].max())
+
+
+def summary_readout(num_summaries: int, num_heads: int, sequence_length: int) -> NDArray:
+    """
+    Returns
+    -------
+    (num_summaries, num_heads, sequence_length) readout in which summary k averages the k-th of num_summaries
+    consecutive blocks of positions; one summary averages them all
+    """
+    readout = np.zeros((num_summaries, num_heads, sequence_length))
+    for summary, block in enumerate(np.array_split(np.arange(sequence_length), num_summaries)):
+        readout[summary][:, block] = sequence_length / len(block)
+    return readout
+
 
 class SpectrePooledAttention(SpectreAttention):
     """
-    SPECTRE mixing that returns a single summary of the sequence instead of a mixed sequence.
+    SPECTRE mixing that returns num_summaries summaries of the sequence instead of a mixed sequence.
 
-    Mixing is y_h = irfft(gate_h * rfft(v_h)) along the sequence, and the layer returns a masked weighted mean of y
+    Mixing is y_h = irfft(gate_h * rfft(v_h)) along the sequence, and each summary is a masked weighted mean of y
         over the real positions:
 
-        out[b, h] = sum mask[b, t] * readout[h, t] * y[b, t, h] / n_b
+        out[b, k, h] = sum mask[b, t] * readout[k, h, t] * y[b, t, h] / n_b
 
-    The mean is taken through the adjoint of the convolution.
+    All summaries share one gate and one set of values; only the readout differs. The mean is taken through the
+    adjoint of the convolution.
 
     Input shape: (batch, sequence_length, hidden_dimension)
-    Output shape: (batch, 1, hidden_dimension)
+    Output shape: (batch, num_summaries, hidden_dimension)
     """
 
     registry_name = "SPECTREPooledAttention"
@@ -797,36 +829,42 @@ class SpectrePooledAttention(SpectreAttention):
         num_heads: int = 1,
         band_radius: int = 0,
         memory_tokens: int = 0,
-        modrelu_bias: float = -0.1,
+        modrelu_bias: float = MODRELU_BIAS,
         gate_dimension: Optional[int] = None,
+        num_latent_projections: int = 1,
     ):
         """
         Parameters
         ----------
         sequence_length : maximum of tokens per sample, the axis the FFT runs across
-        hidden_dimension : trailing dimension of the input
+        hidden_dimension : trailing input_dimension of the input
         num_heads : gates learned in parallel, each over its own slice of the channel axis
         band_radius : radius of the optional Toeplitz band update on the gate, 0 disables it
         memory_tokens : size of an optional learned, persistent context bank, 0 disables it
         modrelu_bias : starting modReLU bias, learned per head and frequency
         gate_dimension : width of each head's gate hidden layer, head_dim if None
+        num_latent_projections : number of mixed sequence, between 1 and sequence_length; each starts as the mean of
+            its own block of positions
         """
+        assert 1 <= num_latent_projections <= sequence_length, (
+            f"num_latent_projections must be between 1 and sequence_length {sequence_length}, got {num_latent_projections}"
+        )
         super().__init__(
             sequence_length=sequence_length,
             hidden_dimension=hidden_dimension,
             num_heads=num_heads,
             band_radius=band_radius,
             memory_tokens=memory_tokens,
-            causal_decode=False,
             modrelu_bias=modrelu_bias,
             use_wrm=False,
             use_positional_phase=False,
             gate_dimension=gate_dimension,
         )
+        self.num_latent_projections = num_latent_projections
         self.declare_shapes(
-            inputs=((sequence_length, hidden_dimension),), outputs=((1, hidden_dimension),)
+            inputs=((sequence_length, hidden_dimension),), outputs=((num_latent_projections, hidden_dimension),)
         )
-        self.readout = np.ones((num_heads, sequence_length))
+        self.readout = summary_readout(num_latent_projections, num_heads, sequence_length)
         self.parameter_names += ("readout",)
         self.zero_gradients()
 
@@ -842,7 +880,7 @@ class SpectrePooledAttention(SpectreAttention):
 
         Returns
         -------
-        (batch, 1, hidden_dimension)
+        (batch, num_latent_projections, hidden_dimension)
         """
         assert input_data.ndim == 3
         assert input_data.shape[1] == self.sequence_length
@@ -871,31 +909,37 @@ class SpectrePooledAttention(SpectreAttention):
 
         total_counts = counts + memory_tokens
         seq_sum = (query_all[:, memory_tokens:] * mask_column).sum(axis=1) + query_all[:, :memory_tokens].sum(axis=1)
-        gate = self.head_gate.forward(seq_sum / total_counts, keep_descriptor=False)
+        gate = self.head_gate.forward(seq_sum / total_counts)
 
         pool_spectrum = irfft_adjoint(self.readout_weights(mask, counts, combined_length), combined_length, axis=1)
-        spectrum = np.conj(align_gate(gate)[..., 0]) * pool_spectrum
+        spectrum = np.conj(align_gate(gate)) * pool_spectrum
         position_weights = rfft_adjoint(spectrum, combined_length, axis=1)
 
         values = split_heads(value_masked, self.num_heads)
-        pooled = np.einsum("bsh,bshc->bhc", position_weights, values)
+        # TODO - optimize einsum here
+        pooled = np.einsum("bshk,bshc->bkhc", position_weights, values)
+
         if self.training:
             self.mask, self.counts, self.total_counts, self.combined_length = mask, counts, total_counts, combined_length
             self.gate, self.pool_spectrum, self.value_masked = gate, pool_spectrum, value_masked
-        return merge_heads(pooled)[:, None, :]
+
+        return merge_heads(pooled)
 
     def readout_weights(self, mask: NDArray, counts: NDArray, combined_length: int) -> NDArray:
-        """(batch, combined_length, heads) readout over the combined sequence, zero on memory slots and padding"""
-        weights = np.zeros((mask.shape[0], combined_length, self.num_heads), dtype=mask.dtype)
-        masked = mask[:, :, None] * self.readout.T[None, :, :]
-        weights[:, self.memory_tokens:] = masked / counts[..., None]
+        """
+        (batch, combined_length, model_heads, latent_projections) readout over the combined sequence, zero on memory slots
+        and padding
+        """
+        weights = np.zeros((mask.shape[0], combined_length, self.num_heads, self.num_latent_projections), dtype=mask.dtype)
+        masked = mask[:, :, None, None] * self.readout.transpose(2, 1, 0)[None]
+        weights[:, self.memory_tokens:] = masked / counts[:, :, None, None]
         return weights
 
     def backward(self, incoming_gradient: NDArray) -> NDArray:
         """
         Parameters
         ----------
-        incoming_gradient : (batch, 1, hidden_dimension)
+        incoming_gradient : (batch, num_latent_projections, hidden_dimension)
 
         Returns
         -------
@@ -904,29 +948,29 @@ class SpectrePooledAttention(SpectreAttention):
         memory_tokens = self.memory_tokens
         mask_column = self.mask[..., None]
 
-        pooled_gradient = split_heads(incoming_gradient[:, 0, :], self.num_heads)
+        pooled_gradient = split_heads(incoming_gradient, self.num_heads)
 
-        spectrum = np.conj(align_gate(self.gate)[..., 0]) * self.pool_spectrum
+        spectrum = np.conj(align_gate(self.gate)) * self.pool_spectrum
         position_weights = rfft_adjoint(spectrum, self.combined_length, axis=1)
         values = split_heads(self.value_masked, self.num_heads)
 
-        value_gradient = position_weights[..., None] * pooled_gradient[:, None, :, :]
+        value_gradient = np.einsum("bshk,bkhc->bshc", position_weights, pooled_gradient)
         value_gradient[:, memory_tokens:] *= mask_column[..., None]
         # (batch, seq, head, combined)
-        scalar_gradient = np.einsum("bshc,bhc->bsh", values, pooled_gradient)
+        scalar_gradient = np.einsum("bshc,bkhc->bshk", values, pooled_gradient)
         scalar_spectrum = np.fft.rfft(scalar_gradient, n=self.combined_length, axis=1)
 
-        gate_gradient = np.transpose(self.pool_spectrum * np.conj(scalar_spectrum), (0, 2, 1))
+        gate_gradient = np.transpose((self.pool_spectrum * np.conj(scalar_spectrum)).sum(axis=-1), (0, 2, 1))
         pooled_query_gradient = self.head_gate.backward(gate_gradient, None)
 
         response = np.fft.irfft(
-            np.transpose(self.gate, axes=(0, 2, 1)) * scalar_spectrum,
+            align_gate(self.gate) * scalar_spectrum,
             n=self.combined_length,
             axis=1
         )
-        readout_signal = response[:, memory_tokens:] * self.mask[..., None] / self.counts[..., None]
+        readout_signal = response[:, memory_tokens:] * self.mask[..., None, None] / self.counts[..., None, None]
 
-        self.gradient_readout = readout_signal.sum(axis=0).T
+        self.gradient_readout = readout_signal.sum(axis=0).transpose(2, 1, 0)
 
         per_token = pooled_query_gradient[:, None, :] / self.total_counts[..., None]
         query_gradient = np.broadcast_to(per_token, (*self.mask.shape[:1], self.combined_length, self.hidden_dimension)).copy()
@@ -944,7 +988,8 @@ class SpectrePooledAttention(SpectreAttention):
     def __str__(self):
         band = f", band radius {self.band_radius}" if self.band_radius else ""
         memory = f", {self.memory_tokens} memory slots" if self.memory_tokens else ""
+        summaries = f", {self.num_latent_projections} summaries" if self.num_latent_projections > 1 else ""
         return (
             f"SPECTRE pooled mixer, sequence {self.sequence_length}, "
-            f"hidden {self.hidden_dimension}, {self.num_heads} heads{band}{memory}"
+            f"hidden {self.hidden_dimension}, {self.num_heads} model_heads{band}{memory}{summaries}"
         )

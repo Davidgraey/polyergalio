@@ -43,7 +43,7 @@ class LatentAttention(Layer):
 
         out = W_O y
 
-    query_head is a LatentHead for q. kv_head is one LatentHead with 2 * num_heads heads on the shared c_KV: the first
+    query_head is a LatentHead for q. kv_head is one LatentHead with 2 * num_heads model_heads on the shared c_KV: the first
     num_heads outputs are the keys and the rest the values. Padded keys get zero attention weight.
 
     There is no positional signal; apply positions upstream when order matters.
@@ -67,7 +67,7 @@ class LatentAttention(Layer):
         Parameters
         ----------
         hidden_dimension : channel width of the input and output
-        num_heads : attention heads, each reading its own slice of the up-projected queries, keys and values
+        num_heads : attention model_heads, each reading its own slice of the up-projected queries, keys and values
         kv_rank : width of the key/value latent c_KV
         query_rank : width of the query latent c_Q, kv_rank if None
         head_dimension : width of each head, hidden_dimension // num_heads if None
@@ -150,7 +150,7 @@ class LatentAttention(Layer):
 
     def __str__(self):
         return (
-            f"{self.__class__.__name__}, hidden {self.hidden_dimension}, {self.num_heads} heads of {self.head_dimension}, "
+            f"{self.__class__.__name__}, hidden {self.hidden_dimension}, {self.num_heads} model_heads of {self.head_dimension}, "
             f"kv rank {self.kv_rank}, query rank {self.query_rank}"
         )
 

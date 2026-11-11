@@ -100,6 +100,61 @@ def sequence_exact_match(predicted_ids: NDArray, target_ids: NDArray, mask: Opti
     return float(row_matches.all(axis=-1).mean())
 
 
+def make_clusters(num_points: int,
+                  rng: np.random.Generator,
+                  centres: Optional[NDArray] = None,
+                  spread: float = 0.15,
+                  ) -> tuple[NDArray, NDArray]:
+    """
+    Parameters
+    ----------
+    num_points : number of points
+    rng : source of randomness
+    centres : (num_clusters, dimension) cluster centres; three in 2-D by default
+    spread : standard deviation of every cluster
+
+    Returns
+    -------
+    points around the centres, (num_points, dimension), and the cluster of each, (num_points,)
+    """
+    centres = np.array([[-1.0, 0.0], [1.0, 0.0], [0.0, 1.5]]) if centres is None else np.asarray(centres)
+    labels = rng.integers(0, len(centres), num_points)
+    return centres[labels] + spread * rng.normal(size=(num_points, centres.shape[1])), labels
+
+
+def make_pinwheel(num_points: int,
+                  rng: np.random.Generator,
+                  num_arcs: int = 5,
+                  radial_spread: float = 0.3,
+                  tangential_spread: float = 0.05,
+                  rate: float = 0.25,
+                  ) -> tuple[NDArray, NDArray]:
+    """
+    Points on the arcs of num_arcs circles (Johnson et al. 2016), the GMVAE paper's synthetic data.
+
+    Parameters
+    ----------
+    num_points : number of points
+    rng : source of randomness
+    num_arcs : number of arcs
+    radial_spread : standard deviation along each arc's radius
+    tangential_spread : standard deviation across each arc
+    rate : how far each arc curls with distance from the centre
+
+    Returns
+    -------
+    points, (num_points, 2), and the arc of each, (num_points,)
+    """
+    labels = rng.integers(0, num_arcs, num_points)
+    features = rng.normal(size=(num_points, 2)) * np.array([radial_spread, tangential_spread])
+    features[:, 0] += 1.0
+    angles = 2.0 * np.pi * labels / num_arcs + rate * np.exp(features[:, 0])
+    cosines, sines = np.cos(angles), np.sin(angles)
+    points = np.stack([features[:, 0] * cosines + features[:, 1] * sines,
+                       -features[:, 0] * sines + features[:, 1] * cosines], axis=1)
+    return points, labels
+
+
 @dataclass
 class GenConfig:
     num_samples: int = 1000
@@ -109,7 +164,7 @@ class GenConfig:
     num_clusters: int = 3  # for clustering
     outlier_fraction: float = 0.0  # for clustering: fraction of samples that are uniform noise, labeled -1
     cluster_shape: str = "gaussian"  # for clustering: a CLUSTER_SHAPES name, or a sequence of names cycled across clusters
-    variance_jitter: float = 0.0  # for clustering: randomizes each cluster's spread per cluster and per dimension, 0 = flat noise_scale
+    variance_jitter: float = 0.0  # for clustering: randomizes each cluster's spread per cluster and per input_dimension, 0 = flat noise_scale
     separation: float = 0.0  # for clustering: minimum centroid distance as a multiple of noise_scale, 0 disables
     imbalance: float = 0.0  # for clustering: >0 skews cluster sizes via Dirichlet concentration 1/imbalance
     ensure_label: bool = True  # for multilabel: ensure at least one sample for a class
@@ -372,10 +427,10 @@ class RandomDatasetGenerator:
 
     def _cluster_scale(self, base_scale: float, dims: int, variance_jitter: float) -> NDArray:
         """
-        Per-dimension noise scale for one cluster: `base_scale` perturbed by
-        an overall per-cluster factor and an independent per-dimension
+        Per-input_dimension noise scale for one cluster: `base_scale` perturbed by
+        an overall per-cluster factor and an independent per-input_dimension
         factor, both drawn from [1 - variance_jitter, 1 + variance_jitter].
-        variance_jitter=0 reproduces a flat `base_scale` in every dimension.
+        variance_jitter=0 reproduces a flat `base_scale` in every input_dimension.
         """
         if variance_jitter <= 0:
             return np.full(dims, base_scale)
@@ -390,7 +445,7 @@ class RandomDatasetGenerator:
         Draw k centroids uniformly in a [-3, 3]^dims box. When
         min_separation > 0, a candidate closer than that to any
         already-placed centroid is redrawn, up to 200 tries, after which the
-        last candidate is kept rather than looping forever on an infeasible
+        last candidate is num_kept rather than looping forever on an infeasible
         request (too many clusters/too large a separation for the box).
         """
         box = 3.0
@@ -440,7 +495,7 @@ class RandomDatasetGenerator:
         via rejection sampling against the same membership test the image
         generator's shapes use. It can be one name for every cluster, or a
         sequence cycled across clusters. `variance_jitter` randomizes each
-        cluster's spread per cluster and per dimension. `separation` sets a
+        cluster's spread per cluster and per input_dimension. `separation` sets a
         minimum centroid distance, as a multiple of noise_scale. `imbalance`
         skews cluster sizes instead of splitting them evenly. Outliers are
         labeled -1 and scattered over the data's own bounding box. Every
@@ -908,7 +963,7 @@ class RandomDatasetGenerator:
         if config.num_choices < 2 or config.num_levels < 2:
             raise ValueError("num_choices and num_levels must each be at least 2")
         if config.vocab_size <= config.num_choices:
-            raise ValueError("vocab_size must exceed num_choices so non-answers can be kept out of the state")
+            raise ValueError("vocab_size must exceed num_choices so non-answers can be num_kept out of the state")
 
         words = self._decision_words(config)
         items = np.arange(config.vocab_size) + TOKEN_OFFSET + len(words)

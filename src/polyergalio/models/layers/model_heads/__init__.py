@@ -1,11 +1,11 @@
 
-from polyergalio.models.layers.heads.prediction_heads import (
+from polyergalio.models.layers.model_heads.prediction_heads import (
     LowRankBottleNeck,
     DecisionHead
 )
 
 # TODO: move this elsewhere
-from polyergalio.models.layers.heads.decision_utilities import (
+from polyergalio.models.layers.model_heads.decision_utilities import (
     calibrated_probabilities,
     fit_temperatures,
     row_buckets,

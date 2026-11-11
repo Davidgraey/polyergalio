@@ -37,7 +37,17 @@ from polyergalio.base_model import BasalEstimator
 from polyergalio.composite_model import Composite
 
 MEGABYTE = 1e6
+MICROSECOND = 1e6
 PHASES = ("forward", "backward")
+
+
+def batch_size(args: tuple) -> Optional[int]:
+    """Size of the zeroth axis of the first argument that has one, else None."""
+    for value in args:
+        shape = getattr(value, "shape", None)
+        if shape:
+            return shape[0]
+    return None
 
 
 @dataclass
@@ -55,6 +65,7 @@ class Measurement:
         they allocate
     peak_total : each call's peak above the level at entry, including nested measurements, summed over calls
     min_peak, max_peak : smallest and largest single-call peak
+    samples : rows processed, summed over calls; the zeroth-axis size of the call's data argument, when known
     """
     label: str
     calls: int = 0
@@ -66,6 +77,7 @@ class Measurement:
     peak_total: int = 0
     min_peak: int = 0
     max_peak: int = 0
+    samples: int = 0
 
     @property
     def mean_time(self) -> float:
@@ -79,7 +91,12 @@ class Measurement:
     def mean_peak(self) -> float:
         return self.peak_total / self.calls if self.calls else 0.0
 
-    def add(self, elapsed: float, self_elapsed: float, net: int, peak: int) -> None:
+    @property
+    def time_per_sample(self) -> float:
+        """Seconds per row, total_time over samples; 0 when no call reported a sample count."""
+        return self.total_time / self.samples if self.samples else 0.0
+
+    def add(self, elapsed: float, self_elapsed: float, net: int, peak: int, samples: int = 0) -> None:
         """Fold one call into the totals."""
         if self.calls == 0:
             self.min_peak = peak
@@ -92,6 +109,7 @@ class Measurement:
         self.peak_total += peak
         self.min_peak = min(self.min_peak, peak)
         self.max_peak = max(self.max_peak, peak)
+        self.samples += samples
 
 
 @dataclass
@@ -173,8 +191,15 @@ class Profiler:
         self.measurements = {}
 
     @contextmanager
-    def measure(self, label: str) -> Iterator[None]:
-        """Time and memory-profile the enclosed block under a label; blocks can nest."""
+    def measure(self, label: str, samples: Optional[int] = None) -> Iterator[None]:
+        """
+        Time and memory-profile the enclosed block under a label; blocks can nest.
+
+        Parameters
+        ----------
+        samples : rows the block processed, for the report's time-per-sample column; omit when the block has
+            no batch axis or the count is not known
+        """
         temporary = self.track_memory and not tracemalloc.is_tracing()
         if temporary:
             tracemalloc.start()
@@ -204,7 +229,8 @@ class Profiler:
                 parent.peak = max(parent.peak, frame.peak)
 
             self.measurements.setdefault(label, Measurement(label)).add(
-                elapsed, elapsed - frame.child_time, end_bytes - start_bytes, frame.peak - start_bytes
+                elapsed, elapsed - frame.child_time, end_bytes - start_bytes, frame.peak - start_bytes,
+                samples or 0,
             )
             if temporary:
                 tracemalloc.stop()
@@ -241,8 +267,9 @@ class Profiler:
 
         @wraps(func)
         def measured(*args, **kwargs):
+            samples = batch_size(args)
             for _ in range(num_loops):
-                with self.measure(name):
+                with self.measure(name, samples=samples):
                     result = func(*args, **kwargs)
             return result
 
@@ -323,8 +350,9 @@ class Profiler:
         Forward and backward cost per instrumented estimator, largest step first.
 
         step_ms is the mean forward plus the mean backward, share is its fraction of the root's step (the largest
-        step if the root was not instrumented), kept_mb is what forward leaves allocated, and the peaks are above the
-        level at entry.
+        step if the root was not instrumented), kept_mb is what forward leaves allocated, the peaks are above the
+        level at entry, and step_us_sample is step time per row (forward plus backward, over samples), 0 when no
+        call reported a sample count.
         """
         grouped: dict[str, dict[str, Measurement]] = {}
         for label, entry in self.measurements.items():
@@ -341,6 +369,10 @@ class Profiler:
                     "calls": max(entry.calls for entry in phases.values()),
                     "forward_ms": forward.mean_time * 1e3 if forward else 0.0,
                     "backward_ms": backward.mean_time * 1e3 if backward else 0.0,
+                    "step_us_sample": MICROSECOND * (
+                        (forward.time_per_sample if forward else 0.0)
+                        + (backward.time_per_sample if backward else 0.0)
+                    ),
                     "kept_mb": forward.mean_net_bytes / MEGABYTE if forward else 0.0,
                     "forward_peak_mb": forward.mean_peak / MEGABYTE if forward else 0.0,
                     "backward_peak_mb": backward.mean_peak / MEGABYTE if backward else 0.0,
@@ -359,15 +391,15 @@ class Profiler:
         rows = self.node_rows()[:top]
         width = max((len(row["node"]) for row in rows), default=4)
         header = (
-            f"{'node':{width}s} {'calls':>6s} {'fwd ms':>9s} {'bwd ms':>9s} {'step ms':>9s} {'share %':>8s} "
-            f"{'kept MB':>8s} {'fwd MB':>8s} {'bwd MB':>8s}"
+            f"{'node':{width}s} {'calls':>6s} {'fwd ms':>9s} {'bwd ms':>9s} {'step ms':>9s} {'us/sample':>10s} "
+            f"{'share %':>8s} {'num_kept MB':>8s} {'fwd MB':>8s} {'bwd MB':>8s}"
         )
         lines = [header, "-" * len(header)]
         for row in rows:
             lines.append(
                 f"{row['node']:{width}s} {row['calls']:6d} {row['forward_ms']:9.2f} {row['backward_ms']:9.2f} "
-                f"{row['step_ms']:9.2f} {100 * row['share']:8.1f} {row['kept_mb']:8.2f} "
-                f"{row['forward_peak_mb']:8.2f} {row['backward_peak_mb']:8.2f}"
+                f"{row['step_ms']:9.2f} {row['step_us_sample']:10.2f} {100 * row['share']:8.1f} "
+                f"{row['kept_mb']:8.2f} {row['forward_peak_mb']:8.2f} {row['backward_peak_mb']:8.2f}"
             )
         return "\n".join(lines)
 
@@ -375,7 +407,7 @@ class Profiler:
         """Every measurement as a flat dict, ready for a DataFrame; times in seconds, memory in bytes."""
         return [
             {**asdict(entry), "mean_time": entry.mean_time, "mean_net_bytes": entry.mean_net_bytes,
-             "mean_peak": entry.mean_peak}
+             "mean_peak": entry.mean_peak, "time_per_sample": entry.time_per_sample}
             for entry in self.measurements.values()
         ]
 
@@ -397,15 +429,17 @@ class Profiler:
         width = max((len(entry.label) for entry in entries), default=5)
         header = (
             f"{'label':{width}s} {'calls':>6s} {'mean ms':>9s} {'min ms':>9s} {'max ms':>9s} "
-            f"{'self ms':>10s} {'self %':>7s} {'net MB':>8s} {'peak MB':>8s} {'min MB':>8s} {'max MB':>8s}"
+            f"{'self ms':>10s} {'self %':>7s} {'us/sample':>10s} {'net MB':>8s} {'peak MB':>8s} {'min MB':>8s} "
+            f"{'max MB':>8s}"
         )
         lines = [header, "-" * len(header)]
         for entry in entries:
             lines.append(
                 f"{entry.label:{width}s} {entry.calls:6d} {entry.mean_time * 1e3:9.2f} "
                 f"{entry.min_time * 1e3:9.2f} {entry.max_time * 1e3:9.2f} {entry.self_time * 1e3:10.2f} "
-                f"{100 * entry.self_time / total_self:7.1f} {entry.mean_net_bytes / MEGABYTE:8.2f} "
-                f"{entry.mean_peak / MEGABYTE:8.2f} {entry.min_peak / MEGABYTE:8.2f} {entry.max_peak / MEGABYTE:8.2f}"
+                f"{100 * entry.self_time / total_self:7.1f} {entry.time_per_sample * MICROSECOND:10.2f} "
+                f"{entry.mean_net_bytes / MEGABYTE:8.2f} {entry.mean_peak / MEGABYTE:8.2f} "
+                f"{entry.min_peak / MEGABYTE:8.2f} {entry.max_peak / MEGABYTE:8.2f}"
             )
         return "\n".join(lines)
 

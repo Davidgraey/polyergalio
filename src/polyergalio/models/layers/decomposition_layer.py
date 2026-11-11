@@ -63,7 +63,7 @@ class IncrementalSVDLayer(Layer):
         Parameters
         ----------
         input_dimension : size of the last axis
-        num_components : rank projections kept, at most input_dimension (identity)
+        num_components : rank projections num_kept, at most input_dimension (identity)
         output_dimension : width of the output, at most num_components below input_dimension.
         output_form : "orthogonalized", "whitened" or "projection"
         standardize : subtract the moving mean and divide by the moving std of the projected rows; they are tracked either way

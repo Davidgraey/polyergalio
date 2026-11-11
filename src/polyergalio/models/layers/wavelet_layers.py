@@ -100,7 +100,7 @@ class WaveletRefinementModule(Layer):
     In the global case, the learned channel gate is broadcast over sequence positions before being pooled to
     wavelet resolution.
 
-    The stochastic execution controller, control_gate, is a scalar logit that is deliberately non-differentiable:
+    The execution controller -  control_gate, is a scalar logit that is deliberately non-differentiable:
     it is a parameter, but its gradient is always zero.
     """
     preserves_shape = True
@@ -126,6 +126,7 @@ class WaveletRefinementModule(Layer):
         self.wavelet = HaarWaveletTransform(sequence_length)
         self.gate_projection = FullyConnectedLayer(input_dimension=input_dimension, output_dimension=input_dimension, activation_type="swish")
         self.gate_output = FullyConnectedLayer(input_dimension=input_dimension, output_dimension=input_dimension, activation_type="linear")
+
         self.control_gate = np.array([[np.log(on_rate / (1.0 - on_rate))]])
         self.zero_gradients()
 
@@ -163,7 +164,7 @@ class WaveletRefinementModule(Layer):
         """
         Parameters
         ----------
-        v_tilde : (B, N, D)
+        v_tilde : (B, N, D) the forward pass through
         descriptor : (B, D) global, or (B, N, D) position-wise
         training_now : None follows the layer's train() / eval() mode
         mask : accepted but not applied. The Haar pairing mixes adjacent sequence positions, so a real position
@@ -182,23 +183,6 @@ class WaveletRefinementModule(Layer):
         assert sequence == self.sequence_length, (
             f"sequence mismatch: expected {self.sequence_length}, got {sequence}"
         )
-        assert hidden == self.input_dimension, (
-            f"hidden mismatch: expected {self.input_dimension}, got {hidden}"
-        )
-        assert descriptor.ndim in (2, 3), (
-            "descriptor must be (batch, hidden) or "
-            f"(batch, sequence, hidden), got {descriptor.shape}"
-        )
-        assert descriptor.shape[0] == batch, (
-            f"descriptor batch mismatch: expected {batch}, got {descriptor.shape[0]}"
-        )
-        assert descriptor.shape[-1] == self.input_dimension, (
-            f"descriptor hidden mismatch: expected {self.input_dimension}, got {descriptor.shape[-1]}"
-        )
-        if descriptor.ndim == 3:
-            assert descriptor.shape[1] == sequence, (
-                f"position-wise descriptor sequence mismatch: expected {sequence}, got {descriptor.shape[1]}"
-            )
 
         self.purge()
 

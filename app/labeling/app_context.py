@@ -18,7 +18,7 @@ class AppContext:
     Attributes
     ----------
     pred_cache : dict
-        Model predictions, kept per session.
+        Model predictions, num_kept per session.
     notify : callable
         ``notify(task_id, level, text)`` posts a notice on a task tab.
     bump : callable

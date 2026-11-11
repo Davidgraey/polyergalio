@@ -52,7 +52,7 @@ class FrequencyFFT(Layer):
         Parameters
         ----------
         incoming_x : (number_of_windows, samples per window)
-        mask : unused; the transform mixes only within a window's own samples, never across windows, kept for
+        mask : unused; the transform mixes only within a window's own samples, never across windows, num_kept for
             pass-through compatibility with the graph
 
         Returns
@@ -156,7 +156,7 @@ class FourierAttention(Layer):
         ----------
         x_data : (batch, sequence, hidden), or (batch, hidden) when use_2d is False
         training_now : None follows the layer's train() / eval() mode
-        mask : unused; neither the FFT mixing nor the per-position norm and feed-forward sublayers need it, kept
+        mask : unused; neither the FFT mixing nor the per-position norm and feed-forward sublayers need it, num_kept
             for pass-through compatibility
         """
         if self.fftlayer.use_2d:

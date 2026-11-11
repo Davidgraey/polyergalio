@@ -71,7 +71,7 @@ def tasks_tab(app) -> None:
                     st.button("Restore" if t.archived else "Archive",
                               icon=":material/unarchive:" if t.archived else ":material/archive:",
                               key=f"arch::{t.id}", on_click=toggle_archive, args=(root, t.id), type="tertiary",
-                              help="Archived tasks are hidden from labeling; their labels are kept.")
+                              help="Archived tasks are hidden from labeling; their labels are num_kept.")
                 lines = "\n".join(f"{x}: {t.label_definitions.get(x, '')}" for x in t.labels)
                 with st.form(f"edit_task::{t.id}", border=False):
                     st.text_input("Name", value=t.name, key=f"edit::{t.id}::name")

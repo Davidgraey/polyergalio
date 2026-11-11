@@ -1,3 +1,34 @@
+0.1.12
+=====================
+- Found a really cool SOM variant that uses a latent projection - this is similar to our (Self Organizing Latent Space)
+    SOLS; I adjusted our implementation to line up with "SOM-OLP" - Ubukata, Notsu, Honda (IJCNN 2026)
+- Added Spectre_generator with Multi-Token Prediction during training, intending for it to be used in World Models
+- Added Noise layers to create a composable, plastic latent noising layer.
+- Modified the operator layers to give us a latent down-project (to K latents) and re-project up to sequence_length
+- Autoencoders adjusted based on Dilokthanakul's 2016 version - more complex than prior.
+- Audio encoders adjusted to work better with some low-frequency audio domains
+- added training schedulers for decay and accumulation (linear, sigmoid) in `models.training.schedulers.py`
+
+- ***AI tool usage*** Modified the Profiler to a more controlled context using `with profiler:`
+- ***AI tool usage*** Extended the Examples and Streamlit application
+- ***AI Tool usage*** Added top-level docstrings to clustering and operator layers
+
+0.1.11
+=====================
+- Updated CentNN density-based splitting - I was using squared distance and setting using a minimum assumption, 
+    essentially placing the new centroid toward the edge of the D-diemnsion ball.  This was breaking the k-search. Also 
+    found a 'dead neuron' problem when using CentNN on our Self-Organizing Maps (post-hoc) to cluster neurons 
+- Finally moved to widescale adoption of the gram-trick for euclidean distances (changes clustering, soms, etc)
+- profiling.Profiler reports time per sample: Measurement tracks a samples count (inferred from the zeroth axis
+    of the call's data argument), node_summary and summary gained a us/sample column
+
+0.1.10
+=====================
+- TESTS are still broken - I'm just removing them at this point, since I refactored a bunch
+- Activation Function Optimization - see `models.activations.py` to get more context
+- Gaussian Mixture Density head added
+- Built a dedicated Layer for SpectreDecoder Generation process
+
 0.1.9
 =====================
 - TESTS are still broken - I'm not fixing these until I get to a more stable build
@@ -5,8 +36,8 @@
   - This should free up some unused memory
   - Added purge() post-update - so each layer drops its cache and gradients once weights are modified, rather than holding onto it until the full update pass is complete for the Network
   - migrated to matmul over einsum in a couple of locations - should be faster in most backend numpy builds (BLAS)
-- ** AI usage ** used Claude Sonnet 5.5 to suggest / assist with variable caching updates to layers. (only maintaining variables that are necessary for backward passes)
-- ** AI usage ** - Streamlit App cleanup - variable collision in BE naming convention
+- *** AI usage *** used Claude Sonnet 5.5 to suggest / assist with variable caching updates to layers. (only maintaining variables that are necessary for backward passes)
+- *** AI usage *** - Streamlit App cleanup - variable collision in BE naming convention
 
 0.1.8
 =====================
@@ -16,8 +47,8 @@
 - Built out GMVAE in autoencoder_layers.py
 - Added a "pooled Spectre" variant
 - updated base model with quality-of-life serialization / unserialization
-- ** AI usage ** - Extended app/labeling streamlit application with a refactor
-- ** AI usage ** - generated docstrings for the new modules
+- ***AI Tool usage*** - Extended app/labeling streamlit application with a refactor
+- ***AI Tool usage*** - generated docstrings for the new modules
 
 0.1.7
 =====================
@@ -25,7 +56,7 @@
 - Continued refinement to modules and code organization.
 - Added a "recast" behavior -- allows us to downcast array precision (eg float64 -> float32). May need refinement...
 - TESTS are still broken - I'm not fixing these until I get to a more stable build
-- ** AI usage ** - generated docstrings for the new sections of network.py and the new Node type.
+- ***AI Tool usage*** - generated docstrings for the new sections of network.py and the new Node type.
 
 0.1.6
 =====================
@@ -49,9 +80,9 @@ effort.
 Added a distributed training process - polyergalio.models.training/
 - check ./distributed_quickstart.md for more context - but the gradient-averaging local-network training is functional and validated
 - Updated a couple of layer behaviors- mostly in MoE module and the need for consistent interfaces to weight updates. (voting weights were not a layer, so were not being captured / registered. They're still not a layer, but are manually injected.)
-- ** AI usage ** - Had LLM generate some missing docstrings.
-- ** AI usage ** - Building tests for individual modules. Tests are still largely underutilized and definitely need culling.
-- ** AI usage ** - App/Streamlit App and examples were built with coding tools' help.
+- ***AI Tool usage*** - Had LLM generate some missing docstrings.
+- ***AI Tool usage***- Building tests for individual modules. Tests are still largely underutilized and definitely need culling.
+- ***AI Tool usage***- App/Streamlit App and examples were built with coding tools' help.
 
 0.1.4
 =====================
